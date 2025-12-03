@@ -1,0 +1,23 @@
+[project]
+name = "tenso"
+version = "0.1.1"
+description = "High-performance zero-copy tensor serialization"
+dependencies = [
+    "msgpack>=1.1.2",
+    "numpy",
+]
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["uv_build>=0.8.14,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "build>=1.3.0",
+    "pytest>=9.0.1",
+    "twine>=6.2.0",
+]
