@@ -1,3 +1,6 @@
+<!-- <img width="2816" height="1536" alt="Gemini_Generated_Image_v39t46v39t46v39t" src="https://github.com/user-attachments/assets/50378dc3-6165-4b79-831d-5ebf1303cada" /> -->
+<img width="2439" height="966" alt="Gemini_Generated_Image_v39t46v39t46v39t" src="https://github.com/user-attachments/assets/5ec9b225-3615-4225-82ca-68e15b7045ce" />
+
 # Tenso
 
 High-performance zero-copy tensor serialization for NumPy arrays.
