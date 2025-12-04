@@ -5,7 +5,8 @@ import struct
 # Utility functions
 def is_aligned(data: bytes, alignment: int = 64) -> bool:
     """Check if data buffer is aligned to specified boundary."""
-    return (id(data) % alignment) == 0
+    import ctypes
+    return (ctypes.addressof(ctypes.c_char.from_buffer(bytearray(data))) % alignment) == 0
 
 
 def get_packet_info(data: bytes) -> dict:

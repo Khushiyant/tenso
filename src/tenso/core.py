@@ -1,7 +1,7 @@
 import struct
 import numpy as np
 from typing import BinaryIO
-
+import math
 from .config import _MAGIC, _VERSION, _ALIGNMENT, _DTYPE_MAP, _REV_DTYPE_MAP
 
 def dumps(tensor: np.ndarray) -> bytes:
@@ -103,7 +103,9 @@ def loads(data: bytes, copy: bool = False) -> np.ndarray:
     
     # 5. Validate Body Size
     dtype = _REV_DTYPE_MAP[dtype_code]
-    expected_body_size = int(np.prod(shape)) * dtype.itemsize
+
+    total_elements = math.prod(shape) 
+    expected_body_size = total_elements * dtype.itemsize
     
     if len(data) < body_start + expected_body_size:
         raise ValueError(
