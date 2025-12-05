@@ -7,27 +7,31 @@
     <title>TENSO | High-Performance Tensor Protocol</title>
     <meta name="description"
         content="Zero-copy, SIMD-aligned tensor serialization for Python. Faster than Pickle, safer than unsafe protocols.">
-    
+
     <!-- Open Graph / Facebook -->
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://khushiyant.github.io/tenso/">
     <meta property="og:title" content="TENSO | High-Performance Tensor Protocol">
-    <meta property="og:description" content="Zero-copy, SIMD-aligned tensor serialization for Python. 445x faster than Pickle for deserialization.">
+    <meta property="og:description"
+        content="Zero-copy, SIMD-aligned tensor serialization for Python. 445x faster than Pickle for deserialization.">
     <meta property="og:image" content="https://github.com/user-attachments/assets/5ec9b225-3615-4225-82ca-68e15b7045ce">
-    
+
     <!-- Twitter -->
     <meta property="twitter:card" content="summary_large_image">
     <meta property="twitter:url" content="https://khushiyant.github.io/tenso/">
     <meta property="twitter:title" content="TENSO | High-Performance Tensor Protocol">
-    <meta property="twitter:description" content="Zero-copy, SIMD-aligned tensor serialization for Python. 445x faster than Pickle for deserialization.">
-    <meta property="twitter:image" content="https://github.com/user-attachments/assets/5ec9b225-3615-4225-82ca-68e15b7045ce">
-    
+    <meta property="twitter:description"
+        content="Zero-copy, SIMD-aligned tensor serialization for Python. 445x faster than Pickle for deserialization.">
+    <meta property="twitter:image"
+        content="https://github.com/user-attachments/assets/5ec9b225-3615-4225-82ca-68e15b7045ce">
+
     <!-- Additional SEO -->
-    <meta name="keywords" content="tensor serialization, numpy, python, machine learning, zero-copy, performance, pickle alternative">
+    <meta name="keywords"
+        content="tensor serialization, numpy, python, machine learning, zero-copy, performance, pickle alternative">
     <meta name="author" content="Khushiyant">
     <link rel="canonical" href="https://khushiyant.github.io/tenso/">
 
-    <!-- Fonts: VT323 for retro headers, Space Mono for technical text -->
+    <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link
@@ -65,7 +69,6 @@
     </script>
 
     <style>
-        /* Custom Grid Background that Tailwind can't do easily without plugins */
         .bg-retro-grid {
             background-image:
                 linear-gradient(#e5e0d8 1px, transparent 1px),
@@ -75,12 +78,12 @@
     </style>
 </head>
 
-<body class="bg-paper text-dark font-mono antialiased selection:bg-brand-orange selection:text-white">
+<body class="bg-paper text-dark font-mono antialiased overflow-x-hidden selection:bg-brand-orange selection:text-white">
 
     <!-- Background -->
     <div class="fixed inset-0 bg-retro-grid -z-10 pointer-events-none"></div>
 
-    <div class="max-w-7xl mx-auto px-6">
+    <div class="max-w-6xl mx-auto px-6">
 
         <!-- Nav -->
         <nav class="flex justify-between items-center py-8 border-b-2 border-dark mb-16">
@@ -89,7 +92,7 @@
                 TENSO
             </div>
             <div class="hidden md:flex gap-8 text-sm font-bold uppercase tracking-wide">
-                <a href="https://pypi.org/project/tenso/"
+                <a href="https://pypi.org/project/tenso-core/"
                     class="hover:text-brand-orange hover:underline decoration-2 underline-offset-4">PyPI</a>
                 <a href="https://github.com/Khushiyant/tenso"
                     class="hover:text-brand-orange hover:underline decoration-2 underline-offset-4">GitHub</a>
@@ -109,7 +112,7 @@
             <div class="relative group inline-block">
                 <div onclick="copyInstall()"
                     class="bg-white border-2 border-dark px-8 py-4 text-lg font-bold shadow-hard cursor-pointer transition-all active:translate-x-[2px] active:translate-y-[2px] active:shadow-hard-active hover:bg-gray-50 select-none">
-                    pip install tenso
+                    pip install tenso-core
                 </div>
                 <div id="tooltip"
                     class="absolute -top-10 left-1/2 -translate-x-1/2 bg-dark text-white text-xs font-bold px-3 py-1 opacity-0 transition-opacity pointer-events-none">
@@ -123,8 +126,7 @@
             </a>
         </header>
 
-        <!-- PERFORMANCE SECTION (Moved Up) -->
-        <!-- Hook: Prove the speed immediately -->
+        <!-- PERFORMANCE SECTION -->
         <div class="relative flex items-center justify-center border-b-2 border-grid mb-16">
             <span class="bg-paper px-6 font-display text-5xl uppercase text-dark absolute">Performance</span>
         </div>
@@ -221,9 +223,7 @@ restored = tenso.<span class="text-brand-teal font-bold">loads</span>(packet)
             </div>
         </div>
 
-        <!-- ARCHITECTURE & FEATURES SECTION (Moved to middle) -->
-        <!-- Explanation: How it works & Why it's good -->
-
+        <!-- Architecture Section -->
         <div class="mb-24">
             <h2 class="relative text-center mb-10">
                 <span
@@ -249,34 +249,38 @@ restored = tenso.<span class="text-brand-teal font-bold">loads</span>(packet)
                     <div>PADDING</div>
                     <div class="text-base font-mono text-muted mt-1">0-63 Bytes</div>
                 </div>
-                <div class="p-6 flex-[4] bg-teal-50">
+                <div class="p-6 flex-[2] bg-teal-50">
                     <div>RAW BODY (C-Contiguous)</div>
                     <div class="text-base font-mono text-muted mt-1">Payload</div>
                 </div>
             </div>
 
-            <!-- Features Grid -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
-                <div class="bg-white border-2 border-dark p-8 shadow-hard hover:-translate-y-1 transition-transform">
-                    <h3 class="font-display text-4xl text-brand-teal mb-3 uppercase">Zero-Copy</h3>
-                    <p class="text-muted text-sm">Maps memory directly from the buffer to NumPy. No CPU cycles wasted on
-                        parsing or copying data. Reads are O(1).</p>
+            <!-- Features Grid (Now includes Cost Saving) -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                <div class="bg-white border-2 border-dark p-6 shadow-hard hover:-translate-y-1 transition-transform">
+                    <h3 class="font-display text-3xl text-brand-teal mb-3 uppercase">Zero-Copy</h3>
+                    <p class="text-muted text-xs">Maps memory directly from the buffer to NumPy. No CPU cycles wasted on
+                        parsing or copying data.</p>
                 </div>
-                <div class="bg-white border-2 border-dark p-8 shadow-hard hover:-translate-y-1 transition-transform">
-                    <h3 class="font-display text-4xl text-brand-teal mb-3 uppercase">Secure</h3>
-                    <p class="text-muted text-sm">Strictly handles data structure. Unlike Pickle, Tenso cannot execute
-                        arbitrary code. Safe for production APIs.</p>
+                <div class="bg-white border-2 border-dark p-6 shadow-hard hover:-translate-y-1 transition-transform">
+                    <h3 class="font-display text-3xl text-brand-teal mb-3 uppercase">Secure</h3>
+                    <p class="text-muted text-xs">Strictly handles data structure. Unlike Pickle, Tenso cannot execute
+                        arbitrary code. Safe for public APIs.</p>
                 </div>
-                <div class="bg-white border-2 border-dark p-8 shadow-hard hover:-translate-y-1 transition-transform">
-                    <h3 class="font-display text-4xl text-brand-teal mb-3 uppercase">Aligned</h3>
-                    <p class="text-muted text-sm">Protocol v2 enforces 64-byte memory alignment, unlocking AVX-512
-                        vectorization optimizations on modern CPUs.</p>
+                <div class="bg-white border-2 border-dark p-6 shadow-hard hover:-translate-y-1 transition-transform">
+                    <h3 class="font-display text-3xl text-brand-teal mb-3 uppercase">Aligned</h3>
+                    <p class="text-muted text-xs">Protocol v2 enforces 64-byte memory alignment, unlocking AVX-512
+                        vectorization optimizations.</p>
+                </div>
+                <div class="bg-white border-2 border-dark p-6 shadow-hard hover:-translate-y-1 transition-transform">
+                    <h3 class="font-display text-3xl text-brand-teal mb-3 uppercase">Efficient</h3>
+                    <p class="text-muted text-xs">Deserialization burns 0% CPU. Free up your inference servers to run
+                        models, not parse JSON.</p>
                 </div>
             </div>
         </div>
 
-        <!-- USE CASES SECTION (End) -->
-        <!-- Application: Inspiration -->
+        <!-- Use Cases -->
         <div class="mb-32">
             <h2
                 class="font-display text-4xl mb-10 uppercase text-center md:text-left border-b-2 border-dark pb-2 inline-block">
@@ -322,7 +326,7 @@ restored = tenso.<span class="text-brand-teal font-bold">loads</span>(packet)
 
     <script>
         function copyInstall() {
-            navigator.clipboard.writeText("pip install tenso");
+            navigator.clipboard.writeText("pip install tenso-core");
             const tooltip = document.getElementById('tooltip');
             tooltip.classList.remove('opacity-0');
             setTimeout(() => {

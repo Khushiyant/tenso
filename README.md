@@ -11,6 +11,14 @@ Tenso is a specialized binary protocol designed for one thing: moving NumPy arra
 
 It avoids the massive CPU overhead of standard formats (JSON, Pickle, MsgPack) by using a strict Little-Endian, 64-byte aligned memory layout. This allows for Zero-Copy deserialization, meaning the CPU doesn't have to move data—it just points to it.
 
+### The Zero-CPU Advantage
+
+Tenso isn't just about speed; it's about resource efficiency.
+
+- JSON/Pickle: Parsing large arrays consumes significant CPU cycles (100% usage during load). In a high-throughput cluster, this steals resources from your actual model inference.
+
+- Tenso: Deserialization is effectively 0% CPU. The processor simply maps the existing memory address.
+
 ## Benchmark
 
 **Scenario:** Reading a 64MB Float32 Matrix (Typical LLM Layer) from memory.
