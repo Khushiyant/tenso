@@ -59,13 +59,14 @@ restored = tenso.loads(packet)
 
 ### File I/O
 ```python
-# Save to disk
-with open("weights.tenso", "wb") as f:
-    tenso.dump(data, f)
-
-# Load from disk
+# Load from disk (Standard)
 with open("weights.tenso", "rb") as f:
     loaded_data = tenso.load(f)
+
+# Load Large Models (Larger than RAM)
+# Uses OS memory mapping to read data instantly without loading file into memory
+with open("llama_70b_weights.tenso", "rb") as f:
+    loaded_data = tenso.load(f, mmap_mode=True)
 ```
 
 ## Protocol Specification
@@ -107,6 +108,20 @@ pytest
 
 # Run benchmarks
 python benchmark.py
+```
+
+### Advanced Usage
+
+**Strict Mode:**
+Prevent accidental memory copies during serialization. Raises an error if data is not already C-Contiguous.
+
+```python
+try:
+    # Will raise ValueError if array is Fortran-contiguous or non-contiguous
+    packet = tenso.dumps(data, strict=True) 
+except ValueError:
+    print("Array must be C-Contiguous!")
+
 ```
 
 ## Requirements

@@ -18,5 +18,8 @@ _DTYPE_MAP = {
     np.dtype('int16'): 10,
     np.dtype('uint32'): 11,
     np.dtype('uint64'): 12,
+    # New additions
+    np.dtype('complex64'): 13,
+    np.dtype('complex128'): 14,
 }
 _REV_DTYPE_MAP = {v: k for k, v in _DTYPE_MAP.items()}

@@ -1,6 +1,6 @@
 [project]
 name = "tenso"
-version = "0.2.2"
+version = "0.3.2"
 description = "High-performance zero-copy tensor protocol"
 readme = "README.md"
 dependencies = [
