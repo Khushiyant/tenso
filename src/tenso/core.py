@@ -1,10 +1,89 @@
 import struct
 import numpy as np
-from typing import BinaryIO, Union
+from typing import BinaryIO, Union, Any
 import math
 import mmap
-import sys
-from .config import _MAGIC, _VERSION, _ALIGNMENT, _DTYPE_MAP, _REV_DTYPE_MAP
+from .config import _MAGIC, _VERSION, _ALIGNMENT, _DTYPE_MAP, _REV_DTYPE_MAP, IS_LITTLE_ENDIAN
+
+# --- Stream Helper ---
+def _read_exact(source: Any, n: int) -> Union[bytes, None]:
+    """Helper to read exactly n bytes from a socket or file-like object."""
+    if n == 0:
+        return b''
+        
+    data = b''
+    while len(data) < n:
+        # Support both socket.recv and file.read
+        if hasattr(source, 'recv'):
+            chunk = source.recv(n - len(data))
+        else:
+            chunk = source.read(n - len(data))
+            
+        if not chunk:
+            # If we read nothing at the very start, it's a clean EOF (if expected)
+            if len(data) == 0:
+                return None
+            # If we read partial data then EOF, it's an error
+            raise EOFError(f"Stream closed unexpectedly. Expected {n} bytes, got {len(data)}")
+        data += chunk
+    return data
+
+def read_stream(source: Any) -> Union[np.ndarray, None]:
+    """
+    Reads a complete Tenso packet directly from a socket or file stream.
+    
+    Args:
+        source: A socket object or file-like object (must support recv or read).
+        
+    Returns:
+        numpy.ndarray or None if stream is closed (EOF).
+    """
+    # 1. Read Fixed Header
+    header = _read_exact(source, 8)
+    if header is None:
+        return None
+        
+    magic, ver, flags, dtype_code, ndim = struct.unpack('<4sBBBB', header)
+    
+    if magic != _MAGIC:
+        raise ValueError("Invalid tenso packet (magic bytes mismatch)")
+
+    # 2. Read Shape Block
+    shape_len = ndim * 4
+    shape_bytes = _read_exact(source, shape_len)
+    if shape_bytes is None: raise EOFError("Stream ended during shape read")
+    
+    shape = struct.unpack(f'<{ndim}I', shape_bytes)
+    
+    # 3. Calculate Padding
+    current_offset = 8 + shape_len
+    remainder = current_offset % _ALIGNMENT
+    padding_len = 0 if remainder == 0 else (_ALIGNMENT - remainder)
+    
+    # 4. Read Padding
+    padding = _read_exact(source, padding_len)
+    if padding is None and padding_len > 0: raise EOFError("Stream ended during padding read")
+    if padding is None: padding = b''
+
+    # 5. Calculate Body Size
+    dtype = _REV_DTYPE_MAP.get(dtype_code)
+    if dtype is None:
+        raise ValueError(f"Unknown dtype code: {dtype_code}")
+        
+    total_elements = math.prod(shape)
+    body_len = int(total_elements * dtype.itemsize)
+    
+    # 6. Read Body
+    body = _read_exact(source, body_len)
+    if body is None and body_len > 0: raise EOFError("Stream ended during body read")
+    if body is None: body = b''
+
+    # 7. Reconstruct
+    # We combine parts to use the robust loads() logic for final object creation
+    return loads(header + shape_bytes + padding + body)
+
+
+# --- Core Functions ---
 
 def dumps(tensor: np.ndarray, strict: bool = False) -> bytes:
     """
@@ -14,15 +93,15 @@ def dumps(tensor: np.ndarray, strict: bool = False) -> bytes:
     if tensor.dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {tensor.dtype}")
     
-    # 2. Handle Memory Layout (Strict Mode)
+    # 2. Handle Memory Layout
     if not tensor.flags['C_CONTIGUOUS']:
         if strict:
             raise ValueError("Tensor is not C-Contiguous and strict=True. "
                              "Reshape or copy array before serializing.")
         tensor = np.ascontiguousarray(tensor)
 
-    # 3. Handle Endianness (Portable Safety)
-    if sys.byteorder == 'big' or tensor.dtype.byteorder == '>':
+    # 3. Handle Endianness (Optimized)
+    if not IS_LITTLE_ENDIAN or tensor.dtype.byteorder == '>':
         tensor = tensor.astype(tensor.dtype.newbyteorder('<'))
 
     dtype_code = _DTYPE_MAP[tensor.dtype]
@@ -92,6 +171,7 @@ def loads(data: Union[bytes, mmap.mmap], copy: bool = False) -> np.ndarray:
             f"got {len(data)})"
         )
     
+    # Safe Creation
     arr = np.frombuffer(
         data,
         dtype=dtype,
@@ -109,8 +189,7 @@ def loads(data: Union[bytes, mmap.mmap], copy: bool = False) -> np.ndarray:
 
 def dump(tensor: np.ndarray, fp: BinaryIO, strict: bool = False) -> None:
     """
-    Serialize a numpy array to a file-like object using Streaming Write.
-    Avoids creating a massive bytes object in RAM.
+    Serialize a numpy array to a file-like object using Coalesced Writes.
     """
     # 1. Validation (Same as dumps)
     if tensor.dtype not in _DTYPE_MAP:
@@ -122,7 +201,7 @@ def dump(tensor: np.ndarray, fp: BinaryIO, strict: bool = False) -> None:
         tensor = np.ascontiguousarray(tensor)
 
     # Endianness
-    if sys.byteorder == 'big' or tensor.dtype.byteorder == '>':
+    if not IS_LITTLE_ENDIAN or tensor.dtype.byteorder == '>':
         tensor = tensor.astype(tensor.dtype.newbyteorder('<'))
 
     dtype_code = _DTYPE_MAP[tensor.dtype]
@@ -139,16 +218,13 @@ def dump(tensor: np.ndarray, fp: BinaryIO, strict: bool = False) -> None:
     remainder = current_offset % _ALIGNMENT
     padding_size = 0 if remainder == 0 else (_ALIGNMENT - remainder)
     
-    # Write Parts directly to file stream
+    # Optimization: Coalesce metadata writes
+    # Reduces syscalls from 4 to 2
     header = struct.pack('<4sBBBB', _MAGIC, _VERSION, 1, dtype_code, ndim)
     shape_block = struct.pack(f'<{ndim}I', *shape)
     padding = b'\x00' * padding_size
     
-    fp.write(header)
-    fp.write(shape_block)
-    fp.write(padding)
-    
-    # Optimization: Write directly from memoryview, avoiding copies
+    fp.write(header + shape_block + padding)
     fp.write(tensor.data)
 
 

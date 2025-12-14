@@ -1,8 +1,10 @@
 import numpy as np
+import sys
 
 _MAGIC = b'TNSO'
 _VERSION = 2
 _ALIGNMENT = 64  # Align body to 64-byte boundaries for AVX-512/SIMD
+IS_LITTLE_ENDIAN = (sys.byteorder == 'little')
 
 # Dtype Mapping
 _DTYPE_MAP = {

@@ -1,11 +1,11 @@
 from .config import _MAGIC, _ALIGNMENT, _DTYPE_MAP, _REV_DTYPE_MAP
 import numpy as np
 import struct
+import ctypes
 
 # Utility functions
 def is_aligned(data: bytes, alignment: int = 64) -> bool:
     """Check if data buffer is aligned to specified boundary."""
-    import ctypes
     return (ctypes.addressof(ctypes.c_char.from_buffer(bytearray(data))) % alignment) == 0
 
 
