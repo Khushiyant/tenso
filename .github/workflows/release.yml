@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: write
-  id-token: write  # REQUIRED: Allows PyPI to verify this workflow
+  id-token: write
 
 jobs:
   release:
@@ -18,28 +18,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 1. Calculate Version & Create Release (GitHub)
+      # 1. Calculate Version, Bump, BUILD (inside container), and Release
       - name: Python Semantic Release
         id: release
         uses: python-semantic-release/python-semantic-release@v9.15.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. Setup Python (Only if a release happened)
-      - name: Set up Python
-        if: steps.release.outputs.released == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # 3. Build Package (Wheel + Sdist)
-      - name: Build Package
-        if: steps.release.outputs.released == 'true'
-        run: |
-          pip install build
-          python -m build
-
-      # 4. Publish to PyPI (Trusted Publisher)
+      # 2. Publish to PyPI (Uses the dist/ created by step 1)
       - name: Publish to PyPI
         if: steps.release.outputs.released == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
