@@ -8,10 +8,11 @@
 - Add write_stream to __init__.py and optimize _read_exact function in core.py
   ([`d6d0dd7`](https://github.com/Khushiyant/tenso/commit/d6d0dd74cb876a345e02f54ad47f3bd4ca1940fc))
 
-### Chores
-
 - Enhance benchmark.py with serialization and I/O tests, add stream read/write functionality
-  ([`4dbafce`](https://github.com/Khushiyant/tenso/commit/4dbafce95cb7834265f035098e071f0fa23f6c3a))
+  ([`310c3ff`](https://github.com/Khushiyant/tenso/commit/310c3ff69ea4ffe8dac2233d16506092774d83ab))
+
+- Retry release 0.4.7
+  ([`ccdb3a0`](https://github.com/Khushiyant/tenso/commit/ccdb3a09b095747dcb034523882224c595f0c5eb))
 
 
 ## v0.4.6 (2025-12-14)
