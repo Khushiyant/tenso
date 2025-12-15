@@ -26,6 +26,10 @@ dev = [
     "pytest>=9.0.1",
     "twine>=6.2.0",
 ]
+gpu = [
+    "cupy-cuda12x; sys_platform != 'darwin'",
+    "torch",
+]
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
