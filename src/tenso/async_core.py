@@ -6,8 +6,19 @@ from .core import loads, _REV_DTYPE_MAP, _MAGIC, _ALIGNMENT
 
 async def aread_stream(reader: asyncio.StreamReader) -> np.ndarray:
     """
-    Async zero-copy reader for FastAPI/asyncio servers.
-    Reads directly from the stream into a pre-allocated numpy buffer.
+    Asynchronously read a Tenso packet from an asyncio StreamReader using zero-copy buffering.
+
+    Designed for FastAPI/asyncio servers. Reads directly from the stream into a pre-allocated numpy buffer for efficiency.
+
+    Args:
+        reader: An asyncio.StreamReader to read from.
+
+    Returns:
+        np.ndarray: The deserialized numpy array, or None if EOF at start.
+
+    Raises:
+        asyncio.IncompleteReadError: If the stream ends unexpectedly during read.
+        ValueError: If the packet is invalid or dtype is unknown.
     """
     # 1. Read Header
     try:

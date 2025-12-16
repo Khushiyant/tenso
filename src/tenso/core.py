@@ -13,9 +13,17 @@ IS_LITTLE_ENDIAN = (sys.byteorder == 'little')
 
 def _read_into_buffer(source: Any, buf: Union[bytearray, memoryview, np.ndarray]) -> bool:
     """
-    Helper to fill a buffer from a source (socket or file).
-    Returns True if full, False if empty (EOF at start).
-    Raises EOFError if stream ends partially.
+    Fill a buffer from a source (socket or file-like object).
+
+    Args:
+        source: The data source supporting 'readinto', 'recv_into', 'read', or 'recv'.
+        buf: The buffer to fill (bytearray, memoryview, or numpy array).
+
+    Returns:
+        bool: True if the buffer was filled completely, False if EOF at start.
+
+    Raises:
+        EOFError: If the stream ends before the buffer is fully filled.
     """
     view = memoryview(buf)
     n = view.nbytes
@@ -57,8 +65,19 @@ def _read_into_buffer(source: Any, buf: Union[bytearray, memoryview, np.ndarray]
 
 def read_stream(source: Any) -> Union[np.ndarray, None]:
     """
-    Reads a tensor from a socket/file using Zero-Copy buffering.
-    Allocates ONE uninitialized buffer and reads directly into it.
+    Read a tensor from a socket or file using zero-copy buffering.
+
+    Allocates a single uninitialized buffer and reads directly into it for efficiency.
+
+    Args:
+        source: The data source (socket or file-like object).
+
+    Returns:
+        np.ndarray or None: The deserialized tensor, or None if EOF at start.
+
+    Raises:
+        EOFError: If the stream ends unexpectedly during read.
+        ValueError: If the packet is invalid or dtype is unknown.
     """
     # 1. Read Header (8 bytes)
     header = bytearray(8)
@@ -127,8 +146,20 @@ def read_stream(source: Any) -> Union[np.ndarray, None]:
 
 def write_stream(tensor: np.ndarray, dest: Any, strict: bool = False) -> int:
     """
-    Writes a tensor to a socket/file using Vectored I/O (os.writev).
-    Sends Header + Shape + Body in ONE system call (Atomic Send).
+    Write a tensor to a socket or file using vectored I/O (os.writev if available).
+
+    Sends header, shape, and body in a single system call for atomicity and performance.
+
+    Args:
+        tensor: The numpy array to serialize and send.
+        dest: The destination (socket or file-like object).
+        strict: If True, require tensor to be C-contiguous.
+
+    Returns:
+        int: Number of bytes written.
+
+    Raises:
+        ValueError: If dtype is unsupported or tensor is not C-contiguous in strict mode.
     """
     if tensor.dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {tensor.dtype}")
@@ -172,8 +203,17 @@ def write_stream(tensor: np.ndarray, dest: Any, strict: bool = False) -> int:
 
 def dumps(tensor: np.ndarray, strict: bool = False) -> memoryview:
     """
-    Optimized serialization: Allocates uninitialized memory and avoids final copy.
-    Returns a memoryview (buffer protocol) instead of bytes.
+    Serialize a numpy array to a Tenso packet (zero-copy, uninitialized buffer).
+
+    Args:
+        tensor: The numpy array to serialize.
+        strict: If True, require tensor to be C-contiguous.
+
+    Returns:
+        memoryview: A memoryview of the serialized packet (no copy).
+
+    Raises:
+        ValueError: If dtype is unsupported or tensor is not C-contiguous in strict mode.
     """
     if tensor.dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {tensor.dtype}")
@@ -222,7 +262,19 @@ def dumps(tensor: np.ndarray, strict: bool = False) -> memoryview:
 
 
 def loads(data: Union[bytes, bytearray, memoryview, np.ndarray, mmap.mmap], copy: bool = False) -> np.ndarray:
-    """Deserialize from bytes-like object."""
+    """
+    Deserialize a Tenso packet from a bytes-like object.
+
+    Args:
+        data: The bytes-like object containing the Tenso packet.
+        copy: If True, return a copy of the data; otherwise, return a zero-copy view.
+
+    Returns:
+        np.ndarray: The deserialized numpy array.
+
+    Raises:
+        ValueError: If the packet is invalid, version is unsupported, or dtype is unknown.
+    """
     mv = memoryview(data)
     
     if len(mv) < 8: raise ValueError("Packet too short")
@@ -266,11 +318,30 @@ def loads(data: Union[bytes, bytearray, memoryview, np.ndarray, mmap.mmap], copy
 
 
 def dump(tensor: np.ndarray, fp: BinaryIO, strict: bool = False) -> None:
-    """Alias for write_stream."""
+    """
+    Serialize and write a tensor to a file-like object.
+
+    Alias for write_stream().
+
+    Args:
+        tensor: The numpy array to serialize.
+        fp: The file-like object to write to.
+        strict: If True, require tensor to be C-contiguous.
+    """
     write_stream(tensor, fp, strict=strict)
 
 def load(fp: BinaryIO, mmap_mode: bool = False, copy: bool = False) -> np.ndarray:
-    """Alias for read_stream logic or mmap."""
+    """
+    Load a tensor from a file-like object, optionally using memory-mapping.
+
+    Args:
+        fp: The file-like object to read from.
+        mmap_mode: If True, use memory-mapped file access.
+        copy: If True, return a copy of the data.
+
+    Returns:
+        np.ndarray: The loaded numpy array.
+    """
     if mmap_mode:
         mm = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
         return loads(mm, copy=copy)

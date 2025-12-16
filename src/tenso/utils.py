@@ -5,19 +5,31 @@ import ctypes
 
 # Utility functions
 def is_aligned(data: bytes, alignment: int = 64) -> bool:
-    """Check if data buffer is aligned to specified boundary."""
+    """
+    Check if a data buffer is aligned to a specified byte boundary.
+
+    Args:
+        data: The data buffer (bytes-like object).
+        alignment: The alignment boundary in bytes (default: 64).
+
+    Returns:
+        bool: True if the buffer is aligned, False otherwise.
+    """
     return (ctypes.addressof(ctypes.c_char.from_buffer(bytearray(data))) % alignment) == 0
 
 
 def get_packet_info(data: bytes) -> dict:
     """
     Extract metadata from a Tenso packet without full deserialization.
-    
+
     Args:
-        data: Tenso packet bytes
-        
+        data: The Tenso packet bytes.
+
     Returns:
-        Dictionary with packet metadata
+        dict: Dictionary with packet metadata, including version, dtype, shape, ndim, flags, alignment, total elements, and data size in bytes.
+
+    Raises:
+        ValueError: If the packet is too short or invalid.
     """
     if len(data) < 8:
         raise ValueError("Packet too short")

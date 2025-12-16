@@ -19,9 +19,18 @@ except ImportError:
 
 def _get_allocator(size: int) -> Tuple[np.ndarray, Any]:
     """
-    Returns a PINNED memory buffer (Page-Locked).
-    Pinned memory allows the GPU to read directly from this RAM 
-    via DMA (Direct Memory Access), bypassing the CPU cache.
+    Allocate a pinned (page-locked) memory buffer for fast GPU transfer.
+
+    Pinned memory allows the GPU to read directly from RAM via DMA, bypassing the CPU cache.
+
+    Args:
+        size: Number of bytes to allocate.
+
+    Returns:
+        tuple: (numpy view of pinned memory, backend-specific pinned memory handle)
+
+    Raises:
+        ImportError: If neither 'cupy' nor 'torch' is installed.
     """
     if BACKEND == 'cupy':
         # CuPy Pinned Memory
@@ -41,8 +50,21 @@ def _get_allocator(size: int) -> Tuple[np.ndarray, Any]:
 
 def read_to_device(source: Any, device_id: int = 0) -> Union['cp.ndarray', 'torch.Tensor', None]:
     """
-    Reads a Tenso packet directly into pinned memory and moves it to GPU.
-    This is the fastest possible way to get network data onto a GPU.
+    Read a Tenso packet directly into pinned memory and transfer it to GPU.
+
+    This is the fastest way to move network data onto a GPU, using pinned memory and async transfer.
+
+    Args:
+        source: The data source (socket or file-like object).
+        device_id: GPU device index to transfer to.
+
+    Returns:
+        cupy.ndarray or torch.Tensor or None: The tensor on GPU, or None if EOF at start.
+
+    Raises:
+        EOFError: If the stream ends unexpectedly during read.
+        ValueError: If the packet is invalid or dtype is unknown.
+        ImportError: If neither 'cupy' nor 'torch' is installed.
     """
     # 1. Read Header (reuse core logic)
     header = bytearray(8)
