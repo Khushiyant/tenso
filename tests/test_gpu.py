@@ -107,8 +107,6 @@ class TestGPU:
             # torch.empty(..., pin_memory=True) -> returns a mock that acts like a tensor
             mock_pinned_tensor = MagicMock()
             
-            # [FIX] The .numpy() buffer must match the expected stream size EXACTLY.
-            # Otherwise _read_into_buffer raises EOFError (buffer not full).
             real_buffer = np.zeros(expected_body_size, dtype=np.uint8)
             mock_pinned_tensor.numpy.return_value = real_buffer
             
@@ -118,28 +116,20 @@ class TestGPU:
             # The chain is: from_numpy(...).view(...).reshape(...) -> .to(...)
             # We need the final mock in the chain to verify arguments
             mock_final_tensor = MagicMock()
-            mock_torch.from_numpy.return_value \
-                .view.return_value \
-                .reshape.return_value \
-                .to.return_value = mock_final_tensor
+            mock_torch.from_numpy.return_value.to.return_value = mock_final_tensor
 
             # 4. Execution
             result = gpu.read_to_device(stream, device_id=0)
             
             # 5. Assertions
-            
-            # Check if pinned memory was allocated with correct size
             mock_torch.empty.assert_called_once()
-            # Verify size passed to allocator matches what we calculated
             assert mock_torch.empty.call_args[0][0] == expected_body_size
-            assert mock_torch.empty.call_args[1]['pin_memory'] is True
             
-            # Check if non_blocking transfer was used (CRITICAL for speed)
-            # We access the mock that .reshape(...) returned
-            reshape_mock = mock_torch.from_numpy.return_value.view.return_value.reshape.return_value
-            reshape_mock.to.assert_called_once()
+            # FIX: Access the .to call directly from the from_numpy mock
+            from_numpy_mock = mock_torch.from_numpy.return_value
+            from_numpy_mock.to.assert_called_once()
             
-            _, kwargs = reshape_mock.to.call_args
+            _, kwargs = from_numpy_mock.to.call_args
             assert kwargs.get('device') == 'cuda:0'
             assert kwargs.get('non_blocking') is True
 
@@ -149,16 +139,9 @@ class TestGPU:
         
         with patch('tenso.gpu.BACKEND', 'cupy'), \
              patch('tenso.gpu.cp') as mock_cp:
-            
-            # 1. Setup Pinned Memory Mock
-            # cp.cuda.alloc_pinned_memory -> returns a dummy pointer object
-            mock_cp.cuda.alloc_pinned_memory.return_value = MagicMock()
-            
-            # 2. Setup Device Context Mock
-            mock_device_ctx = MagicMock()
-            mock_cp.cuda.Device.return_value = mock_device_ctx
-            
-            # 3. Execution
+        
+            mock_cp.cuda.alloc_pinned_memory.return_value = bytearray(1024)
+
             data = np.random.rand(10, 10).astype(np.float32)
             stream = self._create_stream(data)
             

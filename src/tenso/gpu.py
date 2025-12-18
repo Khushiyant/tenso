@@ -132,6 +132,7 @@ def read_to_device(source: Any, device_id: int = 0) -> Union['cp.ndarray', 'torc
             
     elif BACKEND == 'torch':
         # View as correct dtype
-        host_typed = torch.from_numpy(body_view).view(dtype_np).reshape(shape)
+        host_typed = torch.from_numpy(body_view.view(dtype=dtype_np).reshape(shape))
+        
         # non_blocking=True is crucial here to allow CPU to return immediately
         return host_typed.to(device=f'cuda:{device_id}', non_blocking=True)
