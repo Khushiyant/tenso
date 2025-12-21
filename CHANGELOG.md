@@ -1,6 +1,15 @@
 # CHANGELOG
 
 
+## v0.8.0 (2025-12-21)
+
+### Features
+
+- Add xxhash for integrity checks; enhance async read and write functions; update utils for packet
+  metadata extraction
+  ([`258ce17`](https://github.com/Khushiyant/tenso/commit/258ce1718e4cc00f85085fd9b8a6dbfde6bd720a))
+
+
 ## v0.7.0 (2025-12-21)
 
 ### Features
