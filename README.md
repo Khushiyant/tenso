@@ -161,17 +161,18 @@ with open("model_weights.tenso", "rb") as f:
 Tenso uses a minimalist 4-part structure:
 
 ```
-┌─────────────┬──────────────┬──────────────┬────────────────────────┐
-│   HEADER    │    SHAPE     │   PADDING    │    BODY (Raw Data)     │
-│   8 bytes   │  Variable    │   0-63 bytes │   C-Contiguous Array   │
-└─────────────┴──────────────┴──────────────┴────────────────────────┘
+┌─────────────┬──────────────┬──────────────┬────────────────────────┬──────────────┐
+│   HEADER    │    SHAPE     │   PADDING    │    BODY (Raw Data)     │    FOOTER    │
+│   8 bytes   │  Variable    │   0-63 bytes │   C-Contiguous Array   │   8 bytes*   │
+└─────────────┴──────────────┴──────────────┴────────────────────────┴──────────────┘
+                                                                        (*Optional)
 ```
 
 ### Header (8 bytes)
 ```python
 [4 bytes: Magic "TNSO"]
 [1 byte:  Protocol Version (2)]
-[1 byte:  Flags (alignment, etc.)]
+[1 byte:  Flags (Bit 0: Aligned, Bit 1: Integrity)]
 [1 byte:  Dtype Code]
 [1 byte:  Number of Dimensions]
 ```
@@ -191,6 +192,20 @@ The padding ensures the data body starts at a 64-byte boundary, enabling:
 
 ## Advanced Features
 
+### Data Integrity (XXH3)
+
+Protect your tensors against network corruption with ultra-fast XXH3 hashing (adds <2% overhead):
+
+```python
+# Serialize with 64-bit checksum
+packet = tenso.dumps(data, check_integrity=True)
+
+# Verification is automatic during load
+try:
+    restored = tenso.loads(packet)
+except ValueError:
+    print("Detected corrupted data!")
+```
 ### Strict Mode
 
 Prevents accidental memory copies:
@@ -261,6 +276,9 @@ cd tenso
 # Install with dev dependencies
 pip install -e ".[dev]"
 
+# Install with gpu dependencies
+pip install -e ".[gpu]"
+
 # Run tests
 pytest
 
@@ -269,6 +287,9 @@ python benchmark.py all
 
 # Quick benchmark (serialization + Arrow comparison)
 python benchmark.py quick
+
+# Benchmark with Integrity
+python benchmark.py all --integrity # Require installation with [integrity] dependicies
 ```
 
 ---
@@ -283,6 +304,8 @@ python benchmark.py quick
 - `safetensors` - Compare with SafeTensors
 - `msgpack` - Compare with MessagePack
 - `psutil` - Monitor CPU/memory usage
+
+- `xxhash` - Integrity Checks Implementation
 
 ---
 

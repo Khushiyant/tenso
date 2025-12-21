@@ -44,6 +44,7 @@ autodoc_mock_imports = [
     "cupy", 
     "torch", 
     "numpy"  # Optional: speeds up build if you don't need numpy internals
+    "xxhash"
 ]
 
 # Extensions

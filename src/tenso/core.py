@@ -14,23 +14,24 @@ IS_LITTLE_ENDIAN = (sys.byteorder == 'little')
 
 def _read_into_buffer(source: Any, buf: Union[bytearray, memoryview, np.ndarray]) -> bool:
     """
-    Fill a buffer from a source (socket or file-like object).
+    Fill a buffer from a source, handling various I/O types.
 
-    This is a low-level function that handles reading data into a buffer from
-    various source types, including sockets and file-like objects. It ensures
-    the entire buffer is filled or returns False on EOF at the start.
+    This helper function reads data from a source into a provided buffer.
+    It supports different source types such as file-like objects, sockets,
+    or other readable streams. The function ensures the buffer is fully
+    filled or raises an error if the source ends prematurely.
 
     Args:
-        source: The data source, which can be a socket, file-like object, or
-            any object with 'readinto', 'recv_into', 'read', or 'recv' methods.
-        buf: The buffer to fill, which can be a bytearray, memoryview, or numpy array.
+        source: The source to read from. Can be any object with read(),
+            readinto(), recv(), or recv_into() methods.
+        buf: The buffer to fill. Must be a bytearray, memoryview, or numpy array.
 
     Returns:
-        bool: True if the buffer was fully filled, False if EOF was encountered
-        before reading any data.
+        bool: True if the buffer was successfully filled, False if the source
+        reached EOF cleanly (only when no data was read).
 
     Raises:
-        EOFError: If the stream ends unexpectedly after partial reading.
+        EOFError: If the source ends before the buffer is fully filled.
     """
     view = memoryview(buf)
     n = view.nbytes
@@ -58,7 +59,7 @@ def _read_into_buffer(source: Any, buf: Union[bytearray, memoryview, np.ndarray]
 
         if read == 0:
             if pos == 0: return False 
-            raise EOFError(f"Stream ended unexpectedly. Expected {n} bytes, got {pos}")
+            raise EOFError(f"Expected {n} bytes, got {pos}")
             
         pos += read
     return True
@@ -67,47 +68,65 @@ def _read_into_buffer(source: Any, buf: Union[bytearray, memoryview, np.ndarray]
 
 def read_stream(source: Any) -> Union[np.ndarray, None]:
     """
-    Optimized stream reader: Consolidates data reads and verifies integrity.
+    Read and deserialize a tensor from a stream source.
 
-    Read a complete Tenso packet from a stream source and deserialize it into
-    a numpy array. This function handles the full packet parsing, including
-    header, shape, padding, body, and optional integrity footer.
+    This function reads a Tenso packet from a stream (such as a file, socket,
+    or other readable source) and deserializes it into a numpy array. It handles
+    the packet structure, including header, shape, padding, body, and optional
+    integrity footer. Returns None if the stream ends cleanly before any data.
 
     Args:
-        source: The data source, which can be a socket, file-like object, or
-            any object supported by _read_into_buffer.
+        source: The stream source to read from. Can be any object with read(),
+            readinto(), recv(), or recv_into() methods.
 
     Returns:
-        np.ndarray or None: The deserialized numpy array with writeable=False,
-        or None if EOF is encountered before any data.
+        Union[np.ndarray, None]: The deserialized numpy array with writeable=False,
+        or None if the stream ended before reading any data.
 
     Raises:
-        ValueError: If the packet magic number is invalid or integrity check fails.
+        ValueError: If the packet is invalid, has an unsupported dtype, or
+        integrity check fails.
         EOFError: If the stream ends unexpectedly during reading.
     """
+    # 1. Read Header
     header = bytearray(8)
-    if not _read_into_buffer(source, header): return None
+    try:
+        if not _read_into_buffer(source, header): return None
+    except EOFError as e:
+        raise EOFError(f"Stream ended during header read. {e}") from None
         
     magic, ver, flags, dtype_code, ndim = struct.unpack('<4sBBBB', header)
     if magic != _MAGIC: raise ValueError("Invalid tenso packet")
 
+    # 2. Read Shape
     shape_len = ndim * 4
     shape_bytes = bytearray(shape_len)
-    if not _read_into_buffer(source, shape_bytes): raise EOFError("Stream ended during shape read")
+    try:
+        if not _read_into_buffer(source, shape_bytes):
+            raise EOFError("Stream ended during shape read")
+    except EOFError as e:
+        raise EOFError(f"Stream ended during shape read. {e}") from None
+
     shape = struct.unpack(f'<{ndim}I', shape_bytes)
-    
     dtype = _REV_DTYPE_MAP.get(dtype_code)
+    
+    # 3. Calculate Layout
     current_pos = 8 + shape_len
     remainder = current_pos % _ALIGNMENT
     padding_len = 0 if remainder == 0 else (_ALIGNMENT - remainder)
     body_len = int(np.prod(shape) * dtype.itemsize)
-    
-    # Read Padding + Body + optional Footer in ONE buffer
     footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
+    
+    # 4. Consolidated Read (Padding + Body + Footer)
     data_buffer = np.empty(padding_len + body_len + footer_len, dtype=np.uint8)
-    if not _read_into_buffer(source, data_buffer): raise EOFError("Stream ended during data read")
+    try:
+        if not _read_into_buffer(source, data_buffer):
+            raise EOFError("Stream ended during body read")
+    except EOFError as e:
+        # Re-raise with the exact string "Stream ended during body read" for pytest match
+        raise EOFError(f"Stream ended during body read. {e}") from None
 
-    # Verify XXH3 Integrity
+    # 5. Verify Integrity
     if footer_len > 0:
         body_slice = data_buffer[padding_len : padding_len + body_len]
         actual_hash = xxhash.xxh3_64_intdigest(body_slice)

@@ -21,6 +21,9 @@ try:
 except ImportError:
     print("Warning: Missing benchmark dependencies (msgpack, pyarrow, safetensors). Some tests skipped.")
 
+# Global state for integrity check
+USE_INTEGRITY = False
+
 # --- HELPER: Resource Monitoring ---
 
 class ResourceMonitor:
@@ -77,13 +80,15 @@ def bench_arrow(data):
     return enc, dec
 
 def bench_tenso(data):
-    return tenso.dumps, tenso.loads
+    # Wrap dumps to respect the global USE_INTEGRITY flag
+    def enc(x): return tenso.dumps(x, check_integrity=USE_INTEGRITY)
+    return enc, tenso.loads
 
 # --- BENCHMARK RUNNERS ---
 
 def run_serialization():
     print("\n" + "="*80)
-    print("BENCHMARK 1: IN-MEMORY SERIALIZATION (CPU Overhead)")
+    print(f"BENCHMARK 1: IN-MEMORY SERIALIZATION (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     SCENARIOS = [
@@ -132,7 +137,7 @@ def run_serialization():
 
 def run_io():
     print("\n" + "="*80)
-    print("BENCHMARK 2: DISK I/O (Read/Write & Memory Mapping)")
+    print(f"BENCHMARK 2: DISK I/O (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     shape = (8192, 8192) 
@@ -147,14 +152,16 @@ def run_io():
     with tempfile.NamedTemporaryFile(delete=False) as f: path = f.name
     try:
         t0 = time.perf_counter()
-        with open(path, "wb") as f: tenso.dump(data, f)
+        with open(path, "wb") as f: tenso.dump(data, f, check_integrity=USE_INTEGRITY)
         t_write = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
+        # load automatically detects integrity footer from header
         with open(path, "rb") as f: tenso.load(f, mmap_mode=True)
         t_read = (time.perf_counter() - t0) * 1000
         print(f"{'Tenso':<15} | {t_write:>10.2f} | {t_read:>10.2f}")
-    finally: os.remove(path)
+    finally: 
+        if os.path.exists(path): os.remove(path)
 
     # 2. Numpy
     with tempfile.NamedTemporaryFile(delete=False, suffix='.npy') as f: path = f.name
@@ -167,7 +174,8 @@ def run_io():
         np.load(path, mmap_mode='r')
         t_read = (time.perf_counter() - t0) * 1000
         print(f"{'Numpy .npy':<15} | {t_write:>10.2f} | {t_read:>10.2f}")
-    finally: os.remove(path)
+    finally: 
+        if os.path.exists(path): os.remove(path)
 
     # 3. Pickle
     with tempfile.NamedTemporaryFile(delete=False) as f: path = f.name
@@ -181,17 +189,18 @@ def run_io():
             pickle.load(f)
             t_read = (time.perf_counter() - t0) * 1000
         print(f"{'Pickle':<15} | {t_write:>10.2f} | {t_read:>10.2f}")
-    finally: os.remove(path)
+    finally: 
+        if os.path.exists(path): os.remove(path)
 
 def run_stream_read():
     print("\n" + "="*80)
-    print("BENCHMARK 3: STREAM READ (Throughput & Memory Churn)")
+    print(f"BENCHMARK 3: STREAM READ (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     class FastStream(io.BytesIO): pass # IOBase supports readinto
     
     data = np.random.rand(5000, 5000).astype(np.float32)
-    packet = tenso.dumps(data)
+    packet = tenso.dumps(data, check_integrity=USE_INTEGRITY)
     size_mb = len(packet) / (1024 * 1024)
     
     print(f"Dataset: {size_mb:.0f} MB Packet")
@@ -222,7 +231,7 @@ def run_stream_read():
 
 def run_stream_write():
     print("\n" + "="*80)
-    print("BENCHMARK 4: NETWORK WRITE (Latency & Atomic Packets)")
+    print(f"BENCHMARK 4: NETWORK WRITE (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     PORT = 9998
@@ -232,12 +241,14 @@ def run_stream_write():
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('localhost', PORT))
         s.listen(1)
-        conn, _ = s.accept()
-        while True:
-            try:
-                if not conn.recv(1024*1024): break
-            except: break
-        conn.close()
+        try:
+            conn, _ = s.accept()
+            while True:
+                try:
+                    if not conn.recv(1024*1024): break
+                except: break
+            conn.close()
+        except: pass
         s.close()
 
     t = threading.Thread(target=sink_server, daemon=True)
@@ -245,29 +256,31 @@ def run_stream_write():
     time.sleep(0.5)
 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.connect(('localhost', PORT))
+    try:
+        client.connect(('localhost', PORT))
 
-    data = np.random.rand(16, 16).astype(np.float32)
-    COUNT = 10000
-    
-    print(f"Sending {COUNT} tensors (1KB each) over localhost TCP...")
+        data = np.random.rand(16, 16).astype(np.float32)
+        COUNT = 10000
+        
+        print(f"Sending {COUNT} tensors (1KB each) over localhost TCP...")
 
-    # Optimized write_stream
-    t0 = time.perf_counter()
-    for _ in range(COUNT):
-        tenso.write_stream(data, client)
-    t_total = time.perf_counter() - t0
-    
-    client.close()
-    
-    print(f"Total Time: {t_total:.4f}s")
-    print(f"Throughput: {COUNT/t_total:.0f} packets/sec")
-    print(f"Latency:    {(t_total/COUNT)*1_000_000:.1f} µs/packet")
+        # Optimized write_stream
+        t0 = time.perf_counter()
+        for _ in range(COUNT):
+            tenso.write_stream(data, client, check_integrity=USE_INTEGRITY)
+        t_total = time.perf_counter() - t0
+        
+        client.close()
+        
+        print(f"Total Time: {t_total:.4f}s")
+        print(f"Throughput: {COUNT/t_total:.0f} packets/sec")
+        print(f"Latency:    {(t_total/COUNT)*1_000_000:.1f} µs/packet")
+    except:
+        print("Network write benchmark failed. Connection issues.")
 
 def run_memory_overhead():
-    """NEW: Benchmark memory overhead of different formats."""
     print("\n" + "="*80)
-    print("BENCHMARK 5: MEMORY OVERHEAD (Serialization Overhead)")
+    print(f"BENCHMARK 5: MEMORY OVERHEAD (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     shapes = [
@@ -286,7 +299,7 @@ def run_memory_overhead():
         results = {}
         
         # Tenso
-        packet = tenso.dumps(data)
+        packet = tenso.dumps(data, check_integrity=USE_INTEGRITY)
         results['Tenso'] = len(packet) / 1024 / 1024
         
         # Pickle
@@ -314,9 +327,8 @@ def run_memory_overhead():
         print("-" * 80)
 
 def run_cpu_usage():
-    """NEW: Measure CPU usage during serialization/deserialization."""
     print("\n" + "="*80)
-    print("BENCHMARK 6: CPU USAGE (Resource Efficiency)")
+    print(f"BENCHMARK 6: CPU USAGE (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     data = np.random.rand(4096, 4096).astype(np.float32)
@@ -326,7 +338,7 @@ def run_cpu_usage():
     print("-" * 60)
     
     formats = {
-        'Tenso': (tenso.dumps, tenso.loads),
+        'Tenso': (lambda x: tenso.dumps(x, check_integrity=USE_INTEGRITY), tenso.loads),
         'Pickle': (lambda x: pickle.dumps(x, protocol=pickle.HIGHEST_PROTOCOL), pickle.loads)
     }
     
@@ -371,9 +383,8 @@ def run_cpu_usage():
         print(f"{name:<15} | {ser_cpu:>13.1f}% | {des_cpu:>16.1f}%")
 
 def run_dtype_coverage():
-    """NEW: Test all supported dtypes."""
     print("\n" + "="*80)
-    print("BENCHMARK 7: DTYPE COVERAGE (Compatibility Test)")
+    print(f"BENCHMARK 7: DTYPE COVERAGE (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     dtypes = [
@@ -402,7 +413,7 @@ def run_dtype_coverage():
                 data = np.random.randn(*shape).astype(dtype)
             
             t0 = time.perf_counter()
-            packet = tenso.dumps(data)
+            packet = tenso.dumps(data, check_integrity=USE_INTEGRITY)
             restored = tenso.loads(packet)
             roundtrip = (time.perf_counter() - t0) * 1000
             
@@ -420,9 +431,8 @@ def run_dtype_coverage():
     print("-" * 65)
 
 def run_arrow_comparison():
-    """NEW: Detailed Arrow vs Tenso comparison."""
     print("\n" + "="*80)
-    print("BENCHMARK 8: ARROW vs TENSO (Head-to-Head)")
+    print(f"BENCHMARK 8: ARROW vs TENSO (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     if 'pa' not in globals():
@@ -444,7 +454,7 @@ def run_arrow_comparison():
         
         # Tenso
         t0 = time.perf_counter()
-        tenso_packet = tenso.dumps(data)
+        tenso_packet = tenso.dumps(data, check_integrity=USE_INTEGRITY)
         tenso_ser = (time.perf_counter() - t0) * 1000
         
         t0 = time.perf_counter()
@@ -475,9 +485,8 @@ def run_arrow_comparison():
     print("-" * 95)
 
 def run_correctness():
-    """NEW: Verify data integrity."""
     print("\n" + "="*80)
-    print("BENCHMARK 9: CORRECTNESS (Data Integrity)")
+    print(f"BENCHMARK 9: CORRECTNESS (Integrity: {USE_INTEGRITY})")
     print("="*80)
     
     tests = [
@@ -495,7 +504,7 @@ def run_correctness():
     
     for name, gen_func in tests:
         data = gen_func()
-        packet = tenso.dumps(data)
+        packet = tenso.dumps(data, check_integrity=USE_INTEGRITY)
         restored = tenso.loads(packet)
         
         if np.allclose(data, restored, rtol=1e-7, atol=1e-7):
@@ -557,8 +566,17 @@ Benchmark Modes:
         action="store_true",
         help="Skip system information summary"
     )
+
+    parser.add_argument(
+        "--integrity",
+        action="store_true",
+        help="Enable XXH3 integrity checks for Tenso benchmarks"
+    )
     
     args = parser.parse_args()
+    
+    # Set the global flag
+    USE_INTEGRITY = args.integrity
     
     if not args.no_summary:
         print_summary()
