@@ -1,6 +1,15 @@
 # CHANGELOG
 
 
+## v0.8.1 (2025-12-21)
+
+### Bug Fixes
+
+- Add XXH3 integrity checks; update README and benchmark for integrity support; adjust
+  pyproject.toml dependencies
+  ([`886cdc5`](https://github.com/Khushiyant/tenso/commit/886cdc5f84f49eb1054c531692751f73f19ebcee))
+
+
 ## v0.8.0 (2025-12-21)
 
 ### Features
