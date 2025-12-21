@@ -3,10 +3,7 @@ name = "tenso"
 version = "0.8.0"
 description = "High-performance zero-copy tensor protocol"
 readme = "README.md"
-dependencies = [
-    "numpy",
-    "xxhash",
-]
+dependencies = ["numpy"]
 requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
@@ -33,10 +30,8 @@ dev = [
     "sphinx-autodoc-typehints>=3.0.1",
     "sphinx-rtd-theme>=3.0.0",
 ]
-gpu = [
-    "cupy-cuda12x; sys_platform != 'darwin'",
-    "torch",
-]
+gpu = ["cupy-cuda12x; sys_platform != 'darwin'", "torch"]
+integrity = ["xxhash"]
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
