@@ -210,7 +210,7 @@ def write_stream(tensor: np.ndarray, dest: Any, strict: bool = False, check_inte
     Write a tensor to a destination using vectored I/O.
     
     Serializes a tensor and writes it to any destination that supports write()
-    or has a fileno() method (for writev system calls). Uses iter_dumps internally
+    or has a fileno() method (for direct system calls). Uses iter_dumps internally
     for memory-efficient streaming.
     
     Args:
@@ -229,13 +229,9 @@ def write_stream(tensor: np.ndarray, dest: Any, strict: bool = False, check_inte
     """
     chunks = list(iter_dumps(tensor, strict=strict, check_integrity=check_integrity))
     
-    if hasattr(dest, 'fileno'):
-        try:
-            fd = dest.fileno()
-            if hasattr(os, 'writev'):
-                return os.writev(fd, chunks)
-        except (AttributeError, OSError): pass 
-            
+    # Removed os.writev optimization as it conflicts with Python's buffered I/O
+    # (e.g., tempfile, BytesIO) causing data corruption or lost writes.
+    # Python's write() handles memoryviews efficiently enough.
     written = 0
     for chunk in chunks:
         dest.write(chunk)
@@ -400,4 +396,13 @@ def load(fp: BinaryIO, mmap_mode: bool = False, copy: bool = False) -> np.ndarra
     Raises:
         ValueError: If the packet is invalid or corrupted.
         OSError: If reading from the file fails.
+        EOFError: If the file is empty or the stream ends prematurely.
     """
+    if mmap_mode:
+        mm = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
+        return loads(mm, copy=copy)
+    
+    result = read_stream(fp)
+    if result is None:
+        raise EOFError("Empty file or stream")
+    return result
