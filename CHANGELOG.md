@@ -1,6 +1,29 @@
 # CHANGELOG
 
 
+## v0.9.0 (2025-12-22)
+
+### Bug Fixes
+
+- Add XXH3 integrity checks; update README and benchmark for integrity support; adjust
+  pyproject.toml dependencies
+  ([`b8612b0`](https://github.com/Khushiyant/tenso/commit/b8612b0d8cc28c841ef6cc9491c35f58b3353177))
+
+### Features
+
+- Enhance Tenso with DoS protection, FastAPI integration, and GPU support
+  ([`e0f3d2a`](https://github.com/Khushiyant/tenso/commit/e0f3d2ae99939041c179557f8cea2b531e4ee224))
+
+- Added security limits for maximum dimensions (MAX_NDIM) and maximum elements (MAX_ELEMENTS) to
+  prevent allocation attacks. - Improved error handling in core functions to raise ValueErrors for
+  packets exceeding security limits. - Introduced FastAPI integration with a new TensoResponse class
+  for efficient tensor streaming. - Enhanced GPU support by adding JAX as a backend option alongside
+  CuPy and PyTorch. - Implemented async read/write functions for better performance in asynchronous
+  environments. - Added comprehensive tests for new features, including DoS protection, FastAPI
+  response handling, and GPU device reading. - Updated documentation and comments for clarity and
+  maintainability.
+
+
 ## v0.8.0 (2025-12-21)
 
 ### Features
