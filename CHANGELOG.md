@@ -1,6 +1,15 @@
 # CHANGELOG
 
 
+## v0.9.1 (2025-12-22)
+
+### Bug Fixes
+
+- Improve write_stream function by removing os.writev optimization to prevent data corruption;
+  enhance TensoResponse for better tensor streaming with custom headers and error handling
+  ([`2262d4a`](https://github.com/Khushiyant/tenso/commit/2262d4a09d8a8bf474a096d5bc6ff173941c1f8f))
+
+
 ## v0.9.0 (2025-12-22)
 
 ### Bug Fixes
