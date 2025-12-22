@@ -15,6 +15,18 @@ except ImportError:
     HAS_CUDA_TORCH = False
 
 try:
+    import jax
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
+try:
+    from tenso import gpu
+    GPU_MODULE_AVAILABLE = True
+except ImportError:
+    GPU_MODULE_AVAILABLE = False
+
+try:
     import cupy
     HAS_CUPY = True
     try:
@@ -185,3 +197,28 @@ class TestGPU:
             stream = io.BytesIO(b'TNSO')
             with pytest.raises(EOFError):
                 gpu.read_to_device(stream)
+
+    @pytest.mark.skipif(not HAS_JAX, reason="JAX not installed")
+    def test_read_to_device_jax_mocked(self):
+        """Verify JAX path uses device_put."""
+        
+        with patch('tenso.gpu.BACKEND', 'jax'), \
+             patch('tenso.gpu.jax') as mock_jax:
+             
+            # Setup JAX mock
+            mock_device = MagicMock()
+            mock_jax.devices.return_value = [mock_device]
+            
+            data = np.random.rand(10, 10).astype(np.float32)
+            stream = self._create_stream(data)
+            
+            gpu.read_to_device(stream, device_id=0)
+            
+            # Assertions
+            mock_jax.device_put.assert_called_once()
+            args, kwargs = mock_jax.device_put.call_args
+            
+            # args[0] should be the numpy array
+            assert isinstance(args[0], np.ndarray)
+            assert np.array_equal(args[0], data)
+            assert kwargs['device'] == mock_device

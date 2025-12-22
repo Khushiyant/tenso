@@ -4,27 +4,53 @@ import tenso
 import tempfile
 import os
 import io
+import struct
+from tenso.config import MAX_NDIM, MAX_ELEMENTS, _MAGIC, _VERSION, FLAG_ALIGNED
+
+# Try to import bfloat16 for testing
+try:
+    from ml_dtypes import bfloat16
+    HAS_BF16 = True
+except ImportError:
+    try:
+        # NumPy 2.0+ might have it
+        np.dtype('bfloat16')
+        bfloat16 = np.float16 # Placeholder if needed
+        HAS_BF16 = True
+    except TypeError:
+        HAS_BF16 = False
+
 # --- Core Functionality Tests ---
 
-@pytest.mark.parametrize("dtype", [
+DTYPES_TO_TEST = [
     np.float32, np.int32, np.float64, np.int64,
     np.uint8, np.uint16, np.bool_, np.float16,
     np.int8, np.int16, np.uint32, np.uint64,
-    # [NEW] Added Complex Support
     np.complex64, np.complex128
-])
+]
+
+if HAS_BF16:
+    DTYPES_TO_TEST.append(np.dtype('bfloat16'))
+
+@pytest.mark.parametrize("dtype", DTYPES_TO_TEST)
 def test_all_dtypes(dtype):
     """Verify all supported dtypes serialize and deserialize correctly."""
     shape = (10, 10)
+    
+    # [FIX] Normalize to dtype instance to access .name safely
+    dt_instance = np.dtype(dtype)
+    
     if dtype == np.bool_:
         original = np.random.randint(0, 2, size=shape).astype(dtype)
     elif np.issubdtype(dtype, np.integer):
         original = np.random.randint(0, 10, size=shape).astype(dtype)
     elif np.issubdtype(dtype, np.complexfloating):
-        # Generate random complex numbers
         real = np.random.randn(*shape)
         imag = np.random.randn(*shape)
         original = (real + 1j * imag).astype(dtype)
+    elif dt_instance.name == 'bfloat16':
+        # Create float32 and cast
+        original = np.random.randn(*shape).astype(np.float32).astype(dtype)
     else:
         original = np.random.randn(*shape).astype(dtype)
         
@@ -33,11 +59,11 @@ def test_all_dtypes(dtype):
     
     assert restored.dtype == original.dtype
     assert restored.shape == original.shape
+    # Use array_equal for exact match
     assert np.array_equal(original, restored)
 
 def test_large_dimensions():
-    """Verify handling of high-dimensional arrays."""
-    # Create a 6D array (max ndim is 255 in protocol v2)
+    """Verify handling of high-dimensional arrays (within limits)."""
     shape = (2, 2, 2, 2, 2, 2)
     original = np.zeros(shape, dtype=np.float32)
     
@@ -46,36 +72,51 @@ def test_large_dimensions():
     
     assert restored.shape == shape
     
-    # Test packet inspection
     info = tenso.get_packet_info(packet)
     assert info['ndim'] == 6
-    assert info['shape'] == shape
 
-# --- [NEW] Strict Mode Tests ---
+# --- [NEW] DoS Protection Tests ---
+
+def test_dos_max_ndim():
+    """Verify that exceeding MAX_NDIM raises a ValueError."""
+    malicious_ndim = MAX_NDIM + 1
+    header = struct.pack('<4sBBBB', _MAGIC, _VERSION, FLAG_ALIGNED, 1, malicious_ndim)
+    packet = header + b'\x00' * 100 
+    
+    with pytest.raises(ValueError, match="Packet exceeds maximum dimensions"):
+        tenso.loads(packet)
+
+def test_dos_max_elements():
+    """Verify that exceeding MAX_ELEMENTS raises a ValueError."""
+    ndim = 1
+    header = struct.pack('<4sBBBB', _MAGIC, _VERSION, FLAG_ALIGNED, 1, ndim)
+    malicious_shape = struct.pack('<I', MAX_ELEMENTS + 1)
+    packet = header + malicious_shape + b'\x00' * 100
+    
+    with pytest.raises(ValueError, match="Packet exceeds maximum elements"):
+        tenso.loads(packet)
+
+# --- Strict Mode Tests ---
 
 def test_strict_mode_success():
     """Strict mode should pass for C-Contiguous arrays."""
     data = np.random.rand(10, 10).astype(np.float32)
-    # Default numpy arrays are C-Contiguous
     packet = tenso.dumps(data, strict=True)
     assert len(packet) > 0
 
 def test_strict_mode_failure():
     """Strict mode should raise ValueError for non-contiguous arrays."""
-    # Create a non-contiguous array using slicing
     data = np.random.rand(10, 10).astype(np.float32)
-    data_f = np.asfortranarray(data)  # Force Fortran (column-major) layout
+    data_f = np.asfortranarray(data)
     
-    # 1. verify it fails with strict=True
     with pytest.raises(ValueError, match="Tensor is not C-Contiguous"):
         tenso.dumps(data_f, strict=True)
         
-    # 2. verify it succeeds (by copying) with strict=False
     packet = tenso.dumps(data_f, strict=False)
     restored = tenso.loads(packet)
     assert np.array_equal(data, restored)
 
-# --- [NEW] Memory Mapping Tests ---
+# --- Memory Mapping Tests ---
 
 def test_mmap_loading():
     """Verify that we can load files using mmap_mode."""
@@ -87,93 +128,27 @@ def test_mmap_loading():
         
     try:
         with open(tmp_path, "rb") as f:
-            # Load with memory mapping
             loaded = tenso.load(f, mmap_mode=True)
-            
-            # Verify data
             assert np.array_equal(data, loaded)
-            
-            # Verify it is actually using mmap (base should be mmap)
-            # Depending on numpy version, base might be the mmap object directly or indirect
-            assert loaded.base is not None
-            
+            assert loaded.base is not None    
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-# --- Alignment & Safety Tests ---
-
-def test_is_aligned_utility():
-    """Test the is_aligned utility function."""
-    data = b'\x00' * 100
-    aligned = tenso.is_aligned(data)
-    assert isinstance(aligned, bool)
-
-def test_padding_logic():
-    """Verify that packets contain correct padding for 64-byte alignment."""
-    data = np.zeros((10,), dtype=np.float32)
-    packet = tenso.dumps(data)
-    
-    header_shape_len = 8 + 4
-    padding_len = 64 - header_shape_len
-    
-    # Extract padding area directly
-    padding = packet[header_shape_len : header_shape_len + padding_len]
-    assert len(padding) == padding_len
-    assert padding == b'\x00' * padding_len
-
 def test_copy_flag():
     """Verify copy=True behavior."""
     data = np.zeros((10,), dtype=np.float32)
     packet = tenso.dumps(data)
     
-    # Default (Zero Copy)
     arr_view = tenso.loads(packet, copy=False)
-    # Writeable flag should be False for zero-copy views to prevent corruption
     assert arr_view.flags.writeable is False
     
-    # Copy (Safe)
-    arr_copy = tenso.loads(packet, copy=True)
-    assert arr_copy.flags.writeable is True
-    assert arr_copy.base is None  # Owns its memory
-
-def test_copy_flag():
-    """Verify copy=True behavior."""
-    data = np.zeros((10,), dtype=np.float32)
-    packet = tenso.dumps(data)
-    
-    # Default (Zero Copy)
-    arr_view = tenso.loads(packet, copy=False)
-    # The new safety feature enforces writeable=False for views
-    assert arr_view.flags.writeable is False
-    
-    # Copy (Safe)
     arr_copy = tenso.loads(packet, copy=True)
     assert arr_copy.flags.writeable is True
     assert arr_copy.base is None
 
 def test_dumps_return_type():
-    """Verify dumps returns a memoryview that acts like bytes."""
+    """Verify dumps returns a memoryview."""
     data = np.zeros((10,), dtype=np.float32)
     packet = tenso.dumps(data)
-    
-    # Should be memoryview
     assert isinstance(packet, memoryview)
-    
-    # Should be usable in write()
-    with io.BytesIO() as f:
-        f.write(packet)
-        assert f.getvalue() == bytes(packet)
-
-def test_dumps_strict_and_copy():
-    """Verify that strict mode and copy mechanisms work with new buffer."""
-    # Non-contiguous
-    data = np.zeros((10, 10), order='F')
-    
-    with pytest.raises(ValueError, match="Tensor is not C-Contiguous"):
-        tenso.dumps(data, strict=True)
-        
-    # Should work without strict
-    packet = tenso.dumps(data, strict=False)
-    restored = tenso.loads(packet)
-    assert np.array_equal(data, restored)

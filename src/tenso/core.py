@@ -6,7 +6,10 @@ import math
 import mmap
 import sys
 import os
-from .config import _MAGIC, _VERSION, _ALIGNMENT, _DTYPE_MAP, _REV_DTYPE_MAP, FLAG_ALIGNED, FLAG_INTEGRITY
+from .config import (
+    _MAGIC, _VERSION, _ALIGNMENT, _DTYPE_MAP, _REV_DTYPE_MAP, 
+    FLAG_ALIGNED, FLAG_INTEGRITY, MAX_NDIM, MAX_ELEMENTS
+)
 
 IS_LITTLE_ENDIAN = (sys.byteorder == 'little')
 
@@ -15,23 +18,22 @@ IS_LITTLE_ENDIAN = (sys.byteorder == 'little')
 def _read_into_buffer(source: Any, buf: Union[bytearray, memoryview, np.ndarray]) -> bool:
     """
     Fill a buffer from a source, handling various I/O types.
-
-    This helper function reads data from a source into a provided buffer.
-    It supports different source types such as file-like objects, sockets,
-    or other readable streams. The function ensures the buffer is fully
-    filled or raises an error if the source ends prematurely.
-
+    
+    This internal helper function reads data from different types of sources
+    (files, sockets, streams) into a buffer, handling partial reads and
+    different I/O interfaces gracefully.
+    
     Args:
-        source: The source to read from. Can be any object with read(),
-            readinto(), recv(), or recv_into() methods.
-        buf: The buffer to fill. Must be a bytearray, memoryview, or numpy array.
-
+        source: The data source to read from. Can be any object with read(),
+                readinto(), recv(), or recv_into() methods.
+        buf: The buffer to fill with data. Can be bytearray, memoryview, or np.ndarray.
+    
     Returns:
-        bool: True if the buffer was successfully filled, False if the source
-        reached EOF cleanly (only when no data was read).
-
+        bool: True if the buffer was filled completely, False if EOF was reached
+              before filling the buffer (only possible on first read).
+    
     Raises:
-        EOFError: If the source ends before the buffer is fully filled.
+        EOFError: If the source ends prematurely after some data has been read.
     """
     view = memoryview(buf)
     n = view.nbytes
@@ -68,25 +70,25 @@ def _read_into_buffer(source: Any, buf: Union[bytearray, memoryview, np.ndarray]
 
 def read_stream(source: Any) -> Union[np.ndarray, None]:
     """
-    Read and deserialize a tensor from a stream source.
-
-    This function reads a Tenso packet from a stream (such as a file, socket,
-    or other readable source) and deserializes it into a numpy array. It handles
-    the packet structure, including header, shape, padding, body, and optional
-    integrity footer. Returns None if the stream ends cleanly before any data.
-
+    Read and deserialize a tensor from a stream source with DoS protection.
+    
+    This function reads a complete Tenso packet from any stream-like source
+    (file, socket, etc.) and deserializes it into a numpy array. Includes
+    built-in protection against denial-of-service attacks by limiting maximum
+    dimensions and element counts.
+    
     Args:
-        source: The stream source to read from. Can be any object with read(),
-            readinto(), recv(), or recv_into() methods.
-
+        source: Stream source to read from. Must support read(), readinto(),
+                recv(), or recv_into() methods.
+    
     Returns:
-        Union[np.ndarray, None]: The deserialized numpy array with writeable=False,
-        or None if the stream ended before reading any data.
-
+        np.ndarray or None: The deserialized tensor with writeable=False flag set,
+                           or None if the stream ended before any data was read.
+    
     Raises:
-        ValueError: If the packet is invalid, has an unsupported dtype, or
-        integrity check fails.
-        EOFError: If the stream ends unexpectedly during reading.
+        ValueError: If the packet is invalid, exceeds security limits, or fails
+                   integrity checks.
+        EOFError: If the stream ends prematurely during reading.
     """
     # 1. Read Header
     header = bytearray(8)
@@ -97,6 +99,10 @@ def read_stream(source: Any) -> Union[np.ndarray, None]:
         
     magic, ver, flags, dtype_code, ndim = struct.unpack('<4sBBBB', header)
     if magic != _MAGIC: raise ValueError("Invalid tenso packet")
+    
+    # [SECURITY] DoS Protection: Check Dimensions
+    if ndim > MAX_NDIM:
+        raise ValueError(f"Packet exceeds maximum dimensions ({ndim} > {MAX_NDIM})")
 
     # 2. Read Shape
     shape_len = ndim * 4
@@ -108,13 +114,21 @@ def read_stream(source: Any) -> Union[np.ndarray, None]:
         raise EOFError(f"Stream ended during shape read. {e}") from None
 
     shape = struct.unpack(f'<{ndim}I', shape_bytes)
+    
+    # [SECURITY] DoS Protection: Check Element Count
+    num_elements = int(np.prod(shape))
+    if num_elements > MAX_ELEMENTS:
+        raise ValueError(f"Packet exceeds maximum elements ({num_elements} > {MAX_ELEMENTS})")
+
     dtype = _REV_DTYPE_MAP.get(dtype_code)
+    if dtype is None:
+        raise ValueError(f"Unsupported dtype code: {dtype_code}")
     
     # 3. Calculate Layout
     current_pos = 8 + shape_len
     remainder = current_pos % _ALIGNMENT
     padding_len = 0 if remainder == 0 else (_ALIGNMENT - remainder)
-    body_len = int(np.prod(shape) * dtype.itemsize)
+    body_len = num_elements * dtype.itemsize
     footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
     
     # 4. Consolidated Read (Padding + Body + Footer)
@@ -123,7 +137,6 @@ def read_stream(source: Any) -> Union[np.ndarray, None]:
         if not _read_into_buffer(source, data_buffer):
             raise EOFError("Stream ended during body read")
     except EOFError as e:
-        # Re-raise with the exact string "Stream ended during body read" for pytest match
         raise EOFError(f"Stream ended during body read. {e}") from None
 
     # 5. Verify Integrity
@@ -134,7 +147,7 @@ def read_stream(source: Any) -> Union[np.ndarray, None]:
         if actual_hash != expected_hash:
             raise ValueError("Integrity check failed: XXH3 mismatch")
 
-    arr = np.frombuffer(data_buffer, dtype=dtype, offset=padding_len, count=int(np.prod(shape))).reshape(shape)
+    arr = np.frombuffer(data_buffer, dtype=dtype, offset=padding_len, count=num_elements).reshape(shape)
     arr.flags.writeable = False 
     return arr
 
@@ -143,24 +156,25 @@ def read_stream(source: Any) -> Union[np.ndarray, None]:
 def iter_dumps(tensor: np.ndarray, strict: bool = False, check_integrity: bool = False) -> Generator[Union[bytes, memoryview], None, None]:
     """
     Vectored serialization: Yields packet parts to avoid memory copies.
-
-    Serialize a numpy array into a Tenso packet by yielding individual parts
-    (header, shape, padding, body, footer) as separate chunks. This allows
-    for efficient I/O operations without creating a contiguous copy of the
-    entire packet in memory.
-
+    
+    This generator function serializes a tensor into Tenso format by yielding
+    individual chunks of the packet. This allows for zero-copy streaming and
+    efficient I/O operations, especially useful for large tensors.
+    
     Args:
-        tensor: The numpy array to serialize.
-        strict: If True, raise an error if the tensor is not C-contiguous.
-            If False, make a contiguous copy if necessary.
-        check_integrity: If True, include an XXH3 checksum in the packet footer.
-
+        tensor: The numpy array to serialize. Must have a supported dtype.
+        strict: If True, raises an error for non-contiguous arrays instead of
+                making them contiguous. Default False.
+        check_integrity: If True, includes an XXH3 hash for integrity verification.
+                        Default False.
+    
     Yields:
-        bytes or memoryview: Sequential parts of the Tenso packet.
-
+        bytes or memoryview: Sequential chunks of the Tenso packet (header,
+                           shape, padding, body, optional integrity hash).
+    
     Raises:
-        ValueError: If the tensor's dtype is unsupported or (if strict=True)
-        the tensor is not C-contiguous.
+        ValueError: If the tensor dtype is unsupported or (if strict=True) if
+                   the tensor is not C-contiguous.
     """
     if tensor.dtype not in _DTYPE_MAP: raise ValueError(f"Unsupported dtype: {tensor.dtype}")
     
@@ -194,25 +208,23 @@ def iter_dumps(tensor: np.ndarray, strict: bool = False, check_integrity: bool =
 def write_stream(tensor: np.ndarray, dest: Any, strict: bool = False, check_integrity: bool = False) -> int:
     """
     Write a tensor to a destination using vectored I/O.
-
-    Serialize a numpy array and write it to a destination using efficient
-    vectored I/O operations. If the destination supports writev (like files),
-    it uses that for atomic writes; otherwise falls back to sequential writes.
-
+    
+    Serializes a tensor and writes it to any destination that supports write()
+    or has a fileno() method (for writev system calls). Uses iter_dumps internally
+    for memory-efficient streaming.
+    
     Args:
-        tensor: The numpy array to serialize and write.
-        dest: The destination object, which can be a file-like object with
-            a write method or a file descriptor with fileno().
-        strict: If True, raise an error if the tensor is not C-contiguous.
-            If False, make a contiguous copy if necessary.
-        check_integrity: If True, include an XXH3 checksum in the packet.
-
+        tensor: The numpy array to serialize.
+        dest: Destination to write to. Must support write() method, or have
+              fileno() for direct system calls.
+        strict: If True, raises error for non-contiguous arrays. Default False.
+        check_integrity: If True, includes integrity hash. Default False.
+    
     Returns:
-        int: The total number of bytes written.
-
+        int: Number of bytes written.
+    
     Raises:
-        ValueError: If the tensor's dtype is unsupported or (if strict=True)
-        the tensor is not C-contiguous.
+        ValueError: If tensor dtype is unsupported or other serialization errors.
         OSError: If writing to the destination fails.
     """
     chunks = list(iter_dumps(tensor, strict=strict, check_integrity=check_integrity))
@@ -235,22 +247,22 @@ def write_stream(tensor: np.ndarray, dest: Any, strict: bool = False, check_inte
 def dumps(tensor: np.ndarray, strict: bool = False, check_integrity: bool = False) -> memoryview:
     """
     Serialize a numpy array to a Tenso packet.
-
-    Convert a numpy array into a complete Tenso packet in memory, returning
-    a memoryview for efficient access without copying.
-
+    
+    Creates a complete Tenso packet in memory containing the serialized tensor.
+    The returned memoryview provides zero-copy access to the packet data.
+    
     Args:
-        tensor: The numpy array to serialize.
-        strict: If True, raise an error if the tensor is not C-contiguous.
-            If False, make a contiguous copy if necessary.
-        check_integrity: If True, include an XXH3 checksum in the packet.
-
+        tensor: The numpy array to serialize. Must have a supported dtype.
+        strict: If True, raises error for non-contiguous arrays instead of
+                making them contiguous. Default False.
+        check_integrity: If True, includes XXH3 hash for integrity verification.
+                        Default False.
+    
     Returns:
-        memoryview: A memoryview of the complete Tenso packet.
-
+        memoryview: A view of the complete Tenso packet bytes.
+    
     Raises:
-        ValueError: If the tensor's dtype is unsupported or (if strict=True)
-        the tensor is not C-contiguous.
+        ValueError: If tensor dtype is unsupported or other serialization errors.
     """
     if tensor.dtype not in _DTYPE_MAP: raise ValueError(f"Unsupported dtype: {tensor.dtype}")
     
@@ -281,6 +293,8 @@ def dumps(tensor: np.ndarray, strict: bool = False, check_integrity: bool = Fals
     
     body_start = current_len + padding_len
     body_end = body_start + tensor.nbytes
+    
+    # Efficient copy
     dest_view = buffer[body_start:body_end].view(dtype=tensor.dtype).reshape(shape)
     np.copyto(dest_view, tensor, casting='no')
     
@@ -292,32 +306,41 @@ def dumps(tensor: np.ndarray, strict: bool = False, check_integrity: bool = Fals
 
 def loads(data: Union[bytes, bytearray, memoryview, np.ndarray, mmap.mmap], copy: bool = False) -> np.ndarray:
     """
-    Deserialize a Tenso packet from a bytes-like object.
-
-    Parse a complete Tenso packet from memory and reconstruct the original
-    numpy array. Supports various buffer types and optional copying.
-
+    Deserialize a Tenso packet from a bytes-like object with DoS protection.
+    
+    Parses a complete Tenso packet from memory and reconstructs the original
+    numpy array. Includes security checks to prevent denial-of-service attacks.
+    
     Args:
         data: The raw Tenso packet data as bytes, bytearray, memoryview,
-            numpy array, or memory-mapped file.
-        copy: If True, return a copy of the array data. If False, return
-            a read-only view into the original buffer.
-
+              numpy array, or memory-mapped file.
+        copy: If True, returns a copy of the data instead of a read-only view.
+              Default False.
+    
     Returns:
-        np.ndarray: The deserialized numpy array. If copy=False, the array
-        has writeable=False to prevent accidental modification.
-
+        np.ndarray: The deserialized tensor. If copy=False, the array has
+                   writeable=False to prevent accidental modification.
+    
     Raises:
-        ValueError: If the packet is invalid, too short, or integrity check fails.
+        ValueError: If the packet is invalid, corrupted, or exceeds security limits.
     """
     mv = memoryview(data)
     if len(mv) < 8: raise ValueError("Packet too short")
     magic, ver, flags, dtype_code, ndim = struct.unpack('<4sBBBB', mv[:8])
     if magic != _MAGIC: raise ValueError("Invalid tenso packet")
     
+    if ndim > MAX_NDIM:
+        raise ValueError(f"Packet exceeds maximum dimensions ({ndim})")
+    
     shape_end = 8 + (ndim * 4)
     shape = struct.unpack(f'<{ndim}I', mv[8:shape_end])
-    dtype = _REV_DTYPE_MAP[dtype_code]
+    
+    # [SECURITY] DoS Protection
+    if np.prod(shape) > MAX_ELEMENTS:
+        raise ValueError("Packet exceeds maximum elements")
+
+    dtype = _REV_DTYPE_MAP.get(dtype_code)
+    if dtype is None: raise ValueError(f"Unsupported dtype code: {dtype_code}")
     
     body_start = shape_end
     if flags & FLAG_ALIGNED:
@@ -341,47 +364,40 @@ def loads(data: Union[bytes, bytearray, memoryview, np.ndarray, mmap.mmap], copy
 
 def dump(tensor: np.ndarray, fp: BinaryIO, strict: bool = False, check_integrity: bool = False) -> None:
     """
-    Serialize and write a tensor to a file using the optimized path.
-
-    This is a convenience function that combines serialization and file writing
-    using the efficient write_stream function.
-
+    Serialize a tensor and write it to a binary file.
+    
+    Convenience function that serializes a tensor and writes the complete
+    Tenso packet to an open binary file.
+    
     Args:
-        tensor: The numpy array to serialize and write.
-        fp: A binary file-like object open for writing.
-        strict: If True, raise an error if the tensor is not C-contiguous.
-            If False, make a contiguous copy if necessary.
-        check_integrity: If True, include an XXH3 checksum in the packet.
-
+        tensor: The numpy array to serialize.
+        fp: Open binary file object to write to (must be opened in binary mode).
+        strict: If True, raises error for non-contiguous arrays. Default False.
+        check_integrity: If True, includes integrity hash. Default False.
+    
     Raises:
-        ValueError: If the tensor's dtype is unsupported or (if strict=True)
-        the tensor is not C-contiguous.
+        ValueError: If serialization fails.
         OSError: If writing to the file fails.
     """
     write_stream(tensor, fp, strict=strict, check_integrity=check_integrity)
 
 def load(fp: BinaryIO, mmap_mode: bool = False, copy: bool = False) -> np.ndarray:
     """
-    Load a tensor from a file, optionally using memory-mapping.
-
-    Read a Tenso packet from a file and deserialize it. Supports memory-mapping
-    for large files to avoid loading the entire file into memory.
-
+    Deserialize a tensor from a binary file.
+    
+    Reads a complete Tenso packet from an open binary file and deserializes it.
+    Optionally uses memory mapping for efficient loading of large files.
+    
     Args:
-        fp: A binary file-like object open for reading.
-        mmap_mode: If True, use memory-mapping to read the file. This is
-            efficient for large files but requires the file to be seekable.
-        copy: If True and mmap_mode=True, return a copy of the array data.
-            If False, return a read-only view.
-
+        fp: Open binary file object to read from.
+        mmap_mode: If True, uses memory mapping for potentially better performance
+                  with large files. Default False.
+        copy: If True, returns a copy instead of a read-only view. Default False.
+    
     Returns:
-        np.ndarray: The deserialized numpy array.
-
+        np.ndarray: The deserialized tensor.
+    
     Raises:
-        ValueError: If the packet is invalid or integrity check fails.
-        EOFError: If the file ends unexpectedly.
+        ValueError: If the packet is invalid or corrupted.
+        OSError: If reading from the file fails.
     """
-    if mmap_mode:
-        mm = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
-        return loads(mm, copy=copy)
-    return read_stream(fp)

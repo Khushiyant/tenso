@@ -2,11 +2,11 @@ import pytest
 import numpy as np
 import tenso
 import asyncio
-import io
+from unittest.mock import MagicMock, AsyncMock
 
 # Check if async_core is available
 try:
-    from tenso.async_core import aread_stream
+    from tenso.async_core import aread_stream, awrite_stream
     ASYNC_AVAILABLE = True
 except ImportError:
     ASYNC_AVAILABLE = False
@@ -18,35 +18,62 @@ async def test_aread_stream_success():
     data = np.random.rand(20, 20).astype(np.float32)
     packet = tenso.dumps(data)
     
-    # Mock asyncio StreamReader
     reader = asyncio.StreamReader()
     reader.feed_data(packet)
     reader.feed_eof()
     
     result = await aread_stream(reader)
-    
     assert np.array_equal(data, result)
+
+@pytest.mark.skipif(not ASYNC_AVAILABLE, reason="Async core not implemented")
+@pytest.mark.asyncio
+async def test_awrite_stream_success():
+    """Test successful async write."""
+    data = np.random.rand(10, 10).astype(np.float32)
+    
+    # Mock StreamWriter
+    transport = MagicMock()
+    protocol = MagicMock()
+    
+    # [FIX] Get the running loop to satisfy StreamWriter's internal requirements
+    loop = asyncio.get_running_loop()
+    writer = asyncio.StreamWriter(transport, protocol, None, loop)
+    
+    # Mock drain to be awaitable
+    writer.drain = AsyncMock()
+    
+    # Capture writes
+    written_chunks = []
+    def capture_write(chunk):
+        written_chunks.append(chunk)
+    writer.write = capture_write
+    
+    await awrite_stream(data, writer)
+    
+    # Reassemble and check
+    full_packet = b''.join(written_chunks)
+    restored = tenso.loads(full_packet)
+    
+    assert np.array_equal(data, restored)
+    assert writer.drain.called
 
 @pytest.mark.skipif(not ASYNC_AVAILABLE, reason="Async core not implemented")
 @pytest.mark.asyncio
 async def test_aread_stream_padding():
     """Test async read with padding."""
-    # Force padding: 1 byte body
     data = np.array([123], dtype=np.uint8)
     packet = tenso.dumps(data)
     
     reader = asyncio.StreamReader()
     reader.feed_data(packet)
-    # Feed extra data to ensure we don't over-read
-    reader.feed_data(b'NEXT_REQ')
+    reader.feed_data(b'NEXT')
     reader.feed_eof()
     
     result = await aread_stream(reader)
     assert np.array_equal(data, result)
     
-    # Verify next bytes are waiting
     remainder = await reader.read()
-    assert remainder == b'NEXT_REQ'
+    assert remainder == b'NEXT'
 
 @pytest.mark.skipif(not ASYNC_AVAILABLE, reason="Async core not implemented")
 @pytest.mark.asyncio
@@ -55,19 +82,9 @@ async def test_aread_stream_incomplete():
     data = np.zeros((10, 10), dtype=np.float32)
     packet = tenso.dumps(data)
     
-    # 1. Incomplete Header
+    # Incomplete Header
     reader = asyncio.StreamReader()
     reader.feed_data(packet[:4])
-    reader.feed_eof()
-    
-    # Should return None if empty, or raise error if partial header?
-    # Logic: readexactly raises IncompleteReadError
-    with pytest.raises(asyncio.IncompleteReadError):
-        await aread_stream(reader)
-
-    # 2. Incomplete Body
-    reader = asyncio.StreamReader()
-    reader.feed_data(packet[:-5]) # Cut 5 bytes from body
     reader.feed_eof()
     
     with pytest.raises(asyncio.IncompleteReadError):

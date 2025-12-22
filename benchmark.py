@@ -12,6 +12,7 @@ import sys
 import psutil
 import numpy as np
 import tenso
+import asyncio
 
 # Optional dependencies for comparison
 try:
@@ -20,6 +21,13 @@ try:
     from safetensors.numpy import save as st_save, load as st_load
 except ImportError:
     print("Warning: Missing benchmark dependencies (msgpack, pyarrow, safetensors). Some tests skipped.")
+
+
+try:
+    from tenso.async_core import awrite_stream, aread_stream
+    HAS_ASYNC = True
+except ImportError:
+    HAS_ASYNC = False
 
 # Global state for integrity check
 USE_INTEGRITY = False
@@ -382,6 +390,48 @@ def run_cpu_usage():
         
         print(f"{name:<15} | {ser_cpu:>13.1f}% | {des_cpu:>16.1f}%")
 
+async def _bench_async_throughput(data, count=1000):
+    """Measure async write/read throughput."""
+    
+    # 1. Async Write Benchmark
+    # We write to a null sink to measure purely the serialization + overhead
+    class NullWriter:
+        def write(self, d): pass
+        async def drain(self): pass
+    
+    writer = NullWriter()
+    t0 = time.perf_counter()
+    for _ in range(count):
+        await awrite_stream(data, writer, check_integrity=USE_INTEGRITY)
+    t_write = (time.perf_counter() - t0)
+    
+    return t_write
+
+def run_async_benchmark():
+    print("\n" + "="*80)
+    print(f"BENCHMARK: ASYNC I/O (Integrity: {USE_INTEGRITY})")
+    print("="*80)
+    
+    if not HAS_ASYNC:
+        print("Async core not available.")
+        return
+
+    shape = (128, 128) # Small-ish tensor
+    data = np.random.rand(*shape).astype(np.float32)
+    count = 5000
+    total_mb = (data.nbytes * count) / (1024**2)
+    
+    print(f"Streaming {count} tensors of shape {shape} ({data.nbytes/1024:.1f} KB each)...")
+    
+    # Run Async Write
+    t_write = asyncio.run(_bench_async_throughput(data, count))
+    
+    fps = count / t_write
+    mbps = total_mb / t_write
+    
+    print(f"{'Async Write':<20} | {t_write:>8.4f}s | {fps:>10.0f} tensors/s | {mbps:>8.2f} MB/s")
+    print("-" * 80)
+
 def run_dtype_coverage():
     print("\n" + "="*80)
     print(f"BENCHMARK 7: DTYPE COVERAGE (Integrity: {USE_INTEGRITY})")
@@ -394,21 +444,27 @@ def run_dtype_coverage():
         np.bool_, np.complex64, np.complex128
     ]
     
-    shape = (100, 100)
+    # Try adding bfloat16
+    try:
+        from ml_dtypes import bfloat16
+        dtypes.append(bfloat16)
+    except ImportError:
+        pass
     
-    print(f"{'DTYPE':<15} | {'STATUS':<10} | {'SIZE (KB)':<12} | {'ROUNDTRIP (ms)':<15}")
-    print("-" * 65)
+    shape = (100, 100)
+    print(f"{'DTYPE':<25} | {'STATUS':<10} | {'SIZE (KB)':<12} | {'ROUNDTRIP (ms)':<15}")
+    print("-" * 75)
     
     for dtype in dtypes:
         try:
             if dtype == np.bool_:
                 data = np.random.randint(0, 2, shape).astype(dtype)
+            elif hasattr(dtype, 'name') and dtype.name == 'bfloat16':
+                 data = np.random.randn(*shape).astype(np.float32).astype(dtype)
             elif np.issubdtype(dtype, np.integer):
                 data = np.random.randint(0, 100, shape).astype(dtype)
             elif np.issubdtype(dtype, np.complexfloating):
-                real = np.random.randn(*shape)
-                imag = np.random.randn(*shape)
-                data = (real + 1j * imag).astype(dtype)
+                data = (np.random.randn(*shape) + 1j * np.random.randn(*shape)).astype(dtype)
             else:
                 data = np.random.randn(*shape).astype(dtype)
             
@@ -417,18 +473,11 @@ def run_dtype_coverage():
             restored = tenso.loads(packet)
             roundtrip = (time.perf_counter() - t0) * 1000
             
-            if np.array_equal(data, restored):
-                status = "✓ PASS"
-            else:
-                status = "✗ FAIL"
+            status = "✓ PASS" if np.array_equal(data, restored) else "✗ FAIL"
             
-            size_kb = len(packet) / 1024
-            print(f"{str(dtype):<15} | {status:<10} | {size_kb:>10.2f} | {roundtrip:>13.3f}")
-            
+            print(f"{str(dtype):<25} | {status:<10} | {len(packet)/1024:>10.2f} | {roundtrip:>13.3f}")
         except Exception as e:
-            print(f"{str(dtype):<15} | {'✗ ERROR':<10} | {'-':<12} | {str(e)[:20]}")
-    
-    print("-" * 65)
+            print(f"{str(dtype):<25} | {'✗ ERROR':<10} | {'-':<12} | {str(e)[:20]}")
 
 def run_arrow_comparison():
     print("\n" + "="*80)
@@ -591,6 +640,12 @@ Benchmark Modes:
         run_dtype_coverage()
         run_arrow_comparison()
         run_correctness()
+        run_async_benchmark()
+        run_dtype_coverage()
+    elif args.mode == "async":
+        run_async_benchmark()
+    elif args.mode == "dtypes":
+        run_dtype_coverage()
     elif args.mode == "quick":
         run_serialization()
         run_arrow_comparison()
@@ -606,8 +661,6 @@ Benchmark Modes:
         run_memory_overhead()
     elif args.mode == "cpu":
         run_cpu_usage()
-    elif args.mode == "dtypes":
-        run_dtype_coverage()
     elif args.mode == "arrow":
         run_arrow_comparison()
     elif args.mode == "correctness":

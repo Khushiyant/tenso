@@ -16,9 +16,9 @@ where = ["src"]
 requires = ["uv_build>=0.8.14,<0.9.0"]
 build-backend = "uv_build"
 
-
 [project.optional-dependencies]
 dev = [
+    "httpx>=0.28.1",
     "myst-parser>=4.0.1",
     "furo>=2025.9.25",
     "pytest-asyncio>=1.3.0",
@@ -32,8 +32,15 @@ dev = [
     "sphinx>=8.1.3",
     "sphinx-autodoc-typehints>=3.0.1",
     "sphinx-rtd-theme>=3.0.0",
+    "ml_dtypes>=0.4.0",
 ]
-gpu = ["cupy-cuda12x; sys_platform != 'darwin'", "torch"]
+gpu = [
+    "cupy-cuda12x; sys_platform != 'darwin'", 
+    "torch", 
+    "jax[cuda]; sys_platform != 'darwin'",
+    "jax; sys_platform == 'darwin'"
+]
+api = ["fastapi", "uvicorn"]
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
