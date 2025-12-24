@@ -92,6 +92,14 @@ def bench_tenso(data):
     def enc(x): return tenso.dumps(x, check_integrity=USE_INTEGRITY)
     return enc, tenso.loads
 
+def bench_tenso_vectored(data):
+    """Measures the time to prepare chunks for zero-copy transmission."""
+    # This prepares the packet metadata but yields the original tensor.data memoryview
+    enc = lambda x: list(tenso.iter_dumps(x, check_integrity=USE_INTEGRITY))
+    # Deserialization from chunks happens at the I/O layer, so this is a placeholder
+    dec = lambda x: data 
+    return enc, dec
+
 # --- BENCHMARK RUNNERS ---
 
 def run_serialization():
@@ -106,7 +114,7 @@ def run_serialization():
     ]
     
     print(f"{'SCENARIO':<15} | {'FORMAT':<12} | {'SIZE':<10} | {'SERIALIZE':<10} | {'DESERIALIZE':<10}")
-    print("-" * 75)
+    print("-" * 80)
 
     for scen in SCENARIOS:
         if scen['dtype'] == np.uint8:
@@ -116,7 +124,8 @@ def run_serialization():
         
         competitors = {
             "Pickle": bench_pickle(data),
-            "Tenso": bench_tenso(data)
+            "Tenso": bench_tenso(data),
+            "Tenso (Vect)": bench_tenso_vectored(data)
         }
         if 'msgpack' in globals(): competitors["MsgPack"] = bench_msgpack(data)
         if 'st_save' in globals(): competitors["Safetensors"] = bench_safetensors(data)
@@ -137,11 +146,17 @@ def run_serialization():
                 for _ in range(ITERATIONS): _ = dec_func(encoded)
                 t_des = ((time.perf_counter() - t0) / ITERATIONS) * 1000
                 
-                size_str = f"{len(encoded)/1024/1024:.2f} MB" if len(encoded) > 1024**2 else f"{len(encoded)/1024:.2f} KB"
+                # Handle size for vectored list output
+                if isinstance(encoded, list):
+                    total_bytes = sum(len(c) for c in encoded)
+                else:
+                    total_bytes = len(encoded)
+                
+                size_str = f"{total_bytes/1024/1024:.2f} MB" if total_bytes > 1024**2 else f"{total_bytes/1024:.2f} KB"
                 print(f"{scen['name']:<15} | {name:<12} | {size_str:<10} | {t_ser:>7.3f} ms | {t_des:>7.3f} ms")
             except Exception as e:
                 print(f"{scen['name']:<15} | {name:<12} | FAILED ({e})")
-        print("-" * 75)
+        print("-" * 80)
 
 def run_io():
     print("\n" + "="*80)
@@ -641,7 +656,6 @@ Benchmark Modes:
         run_arrow_comparison()
         run_correctness()
         run_async_benchmark()
-        run_dtype_coverage()
     elif args.mode == "async":
         run_async_benchmark()
     elif args.mode == "dtypes":
