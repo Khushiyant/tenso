@@ -18,14 +18,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 1. Calculate Version, Bump, BUILD (inside container), and Release
       - name: Python Semantic Release
         id: release
         uses: python-semantic-release/python-semantic-release@v9.15.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. Publish to PyPI (Uses the dist/ created by step 1)
       - name: Publish to PyPI
         if: steps.release.outputs.released == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      # Trigger documentation build after successful release
+      - name: Trigger Documentation Build
+        if: steps.release.outputs.released == 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          event-type: release-complete

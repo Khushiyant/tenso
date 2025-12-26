@@ -4,6 +4,8 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch:
+  repository_dispatch:
+    types: [release-complete]
 
 # Grant GITHUB_TOKEN the permissions to deploy to Pages
 permissions:
