@@ -1,6 +1,36 @@
 # CHANGELOG
 
 
+## v0.10.0 (2025-12-26)
+
+### Chores
+
+- Add vectored Tenso benchmark for zero-copy transmission; improve size reporting in serialization
+  benchmarks
+  ([`cf5a67e`](https://github.com/Khushiyant/tenso/commit/cf5a67efcee2cea0d5b3ac69a5c92dea5580848a))
+
+- Refactor and enhance Tenso library with improved error handling, code formatting, and test
+  coverage
+  ([`a0ffc18`](https://github.com/Khushiyant/tenso/commit/a0ffc18bc46ea0d00118bed90761461e542e6800))
+
+- Refactor Tenso serialization and streaming for improved clarity and performance
+  ([`d5d022b`](https://github.com/Khushiyant/tenso/commit/d5d022bddd379a5545c966cb2a8f7833ce7c7657))
+
+- Enhanced docstrings across modules for better parameter and return type descriptions. -
+  Streamlined the `aread_stream` and `awrite_stream` functions to reduce redundancy and improve
+  readability. - Added support for sparse tensors in the `dumps` and `loads` functions. - Improved
+  integrity checks and error handling in the serialization process. - Updated FastAPI integration to
+  handle tensor streaming more efficiently. - Introduced GPU support for direct serialization from
+  device memory. - Optimized memory allocation and data transfer methods for better performance. -
+  General code cleanup and organization for maintainability.
+
+### Features
+
+- Enhance Tenso with new features including LZ4 compression, sparse matrix support, and multi-tensor
+  bundling; add comprehensive tests for advanced functionalities
+  ([`68c90b9`](https://github.com/Khushiyant/tenso/commit/68c90b9676fd03c7427e98b0a589c88d5748a104))
+
+
 ## v0.9.1 (2025-12-22)
 
 ### Bug Fixes
