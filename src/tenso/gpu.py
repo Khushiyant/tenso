@@ -1,8 +1,17 @@
+"""
+GPU Acceleration for Tenso.
+
+Fast transfers between device memory and Tenso streams using pinned buffers.
+Supports CuPy, PyTorch, and JAX.
+"""
+
 import struct
+from typing import Any, Optional, Tuple
+
 import numpy as np
-from typing import Union, Optional, Tuple, Any
-from .config import _MAGIC, _ALIGNMENT, _REV_DTYPE_MAP
-from .core import _read_into_buffer
+
+from .config import _ALIGNMENT, _MAGIC, _REV_DTYPE_MAP
+from .core import _read_into_buffer, dumps
 
 # --- BACKEND DETECTION ---
 BACKEND = None
@@ -32,7 +41,7 @@ except ImportError:
     jax = None
     HAS_JAX = False
 
-# Preference: CuPy > PyTorch > JAX (Arbitrary, can be user-defined later)
+# Preference: CuPy > PyTorch > JAX
 if HAS_CUPY:
     BACKEND = "cupy"
 elif HAS_TORCH:
@@ -44,71 +53,82 @@ else:
 
 
 def _get_allocator(size: int) -> Tuple[np.ndarray, Any]:
-    """
-    Allocate a pinned (page-locked) memory buffer for fast GPU transfer.
+    """Allocate pinned host memory for fast GPU transfer.
 
-    This internal function allocates host memory that is pinned (page-locked)
-    to enable fast, asynchronous DMA transfers to GPU devices. The allocation
-    method depends on the available GPU backend (CuPy, PyTorch, or JAX).
+    Parameters
+    ----------
+    size : int
+        The size in bytes to allocate.
 
-    Args:
-        size: Number of bytes to allocate.
-
-    Returns:
-        Tuple[np.ndarray, Any]: A tuple containing:
-            - A numpy array view of the allocated pinned memory
-            - The backend-specific handle/object for the allocation
-
-    Raises:
-        ImportError: If no supported GPU backend is available.
+    Returns
+    -------
+    Tuple[np.ndarray, Any]
+        The allocated array and backend-specific memory object.
     """
     if BACKEND == "cupy":
         mem = cp.cuda.alloc_pinned_memory(size)
         return np.frombuffer(mem, dtype=np.uint8, count=size), mem
-
     elif BACKEND == "torch":
         tensor = torch.empty(size, dtype=torch.uint8, pin_memory=True)
         return tensor.numpy(), tensor
-
     elif BACKEND == "jax":
-        # JAX doesn't expose a direct "pinned memory allocator" easily via Python API
-        # that returns a numpy view without copies.
-        # Fallback: Standard numpy array (OS may optimize) or use PyTorch/CuPy if available.
-        # For pure JAX env, we stick to standard numpy allocation.
+        # JAX doesn't expose a direct pinned allocator; fallback to standard numpy
         arr = np.empty(size, dtype=np.uint8)
         return arr, None
-
     else:
         raise ImportError(
             "Tenso GPU support requires 'cupy', 'torch', or 'jax' installed."
         )
 
 
+def write_from_device(tensor: Any, dest: Any, check_integrity: bool = False) -> int:
+    """
+    Serialize a GPU tensor directly to an I/O stream.
+
+    Parameters
+    ----------
+    tensor : Any
+        A GPU-resident array (CuPy ndarray, PyTorch Tensor, or JAX Array).
+    dest : Any
+        A file-like object with a .write() method.
+    check_integrity : bool, optional
+        Include XXH3 hash for verification. Default is False.
+
+    Returns
+    -------
+    int
+        Number of bytes written.
+    """
+    if HAS_CUPY and isinstance(tensor, cp.ndarray):
+        host_arr = cp.asnumpy(tensor)
+    elif HAS_TORCH and isinstance(tensor, torch.Tensor):
+        host_arr = tensor.detach().cpu().numpy()
+    elif HAS_JAX and isinstance(tensor, (jax.Array, np.ndarray)):
+        host_arr = np.asarray(tensor)
+    else:
+        host_arr = np.asarray(tensor)
+
+    packet = dumps(host_arr, check_integrity=check_integrity)
+    dest.write(packet)
+    return len(packet)
+
+
 def read_to_device(source: Any, device_id: int = 0) -> Any:
     """
-    Read a Tenso packet directly into pinned memory and transfer it to GPU.
+    Read a Tenso packet directly into pinned memory and transfer to GPU.
 
-    This function reads a Tenso packet from a stream source, allocates pinned
-    host memory, and transfers the tensor directly to GPU memory using the
-    available backend (CuPy, PyTorch, or JAX). This minimizes CPU usage and
-    maximizes transfer speed.
+    Parameters
+    ----------
+    source : Any
+        Stream source to read the packet from (file, socket, etc.).
+    device_id : int, optional
+        GPU device ID to transfer to. Default is 0.
 
-    Args:
-        source: Stream source to read the packet from (file, socket, etc.).
-        device_id: GPU device ID to transfer to. Default 0.
-
-    Returns:
-        GPU tensor object: The tensor in GPU memory. Type depends on backend:
-            - CuPy: cupy.ndarray
-            - PyTorch: torch.Tensor
-            - JAX: jax.Array
-
-    Raises:
-        ValueError: If the packet is invalid or unsupported.
-        EOFError: If the stream ends prematurely.
-        ImportError: If no GPU backend is available.
+    Returns
+    -------
+    Any
+        GPU tensor object: The tensor in GPU memory (CuPy, PyTorch, or JAX).
     """
-    # 1. Read Header
     header = bytearray(8)
     if not _read_into_buffer(source, header):
         return None
@@ -117,51 +137,40 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
     if magic != _MAGIC:
         raise ValueError("Invalid tenso packet")
 
-    # 2. Read Shape
-    shape_len = ndim * 4
-    shape_bytes = bytearray(shape_len)
+    shape_bytes = bytearray(ndim * 4)
     if not _read_into_buffer(source, shape_bytes):
         raise EOFError("Stream ended during shape read")
 
     shape = struct.unpack(f"<{ndim}I", shape_bytes)
-
-    # 3. Calculate Layout
     dtype_np = _REV_DTYPE_MAP.get(dtype_code)
     if dtype_np is None:
         raise ValueError(f"Unknown dtype: {dtype_code}")
 
-    current_pos = 8 + shape_len
-    remainder = current_pos % _ALIGNMENT
-    padding_len = 0 if remainder == 0 else (_ALIGNMENT - remainder)
-
+    current_pos = 8 + (ndim * 4)
+    padding_len = (_ALIGNMENT - (current_pos % _ALIGNMENT)) % _ALIGNMENT
     body_len = int(np.prod(shape) * dtype_np.itemsize)
-    total_read_len = padding_len + body_len
 
-    # 4. Allocate Memory (Pinned if possible)
-    host_view, host_handle = _get_allocator(total_read_len)
+    host_view, _ = _get_allocator(padding_len + body_len)
+    try:
+        if not _read_into_buffer(source, host_view):
+            raise EOFError("Stream ended during body read")
+    except EOFError as e:
+        raise EOFError(f"Stream ended during body read. {e}") from None
 
-    # 5. Read
-    pinned_view = memoryview(host_view)
-    if not _read_into_buffer(source, pinned_view):
-        raise EOFError("Stream ended during body read")
-
-    # 6. Transfer to GPU
-    body_view = host_view[padding_len:]
+    body_view = host_view[padding_len:].view(dtype=dtype_np).reshape(shape)
 
     if BACKEND == "cupy":
         with cp.cuda.Device(device_id):
-            host_typed = body_view.view(dtype=dtype_np).reshape(shape)
-            return cp.array(host_typed)
-
+            return cp.array(body_view)
     elif BACKEND == "torch":
-        host_typed = torch.from_numpy(body_view.view(dtype=dtype_np).reshape(shape))
-        return host_typed.to(device=f"cuda:{device_id}", non_blocking=True)
-
+        return torch.from_numpy(body_view).to(
+            device=f"cuda:{device_id}", non_blocking=True
+        )
     elif BACKEND == "jax":
-        # JAX Device Put (Async dispatch)
-        host_typed = body_view.view(dtype=dtype_np).reshape(shape)
         try:
             device = jax.devices()[device_id]
         except IndexError:
-            device = jax.devices()[0]  # Fallback
-        return jax.device_put(host_typed, device=device)
+            device = jax.devices()[0]
+        return jax.device_put(body_view, device=device)
+
+    return body_view

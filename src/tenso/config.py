@@ -1,18 +1,22 @@
-import numpy as np
-import sys
+"""
+Configuration and Protocol Constants for Tenso.
+"""
 
-_MAGIC = b"TNSO"  #: Magic number for Tenso packet header (bytes)
-_VERSION = 2  #: Protocol version (int)
-_ALIGNMENT = 64  #: Align body to 64-byte boundaries for AVX-512/SIMD (int)
+import numpy as np
+
+_MAGIC = b"TNSO"  #: Magic number for Tenso packet header
+_VERSION = 2  #: Protocol version
+_ALIGNMENT = 64  #: SIMD alignment boundary
 
 # --- Security Limits (DoS Protection) ---
-MAX_NDIM = 32  #: Maximum number of dimensions (prevent allocation attacks)
-MAX_ELEMENTS = 10**9  #: Maximum elements per tensor (default ~4GB for float32)
+MAX_NDIM = 32  #: Maximum dimensions to prevent allocation attacks
+MAX_ELEMENTS = 10**9  #: Maximum elements per tensor
 
 # --- Flags ---
 FLAG_ALIGNED = 1  #: Packet uses 64-byte alignment
 FLAG_INTEGRITY = 2  #: Packet includes an 8-byte XXH3 checksum footer
-FLAG_COMPRESSION = 4  #: Packet body is compressed (Reserved for future use)
+FLAG_COMPRESSION = 4  #: Packet body is compressed using LZ4
+FLAG_SPARSE = 8  #: Packet contains a Sparse COO tensor
 
 # --- Dtype Mapping ---
 _DTYPE_MAP = {
@@ -32,17 +36,14 @@ _DTYPE_MAP = {
     np.dtype("complex128"): 14,
 }
 
-# Try to register bfloat16 (Code 15)
 try:
-    # Try getting it directly (NumPy 2.x or if ml_dtypes is loaded)
     _bf16 = np.dtype("bfloat16")
     _DTYPE_MAP[_bf16] = 15
-except TypeError:
+except (TypeError, Exception):
     try:
         import ml_dtypes
 
-        _bf16 = np.dtype("bfloat16")
-        _DTYPE_MAP[_bf16] = 15
+        _DTYPE_MAP[np.dtype("bfloat16")] = 15
     except ImportError:
         pass
 

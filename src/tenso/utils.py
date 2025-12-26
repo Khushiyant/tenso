@@ -1,19 +1,26 @@
-from .config import _MAGIC, FLAG_INTEGRITY, _REV_DTYPE_MAP
-import numpy as np
-import struct
 import ctypes
+import struct
+
+import numpy as np
+
+from .config import _MAGIC, _REV_DTYPE_MAP, FLAG_INTEGRITY
 
 
 def is_aligned(data: bytes, alignment: int = 64) -> bool:
     """
     Check if the given bytes data is aligned to the specified boundary.
 
-    Args:
-        data: The bytes object to check alignment for.
-        alignment: The alignment boundary in bytes (default: 64).
+    Parameters
+    ----------
+    data : bytes
+        The bytes object to check alignment for.
+    alignment : int, optional
+        The alignment boundary in bytes. Default is 64.
 
-    Returns:
-        bool: True if the data is aligned, False otherwise.
+    Returns
+    -------
+    bool
+        True if the data is aligned, False otherwise.
     """
     return (
         ctypes.addressof(ctypes.c_char.from_buffer(bytearray(data))) % alignment
@@ -27,23 +34,29 @@ def get_packet_info(data: bytes) -> dict:
     This function parses the header of a Tenso packet to provide information
     about the tensor's properties, such as dtype, shape, and flags.
 
-    Args:
-        data: The raw bytes of the Tenso packet.
+    Parameters
+    ----------
+    data : bytes
+        The raw bytes of the Tenso packet.
 
-    Returns:
-        dict: A dictionary containing packet information with keys:
-            - 'version': Protocol version
-            - 'dtype': NumPy dtype of the tensor
-            - 'shape': Tuple representing tensor shape
-            - 'ndim': Number of dimensions
-            - 'flags': Raw flags byte
-            - 'aligned': Boolean indicating if packet uses alignment
-            - 'integrity_protected': Boolean indicating if integrity check is enabled
-            - 'total_elements': Total number of elements in the tensor
-            - 'data_size_bytes': Size of the tensor data in bytes
+    Returns
+    -------
+    dict
+        A dictionary containing packet information with keys:
+        - 'version': Protocol version
+        - 'dtype': NumPy dtype of the tensor
+        - 'shape': Tuple representing tensor shape
+        - 'ndim': Number of dimensions
+        - 'flags': Raw flags byte
+        - 'aligned': Boolean indicating if packet uses alignment
+        - 'integrity_protected': Boolean indicating if integrity check is enabled
+        - 'total_elements': Total number of elements in the tensor
+        - 'data_size_bytes': Size of the tensor data in bytes
 
-    Raises:
-        ValueError: If the packet is too short or invalid.
+    Raises
+    ------
+    ValueError
+        If the packet is too short or invalid.
     """
     if len(data) < 8:
         raise ValueError("Packet too short")

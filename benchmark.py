@@ -1,24 +1,27 @@
 import argparse
-import time
-import json
-import pickle
+import asyncio
 import io
+import json
 import os
+import pickle
 import socket
-import threading
-import tempfile
 import struct
 import sys
-import psutil
+import tempfile
+import threading
+import time
+
 import numpy as np
+import psutil
+
 import tenso
-import asyncio
 
 # Optional dependencies for comparison
 try:
     import msgpack
     import pyarrow as pa
-    from safetensors.numpy import save as st_save, load as st_load
+    from safetensors.numpy import load as st_load
+    from safetensors.numpy import save as st_save
 except ImportError:
     print(
         "Warning: Missing benchmark dependencies (msgpack, pyarrow, safetensors). Some tests skipped."
@@ -26,7 +29,7 @@ except ImportError:
 
 
 try:
-    from tenso.async_core import awrite_stream, aread_stream
+    from tenso.async_core import aread_stream, awrite_stream
 
     HAS_ASYNC = True
 except ImportError:
@@ -42,16 +45,19 @@ class ResourceMonitor:
     """Monitor CPU and memory during benchmarks."""
 
     def __init__(self):
+        """Initialize the resource monitor."""
         self.process = psutil.Process()
         self.baseline_memory = self.process.memory_info().rss / 1024 / 1024
 
     def snapshot(self):
+        """Take a snapshot of current resource usage."""
         return {
             "memory_mb": self.process.memory_info().rss / 1024 / 1024,
             "cpu_percent": self.process.cpu_percent(),
         }
 
     def memory_delta(self):
+        """Calculate memory usage delta from baseline."""
         current = self.process.memory_info().rss / 1024 / 1024
         return current - self.baseline_memory
 
@@ -60,18 +66,72 @@ class ResourceMonitor:
 
 
 def bench_json(data):
+    """
+    Benchmark JSON serialization and deserialization.
+
+    JSON is a text-based format that converts arrays to lists, which can be
+    inefficient for large numerical arrays due to string conversion overhead.
+
+    Parameters
+    ----------
+    data : array_like
+        The input data to benchmark. Will be converted to list for JSON.
+
+    Returns
+    -------
+    enc : callable
+        Encoder function that serializes to JSON bytes.
+    dec : callable
+        Decoder function that deserializes from JSON bytes.
+    """
     enc = lambda x: json.dumps(x.tolist()).encode("utf-8")
     dec = lambda x: np.array(json.loads(x), dtype=data.dtype)
     return enc, dec
 
 
 def bench_pickle(data):
+    """
+    Benchmark pickle serialization and deserialization.
+
+    Pickle is Python's native serialization format, efficient for Python objects
+    but not cross-language compatible and potentially insecure for untrusted data.
+
+    Parameters
+    ----------
+    data : array_like
+        The input data to benchmark.
+
+    Returns
+    -------
+    enc : callable
+        Encoder function that serializes with highest protocol.
+    dec : callable
+        Decoder function that deserializes from pickle bytes.
+    """
     enc = lambda x: pickle.dumps(x, protocol=pickle.HIGHEST_PROTOCOL)
     dec = lambda x: pickle.loads(x)
     return enc, dec
 
 
 def bench_msgpack(data):
+    """
+    Benchmark msgpack serialization and deserialization.
+
+    Msgpack is a binary serialization format that's more efficient than JSON
+    for numerical data, but requires converting arrays to bytes.
+
+    Parameters
+    ----------
+    data : array_like
+        The input data to benchmark.
+
+    Returns
+    -------
+    enc : callable
+        Encoder function that serializes to msgpack bytes.
+    dec : callable
+        Decoder function that deserializes and reshapes from msgpack bytes.
+    """
     enc = lambda x: msgpack.packb(x.tobytes())
     dec = lambda x: np.frombuffer(msgpack.unpackb(x), dtype=data.dtype).reshape(
         data.shape
@@ -80,6 +140,24 @@ def bench_msgpack(data):
 
 
 def bench_safetensors(data):
+    """
+    Benchmark safetensors serialization and deserialization.
+
+    Safetensors is a fast, safe serialization format for tensors, designed
+    for machine learning models with memory mapping support.
+
+    Parameters
+    ----------
+    data : array_like
+        The input data to benchmark.
+
+    Returns
+    -------
+    enc : callable
+        Encoder function that saves to safetensors format.
+    dec : callable
+        Decoder function that loads from safetensors format.
+    """
     def enc(x):
         return st_save({"t": x})
 
@@ -90,6 +168,24 @@ def bench_safetensors(data):
 
 
 def bench_arrow(data):
+    """
+    Benchmark Apache Arrow serialization and deserialization.
+
+    Apache Arrow provides columnar in-memory analytics with efficient
+    serialization for big data processing.
+
+    Parameters
+    ----------
+    data : array_like
+        The input data to benchmark.
+
+    Returns
+    -------
+    enc : callable
+        Encoder function that serializes to Arrow IPC format.
+    dec : callable
+        Decoder function that deserializes from Arrow IPC format.
+    """
     def enc(x):
         arr = pa.array(x.flatten())
         batch = pa.RecordBatch.from_arrays([arr], names=["t"])
@@ -107,6 +203,24 @@ def bench_arrow(data):
 
 
 def bench_tenso(data):
+    """
+    Benchmark Tenso serialization and deserialization.
+
+    Tenso is a high-performance tensor serialization format optimized for
+    numpy arrays with optional integrity checking and compression.
+
+    Parameters
+    ----------
+    data : array_like
+        The input data to benchmark.
+
+    Returns
+    -------
+    enc : callable
+        Encoder function that serializes to Tenso format.
+    dec : callable
+        Decoder function that deserializes from Tenso format.
+    """
     # Wrap dumps to respect the global USE_INTEGRITY flag
     def enc(x):
         return tenso.dumps(x, check_integrity=USE_INTEGRITY)
@@ -115,7 +229,24 @@ def bench_tenso(data):
 
 
 def bench_tenso_vectored(data):
-    """Measures the time to prepare chunks for zero-copy transmission."""
+    """
+    Benchmark Tenso vectored serialization.
+
+    Measures the time to prepare chunks for zero-copy transmission.
+    Vectored I/O allows sending multiple buffers without copying.
+
+    Parameters
+    ----------
+    data : array_like
+        The input data to benchmark.
+
+    Returns
+    -------
+    enc : callable
+        Encoder function.
+    dec : callable
+        Decoder function (placeholder, returns original data).
+    """
     # This prepares the packet metadata but yields the original tensor.data memoryview
     enc = lambda x: list(tenso.iter_dumps(x, check_integrity=USE_INTEGRITY))
     # Deserialization from chunks happens at the I/O layer, so this is a placeholder
@@ -127,6 +258,7 @@ def bench_tenso_vectored(data):
 
 
 def run_serialization():
+    """Run in-memory serialization benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 1: IN-MEMORY SERIALIZATION (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -197,6 +329,7 @@ def run_serialization():
 
 
 def run_io():
+    """Run disk I/O benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 2: DISK I/O (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -264,6 +397,7 @@ def run_io():
 
 
 def run_stream_read():
+    """Run stream read benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 3: STREAM READ (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -308,6 +442,7 @@ def run_stream_read():
 
 
 def run_stream_write():
+    """Run stream write benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 4: NETWORK WRITE (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -361,6 +496,7 @@ def run_stream_write():
 
 
 def run_memory_overhead():
+    """Run memory overhead benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 5: MEMORY OVERHEAD (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -410,6 +546,7 @@ def run_memory_overhead():
 
 
 def run_cpu_usage():
+    """Run CPU usage benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 6: CPU USAGE (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -497,6 +634,7 @@ async def _bench_async_throughput(data, count=1000):
 
 
 def run_async_benchmark():
+    """Run async I/O benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK: ASYNC I/O (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -527,6 +665,7 @@ def run_async_benchmark():
 
 
 def run_dtype_coverage():
+    """Run dtype coverage benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 7: DTYPE COVERAGE (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -592,6 +731,7 @@ def run_dtype_coverage():
 
 
 def run_arrow_comparison():
+    """Run Arrow vs Tenso comparison benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 8: ARROW vs TENSO (Integrity: {USE_INTEGRITY})")
     print("=" * 80)
@@ -651,6 +791,7 @@ def run_arrow_comparison():
 
 
 def run_correctness():
+    """Run correctness benchmarks."""
     print("\n" + "=" * 80)
     print(f"BENCHMARK 9: CORRECTNESS (Integrity: {USE_INTEGRITY})")
     print("=" * 80)

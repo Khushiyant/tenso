@@ -1,31 +1,30 @@
+"""
+Async I/O Support for Tenso.
+"""
+
 import asyncio
-import numpy as np
 import struct
+from typing import Optional, Union
+
+import numpy as np
 import xxhash
-from typing import Union
-from .core import _REV_DTYPE_MAP, _ALIGNMENT, FLAG_INTEGRITY, iter_dumps
-from .config import MAX_NDIM, MAX_ELEMENTS
+
+from .config import MAX_ELEMENTS, MAX_NDIM
+from .core import _ALIGNMENT, _REV_DTYPE_MAP, FLAG_INTEGRITY, iter_dumps
 
 
-async def aread_stream(reader: asyncio.StreamReader) -> Union[np.ndarray, None]:
-    """
-    Asynchronously read a Tenso packet from an asyncio StreamReader.
+async def aread_stream(reader: asyncio.StreamReader) -> Optional[np.ndarray]:
+    """Asynchronously read a Tenso packet from a StreamReader.
 
-    This coroutine reads a complete Tenso packet from an asyncio stream
-    and deserializes it into a numpy array. Includes DoS protection and
-    integrity checking if the packet includes it.
+    Parameters
+    ----------
+    reader : asyncio.StreamReader
+        The stream reader to read from.
 
-    Args:
-        reader: An asyncio.StreamReader instance to read the packet from.
-
-    Returns:
-        np.ndarray or None: The deserialized tensor with writeable=False,
-                           or None if the stream ended before reading any data.
-
-    Raises:
-        ValueError: If the packet is invalid, exceeds security limits, or fails
-                   integrity checks.
-        asyncio.IncompleteReadError: If the stream ends prematurely.
+    Returns
+    -------
+    Optional[np.ndarray]
+        The deserialized tensor, or None if stream is empty.
     """
     try:
         header = await reader.readexactly(8)
@@ -33,39 +32,25 @@ async def aread_stream(reader: asyncio.StreamReader) -> Union[np.ndarray, None]:
         if len(e.partial) == 0:
             return None
         raise
-
-    magic, ver, flags, dtype_code, ndim = struct.unpack("<4sBBBB", header)
-
-    # [SECURITY] DoS Protection
+    _, _, flags, dtype_code, ndim = struct.unpack("<4sBBBB", header)
     if ndim > MAX_NDIM:
         raise ValueError(f"Packet exceeds maximum dimensions ({ndim})")
 
     shape_bytes = await reader.readexactly(ndim * 4)
     shape = struct.unpack(f"<{ndim}I", shape_bytes)
+    if int(np.prod(shape)) > MAX_ELEMENTS:
+        raise ValueError(f"Packet exceeds maximum elements ({int(np.prod(shape))})")
 
-    # [SECURITY] DoS Protection
-    num_elements = int(np.prod(shape))
-    if num_elements > MAX_ELEMENTS:
-        raise ValueError(f"Packet exceeds maximum elements ({num_elements})")
-
-    current_pos = 8 + (ndim * 4)
-    remainder = current_pos % _ALIGNMENT
-    padding_len = 0 if remainder == 0 else (_ALIGNMENT - remainder)
-    if padding_len > 0:
-        await reader.readexactly(padding_len)
+    pad_len = (_ALIGNMENT - ((8 + (ndim * 4)) % _ALIGNMENT)) % _ALIGNMENT
+    if pad_len > 0:
+        await reader.readexactly(pad_len)
 
     dtype = _REV_DTYPE_MAP.get(dtype_code)
-    if dtype is None:
-        raise ValueError(f"Unsupported dtype code: {dtype_code}")
-
-    body_len = num_elements * dtype.itemsize
-    body_data = await reader.readexactly(body_len)
+    body_data = await reader.readexactly(int(np.prod(shape)) * dtype.itemsize)
 
     if flags & FLAG_INTEGRITY:
-        footer_bytes = await reader.readexactly(8)
-        expected_hash = struct.unpack("<Q", footer_bytes)[0]
-        actual_hash = xxhash.xxh3_64_intdigest(body_data)
-        if actual_hash != expected_hash:
+        footer = await reader.readexactly(8)
+        if xxhash.xxh3_64_intdigest(body_data) != struct.unpack("<Q", footer)[0]:
             raise ValueError("Integrity check failed: XXH3 mismatch")
 
     arr = np.frombuffer(body_data, dtype=dtype).reshape(shape)
@@ -79,24 +64,23 @@ async def awrite_stream(
     strict: bool = False,
     check_integrity: bool = False,
 ) -> None:
-    """
-    Asynchronously write a tensor to an asyncio StreamWriter.
+    """Asynchronously write a tensor to a StreamWriter.
 
-    Serializes a tensor and writes it to an asyncio stream using vectored I/O.
-    Uses iter_dumps internally to avoid large memory copies and yields control
-    to the event loop between chunks to prevent blocking.
+    Parameters
+    ----------
+    tensor : np.ndarray
+        The tensor to serialize.
+    writer : asyncio.StreamWriter
+        The stream writer to write to.
+    strict : bool, optional
+        Whether to use strict mode. Default is False.
+    check_integrity : bool, optional
+        Whether to check integrity. Default is False.
 
-    Args:
-        tensor: The numpy array to serialize.
-        writer: An asyncio.StreamWriter instance to write the packet to.
-        strict: If True, raises error for non-contiguous arrays. Default False.
-        check_integrity: If True, includes integrity hash. Default False.
-
-    Raises:
-        ValueError: If serialization fails.
-        OSError: If writing to the stream fails.
+    Returns
+    -------
+    None
     """
     for chunk in iter_dumps(tensor, strict=strict, check_integrity=check_integrity):
         writer.write(chunk)
-        # Yield control to event loop to allow concurrent processing
         await writer.drain()
