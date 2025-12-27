@@ -2,7 +2,6 @@ import pytest
 import numpy as np
 import tenso
 import io
-import sys
 from unittest.mock import patch, MagicMock
 
 # Attempt to import backends to determine capability
@@ -16,7 +15,7 @@ except ImportError:
     HAS_CUDA_TORCH = False
 
 try:
-    import jax
+    import jax  # noqa F401
 
     HAS_JAX = True
 except ImportError:
@@ -138,7 +137,7 @@ class TestGPU:
             mock_torch.from_numpy.return_value.to.return_value = mock_final_tensor
 
             # 4. Execution
-            result = gpu.read_to_device(stream, device_id=0)
+            _ = gpu.read_to_device(stream, device_id=0)
 
             # 5. Assertions
             mock_torch.empty.assert_called_once()

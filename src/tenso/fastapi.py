@@ -76,6 +76,4 @@ async def get_tenso_data(request: Request) -> Any:
     try:
         return loads(body)
     except Exception as e:
-        raise HTTPException(
-            status_code=422, detail=f"Invalid Tenso packet: {str(e)}"
-        )
+        raise HTTPException(status_code=422, detail=f"Invalid Tenso packet: {str(e)}")

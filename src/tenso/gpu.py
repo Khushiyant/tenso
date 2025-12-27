@@ -7,7 +7,7 @@ and Tenso streams using pinned host memory.
 
 import struct
 import numpy as np
-from typing import Any, Tuple, Optional
+from typing import Any, Tuple
 from .config import _MAGIC, _ALIGNMENT, _REV_DTYPE_MAP
 from .core import _read_into_buffer, dumps
 

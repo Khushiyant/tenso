@@ -11,7 +11,7 @@ import numpy as np
 import xxhash
 import sys
 import mmap
-from typing import BinaryIO, Union, Any, Generator, Optional, Dict
+from typing import BinaryIO, Union, Any, Generator, Optional
 from .config import (
     _MAGIC,
     _VERSION,

@@ -2,7 +2,6 @@ import pytest
 import numpy as np
 import tenso
 import io
-import struct
 
 
 class FragmentedStream:

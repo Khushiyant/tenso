@@ -6,7 +6,6 @@ Verifies Compression, Sparse Formats, and Multi-tensor Bundling.
 import pytest
 import numpy as np
 import tenso
-import io
 
 try:
     from scipy import sparse

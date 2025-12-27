@@ -9,7 +9,7 @@ import asyncio
 import numpy as np
 import struct
 import xxhash
-from typing import Union, Optional
+from typing import Optional
 from .core import _REV_DTYPE_MAP, _ALIGNMENT, FLAG_INTEGRITY, iter_dumps
 from .config import MAX_NDIM, MAX_ELEMENTS
 

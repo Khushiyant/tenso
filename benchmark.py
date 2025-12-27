@@ -5,7 +5,6 @@ import json
 import os
 import pickle
 import socket
-import struct
 import sys
 import tempfile
 import threading
@@ -29,7 +28,7 @@ except ImportError:
 
 
 try:
-    from tenso.async_core import aread_stream, awrite_stream
+    from tenso.async_core import awrite_stream
 
     HAS_ASYNC = True
 except ImportError:
@@ -84,8 +83,8 @@ def bench_json(data):
     dec : callable
         Decoder function that deserializes from JSON bytes.
     """
-    enc = lambda x: json.dumps(x.tolist()).encode("utf-8")
-    dec = lambda x: np.array(json.loads(x), dtype=data.dtype)
+    enc = lambda x: json.dumps(x.tolist()).encode("utf-8")  # noqa
+    dec = lambda x: np.array(json.loads(x), dtype=data.dtype)  # noqa
     return enc, dec
 
 
@@ -108,8 +107,8 @@ def bench_pickle(data):
     dec : callable
         Decoder function that deserializes from pickle bytes.
     """
-    enc = lambda x: pickle.dumps(x, protocol=pickle.HIGHEST_PROTOCOL)
-    dec = lambda x: pickle.loads(x)
+    enc = lambda x: pickle.dumps(x, protocol=pickle.HIGHEST_PROTOCOL)  # noqa
+    dec = lambda x: pickle.loads(x)  # noqa
     return enc, dec
 
 
@@ -132,10 +131,10 @@ def bench_msgpack(data):
     dec : callable
         Decoder function that deserializes and reshapes from msgpack bytes.
     """
-    enc = lambda x: msgpack.packb(x.tobytes())
+    enc = lambda x: msgpack.packb(x.tobytes())  # noqa
     dec = lambda x: np.frombuffer(msgpack.unpackb(x), dtype=data.dtype).reshape(
         data.shape
-    )
+    )  # noqa
     return enc, dec
 
 
@@ -158,6 +157,7 @@ def bench_safetensors(data):
     dec : callable
         Decoder function that loads from safetensors format.
     """
+
     def enc(x):
         return st_save({"t": x})
 
@@ -186,6 +186,7 @@ def bench_arrow(data):
     dec : callable
         Decoder function that deserializes from Arrow IPC format.
     """
+
     def enc(x):
         arr = pa.array(x.flatten())
         batch = pa.RecordBatch.from_arrays([arr], names=["t"])
@@ -221,6 +222,7 @@ def bench_tenso(data):
     dec : callable
         Decoder function that deserializes from Tenso format.
     """
+
     # Wrap dumps to respect the global USE_INTEGRITY flag
     def enc(x):
         return tenso.dumps(x, check_integrity=USE_INTEGRITY)
@@ -248,9 +250,9 @@ def bench_tenso_vectored(data):
         Decoder function (placeholder, returns original data).
     """
     # This prepares the packet metadata but yields the original tensor.data memoryview
-    enc = lambda x: list(tenso.iter_dumps(x, check_integrity=USE_INTEGRITY))
+    enc = lambda x: list(tenso.iter_dumps(x, check_integrity=USE_INTEGRITY))  # noqa
     # Deserialization from chunks happens at the I/O layer, so this is a placeholder
-    dec = lambda x: data
+    dec = lambda x: data  # noqa
     return enc, dec
 
 
@@ -460,10 +462,10 @@ def run_stream_write():
                 try:
                     if not conn.recv(1024 * 1024):
                         break
-                except:
+                except Exception as _:
                     break
             conn.close()
-        except:
+        except Exception as _:
             pass
         s.close()
 
@@ -491,7 +493,7 @@ def run_stream_write():
         print(f"Total Time: {t_total:.4f}s")
         print(f"Throughput: {COUNT / t_total:.0f} packets/sec")
         print(f"Latency:    {(t_total / COUNT) * 1_000_000:.1f} µs/packet")
-    except:
+    except Exception as _:
         print("Network write benchmark failed. Connection issues.")
 
 

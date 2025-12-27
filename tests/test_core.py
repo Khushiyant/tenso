@@ -3,7 +3,6 @@ import numpy as np
 import tenso
 import tempfile
 import os
-import io
 import struct
 from tenso.config import MAX_NDIM, MAX_ELEMENTS, _MAGIC, _VERSION, FLAG_ALIGNED
 

@@ -48,9 +48,9 @@ try:
     _DTYPE_MAP[_bf16] = 15
 except (TypeError, Exception):
     try:
-        import ml_dtypes
+        from ml_dtypes import bfloat16
 
-        _DTYPE_MAP[np.dtype("bfloat16")] = 15
+        _DTYPE_MAP[np.dtype(bfloat16)] = 15
     except ImportError:
         pass
 
