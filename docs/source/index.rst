@@ -13,7 +13,7 @@ Tenso Documentation
    :caption: API Reference
    :hidden:
 
-   api
+   reference/modules
 
 Indices and tables
 ==================

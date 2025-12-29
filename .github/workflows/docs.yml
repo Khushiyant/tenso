@@ -42,7 +42,7 @@ jobs:
         run: |
           cd docs
           mkdir -p source/_static 
-          uv run sphinx-build -M html source build -W
+          make html SPHINXOPTS="-W"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
