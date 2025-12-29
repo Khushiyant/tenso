@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.12.1 (2025-12-29)
+
+### Bug Fixes
+
+- Update documentation build process and structure
+  ([`e8efd7e`](https://github.com/Khushiyant/tenso/commit/e8efd7ec6178555bd2ca23ce5cecd84ee632d45d))
+
+
 ## v0.12.0 (2025-12-29)
 
 ### Features
