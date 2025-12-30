@@ -14,8 +14,14 @@ requires-python = ">=3.10"
 where = ["src"]
 
 [build-system]
-requires = ["uv_build>=0.8.14,<0.9.0"]
-build-backend = "uv_build"
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+
+[tool.maturin]
+python-source = "src"          # Your python code is in src/
+module-name = "tenso.tenso_rs" # This compiles the rust binary as a submodule
+features = ["pyo3/extension-module"]
 
 [project.optional-dependencies]
 grpc = [
@@ -23,6 +29,7 @@ grpc = [
     "grpcio-tools>=1.76.0",
 ]
 dev = [
+    "maturin>=1.10.2",
     "httpx>=0.28.1",
     "myst-parser>=4.0.1",
     "furo>=2025.9.25",

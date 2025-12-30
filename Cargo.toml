@@ -1,0 +1,13 @@
+[package]
+name = "tenso-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tenso_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# PyO3 is the bridge between Rust and Python
+pyo3 = { version = "0.20.0", features = ["extension-module"] }
+numpy = "0.20.0"  # For zero-copy array access

@@ -29,12 +29,23 @@ from .config import (
     MAX_ELEMENTS,
 )
 
+# --- OPTIONAL DEPENDENCIES ---
 try:
     import lz4.frame
 
     HAS_LZ4 = True
 except ImportError:
     HAS_LZ4 = False
+
+# --- RUST CORE INTEGRATION ---
+try:
+    # Attempt to import the optimized Rust backend
+    from .tenso_rs import dumps_rs
+
+    HAS_RUST = True
+except ImportError:
+    # Fallback to pure Python if the extension isn't compiled
+    HAS_RUST = False
 
 IS_LITTLE_ENDIAN = sys.byteorder == "little"
 
@@ -422,7 +433,29 @@ def dumps(
             sub_pkts.append(struct.pack("<I", len(sp)) + sp)
         return memoryview(b"".join([header, shape_block] + sub_pkts))
 
-    # 3. Standard Array
+    # 3. FAST PATH: RUST ACCELERATION
+    # We use Rust if:
+    #  a) The extension is available (HAS_RUST)
+    #  b) No integrity checks requested (Rust MVP doesn't support XXH3 yet)
+    #  c) No compression requested (Rust MVP doesn't support LZ4 yet)
+    if HAS_RUST and not check_integrity and not compress:
+        try:
+            # Enforce strict contiguous check here if requested
+            if strict and not tensor.flags["C_CONTIGUOUS"]:
+                raise ValueError("Tensor is not C-Contiguous")
+
+            # Ensure contiguous for Rust (zero-copy requirement)
+            if not tensor.flags["C_CONTIGUOUS"]:
+                tensor = np.ascontiguousarray(tensor)
+
+            # Return zero-copy memoryview from Rust bytes
+            return memoryview(dumps_rs(tensor))
+        except (TypeError, ValueError):
+            # Fallback to Python if Rust doesn't support the dtype (e.g. object, complex)
+            # or if any other issue arises during dispatch.
+            pass
+
+    # 4. Standard Python Implementation (Fallback)
     if tensor.dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {tensor.dtype}")
 

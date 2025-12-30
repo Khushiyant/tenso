@@ -25,3 +25,7 @@ uv.lock
 # Sphinx generated files
 docs/build/
 docs/source/reference/
+
+# Added by cargo
+*.so
+/target
