@@ -228,15 +228,6 @@ The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 
 
 ---
 
-## Contributing
-
-Contributions are welcome! We are currently looking for help with:
-
-* **Rust Core**: Porting serialization logic to Rust for even lower overhead.
-* **C++ / JavaScript Clients**: Extending the protocol to other ecosystems.
-
----
-
 ## License
 
 Apache License 2.0 - see [LICENSE](https://www.google.com/search?q=LICENSE) file.

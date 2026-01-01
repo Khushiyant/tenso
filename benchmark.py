@@ -34,6 +34,15 @@ try:
 except ImportError:
     HAS_ASYNC = False
 
+# In benchmark.py
+
+try:
+    from tenso.core import HAS_RUST
+
+    print(f"Rust Acceleration: {'ENABLED' if HAS_RUST else 'DISABLED'}")
+except ImportError:
+    print("Rust Acceleration: UNKNOWN")
+
 # Global state for integrity check
 USE_INTEGRITY = False
 
