@@ -3,7 +3,15 @@
 
 # Tenso
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 **Up to 22x faster than Apache Arrow on deserialization. 55x less CPU than SafeTensors.**
+=======
+**Up to 140x faster than Apache Arrow. 42x less CPU than SafeTensors.**
+>>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
+=======
+**Up to 22x faster than Apache Arrow on deserialization. 55x less CPU than SafeTensors.**
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
 
 Zero-copy, SIMD-aligned tensor protocol for high-performance ML infrastructure.
 
@@ -20,9 +28,21 @@ Most serialization formats are designed for general data or disk storage. Tenso 
 ### The Problem
 
 Traditional formats waste CPU cycles during deserialization:
+<<<<<<< HEAD
+<<<<<<< HEAD
 - **SafeTensors**: 38.8% CPU usage (great for disk, overkill for network)
 - **Pickle**: 41.5% CPU usage + security vulnerabilities
 - **Arrow**: Faster on serialization, but up to 22x slower on deserialization for large tensors
+=======
+- **SafeTensors**: 41.2% CPU usage (great for disk, overkill for network)
+- **Pickle**: 41.3% CPU usage + security vulnerabilities
+- **Arrow**: Fast, but up to 140x slower than Tenso for large tensors
+>>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
+=======
+- **SafeTensors**: 38.8% CPU usage (great for disk, overkill for network)
+- **Pickle**: 41.5% CPU usage + security vulnerabilities
+- **Arrow**: Faster on serialization, but up to 22x slower on deserialization for large tensors
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
 
 ### The Solution
 
@@ -31,7 +51,15 @@ Tenso achieves **true zero-copy** with:
 - **64-byte Alignment**: SIMD-ready padding ensures the data body is cache-line aligned.
 - **Direct Memory Mapping**: The CPU points directly to existing buffers without copying.
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 **Result**: 0.7% CPU usage vs >38% for SafeTensors/Pickle.
+=======
+**Result**: 1.1% CPU usage vs >41% for SafeTensors/Pickle.
+>>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
+=======
+**Result**: 0.7% CPU usage vs >38% for SafeTensors/Pickle.
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
 
 ---
 
@@ -41,17 +69,47 @@ Tenso achieves **true zero-copy** with:
 
 ### Deserialization Speed (256 MB Matrix - 8192×8192 Float32)
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 | Format | Read Time | CPU Usage | Speedup |
 |--------|-----------|-----------|---------|
+=======
+| Format | Read Time | CPU Usage | Speedup |
+|--------|-----------|-----------|---------|---|
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
 | **Tenso** | **44.65ms** | **0.7%** | **1x** |
 | NumPy .npy | 46.14ms | N/A | 1.03x slower |
 | Pickle | 25.23ms* | 41.5% | 1.8x faster† |
 | SafeTensors | ~3.42s | 38.8% | 77x slower |
 | Arrow (zero-copy) | ~0.35s | 1.2% | 7.8x slower |
+<<<<<<< HEAD
+=======
+| Format | Time (mean±std) | CPU Usage | Speedup |
+|--------|-----------------|-----------|---------|------|
+| **Tenso** | **0.03±0.01ms** | **1.1%** | **1x** |
+| Arrow | 4.35±0.22ms | 0.9% | 140x slower |
+| SafeTensors | 2.80±0.39ms | 41.2% | 93x slower |
+| Pickle | 2.91±0.45ms | 41.3% | 97x slower |
+
+**Note**: Benchmarks based on 15-20 iterations with warmup runs. Standard deviation shows measurement consistency.
+>>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
+=======
 
 *Pickle faster on disk read but uses 59x more CPU and lacks security  
 †Tenso optimized for network streaming, not disk I/O
 
+### Large Tensor Performance (XLarge Dataset)
+
+| Format | Serialization | Deserialization | Speedup (Deser) |
+|--------|---------------|-----------------|---------|---|
+| **Tenso** | 84.75ms | **0.059ms** | **1x** |
+| Arrow (zero-copy) | 16.34ms | 1.306ms | 22.2x slower |
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
+
+*Pickle faster on disk read but uses 59x more CPU and lacks security  
+†Tenso optimized for network streaming, not disk I/O
+
+<<<<<<< HEAD
 ### Large Tensor Performance (XLarge Dataset)
 
 | Format | Serialization | Deserialization | Speedup (Deser) |
@@ -61,10 +119,59 @@ Tenso achieves **true zero-copy** with:
 
 ### Stream Reading Performance (95 MB Packet)
 
+<<<<<<< HEAD
 | Method | Time | Throughput | Speedup |
 |--------|------|------------|---------|
 | **Tenso read_stream** | **6.43ms** | **14,830 MB/s** | **1x** |
 | Naive loop | 14.50ms | 6,577 MB/s | 2.3x slower |
+=======
+| Method | Time (mean±std) | Throughput | Speedup |
+|--------|-----------------|------------|---------|------|
+| **Tenso read_stream** | **4.47±1.08ms** | **21,349 MB/s** | **1x** |
+| Naive loop | 7,220.64±107.97ms | 13.21 MB/s | 1,616x slower |
+=======
+### Stream Reading Performance (95 MB Packet)
+
+| Method | Time | Throughput | Speedup |
+|--------|------|------------|---------|---|
+| **Tenso read_stream** | **6.43ms** | **14,830 MB/s** | **1x** |
+| Naive loop | 14.50ms | 6,577 MB/s | 2.3x slower |
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
+
+### Async I/O Performance (5,000 tensors × 64 KB)
+
+| Method | Time | Throughput | Tensor Rate |
+|--------|------|------------|-------------|---|
+| **Async Write** | **4.3ms** | **72,021 MB/s** | **1.15M tensors/sec** |
+
+### Network Transmission (10,000 packets × 1KB over TCP)
+
+<<<<<<< HEAD
+**
+
+### Disk I/O Performance (256MB Matrix: 8192×8192 Float32)
+
+| Format | Write (mean±std) | Read (mean±std) |
+|--------|------------------|------------------|
+| **Tenso** | **25.74±0.11ms** | **0.58±0.83ms** |
+| NumPy .npy | 26.82±7.14ms | 25.63±63.56ms |
+| Pickle | 52.41±2.03ms | 27.41±2.08ms |
+
+**Note**: Low standard deviation in Tenso's write performance shows consistent, reliable behavior.
+
+**
+
+### Network Performance (Async I/O)
+
+- **Throughput**: 1,060,867 tensors/sec (66,304 MB/s)
+- **Latency**: 11.8 µs/packet (10,000 tensors over localhost TCP)
+>>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
+=======
+| Metric | Performance |
+|--------|-------------|
+| **Throughput** | **88,491 packets/sec** |
+| **Latency** | **11.3 µs/packet** |
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
 
 ### Async I/O Performance (5,000 tensors × 64 KB)
 
@@ -220,11 +327,33 @@ The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 
 
 ## Use Cases
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+* **Model Serving APIs**: Up to 22x faster deserialization with 55x less CPU saves massive overhead on inference nodes.
+* **Distributed Training**: Efficiently pass gradients or activations between nodes (Ray, Spark) at 72 GB/s.
+=======
+* **Model Serving APIs**: Up to 140x faster deserialization saves massive CPU overhead on inference nodes.
+* **Distributed Training**: Efficiently pass gradients or activations between nodes (Ray, Spark).
+>>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
+* **GPU-Direct Pipelines**: Stream data from network cards to GPU memory with minimal host intervention.
+* **Real-time Robotics**: 11.3 µs latency for high-frequency sensor fusion (LIDAR, Radar).
+* **High-Throughput Streaming**: 88K packets/sec network transmission for real-time data pipelines.
+=======
 * **Model Serving APIs**: Up to 22x faster deserialization with 55x less CPU saves massive overhead on inference nodes.
 * **Distributed Training**: Efficiently pass gradients or activations between nodes (Ray, Spark) at 72 GB/s.
 * **GPU-Direct Pipelines**: Stream data from network cards to GPU memory with minimal host intervention.
 * **Real-time Robotics**: 11.3 µs latency for high-frequency sensor fusion (LIDAR, Radar).
 * **High-Throughput Streaming**: 88K packets/sec network transmission for real-time data pipelines.
+
+---
+
+## Contributing
+
+Contributions are welcome! We are currently looking for help with:
+
+* **Rust Core**: Porting serialization logic to Rust for even lower overhead.
+* **C++ / JavaScript Clients**: Extending the protocol to other ecosystems.
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
 
 ---
 

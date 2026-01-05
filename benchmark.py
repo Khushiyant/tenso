@@ -34,15 +34,6 @@ try:
 except ImportError:
     HAS_ASYNC = False
 
-# In benchmark.py
-
-try:
-    from tenso.core import HAS_RUST
-
-    print(f"Rust Acceleration: {'ENABLED' if HAS_RUST else 'DISABLED'}")
-except ImportError:
-    print("Rust Acceleration: UNKNOWN")
-
 # Global state for integrity check
 USE_INTEGRITY = False
 
@@ -434,6 +425,10 @@ def run_stream_read():
     )
 
     # Legacy Loop Simulation
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
     stream.seek(0)
     t0 = time.perf_counter()
     chunks = []
@@ -445,6 +440,26 @@ def run_stream_read():
     full_data = b"".join(chunks)  # Standard Python way
     tenso.loads(full_data)
     t_old = (time.perf_counter() - t0) * 1000
+<<<<<<< HEAD
+=======
+    old_times = []
+    for _ in range(RUNS):
+        stream = FastStream(packet)
+        stream.seek(0)
+        t0 = time.perf_counter()
+        buffer = b""
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            buffer += chunk
+        tenso.loads(buffer)
+        old_times.append((time.perf_counter() - t0) * 1000)
+    
+    old_mean, old_std = np.mean(old_times), np.std(old_times)
+>>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
+=======
+>>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
     print(
         f"{'Naive Loop':<20} | {t_old:>7.2f} ms | {size_mb / (t_old / 1000):>7.2f} MB/s"
     )
@@ -509,6 +524,7 @@ def run_stream_write():
         print(f"Latency:    {(t_total / COUNT) * 1_000_000:.1f} µs/packet")
     except Exception as e:
         print(f"Network write benchmark failed: {e}")
+
 
 def run_memory_overhead():
     """Run memory overhead benchmarks."""
@@ -836,6 +852,45 @@ def run_correctness():
             print(f"{name:<20} | {'✗ FAIL':<10} | {'MISMATCH':<15}")
 
     print("-" * 55)
+
+def run_gpu_benchmark():
+    print("\n" + "=" * 80)
+    print("BENCHMARK: GPU TRANSFER")
+    print("=" * 80)
+
+    try:
+        import torch
+        import tenso.gpu as t_gpu
+
+        # Setup: Create a large tensor in RAM
+        shape = (4096, 4096)  # ~64MB float32
+        data = np.random.rand(*shape).astype(np.float32)
+        stream = io.BytesIO(tenso.dumps(data))
+
+        # Benchmark
+        t0 = time.perf_counter()
+        # This uses your pinned memory logic
+        t_gpu.read_to_device(stream, device_id=0)
+        torch.cuda.synchronize()  # Wait for GPU to finish
+        t_total = (time.perf_counter() - t0) * 1000
+
+        print(f"CPU -> GPU (Tenso): {t_total:.2f} ms")
+
+        # Compare to Standard PyTorch Load
+        stream.seek(0)
+        t0 = time.perf_counter()
+        # Standard way: Load to CPU -> Move to GPU
+        cpu_arr = tenso.loads(stream.read())
+        torch.tensor(cpu_arr).to("cuda")
+        torch.cuda.synchronize()
+        t_std = (time.perf_counter() - t0) * 1000
+
+        print(f"CPU -> GPU (Standard): {t_std:.2f} ms")
+        print(f"Speedup: {t_std / t_total:.1f}x")
+
+    except ImportError:
+        print("Skipping GPU benchmark (Torch/CUDA not found)")
+
 
 def run_gpu_benchmark():
     print("\n" + "=" * 80)
