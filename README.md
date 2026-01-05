@@ -42,7 +42,7 @@ Tenso achieves **true zero-copy** with:
 ### Deserialization Speed (256 MB Matrix - 8192×8192 Float32)
 
 | Format | Read Time | CPU Usage | Speedup |
-|--------|-----------|-----------|---------|---|
+|--------|-----------|-----------|---------|
 | **Tenso** | **44.65ms** | **0.7%** | **1x** |
 | NumPy .npy | 46.14ms | N/A | 1.03x slower |
 | Pickle | 25.23ms* | 41.5% | 1.8x faster† |
@@ -55,23 +55,21 @@ Tenso achieves **true zero-copy** with:
 ### Large Tensor Performance (XLarge Dataset)
 
 | Format | Serialization | Deserialization | Speedup (Deser) |
-|--------|---------------|-----------------|---------|---|
+|--------|---------------|-----------------|-----------------|
 | **Tenso** | 84.75ms | **0.059ms** | **1x** |
 | Arrow (zero-copy) | 16.34ms | 1.306ms | 22.2x slower |
-
-**
 
 ### Stream Reading Performance (95 MB Packet)
 
 | Method | Time | Throughput | Speedup |
-|--------|------|------------|---------|---|
+|--------|------|------------|---------|
 | **Tenso read_stream** | **6.43ms** | **14,830 MB/s** | **1x** |
 | Naive loop | 14.50ms | 6,577 MB/s | 2.3x slower |
 
 ### Async I/O Performance (5,000 tensors × 64 KB)
 
 | Method | Time | Throughput | Tensor Rate |
-|--------|------|------------|-------------|---|
+|--------|------|------------|-------------|
 | **Async Write** | **4.3ms** | **72,021 MB/s** | **1.15M tensors/sec** |
 
 ### Network Transmission (10,000 packets × 1KB over TCP)
@@ -80,8 +78,6 @@ Tenso achieves **true zero-copy** with:
 |--------|-------------|
 | **Throughput** | **88,491 packets/sec** |
 | **Latency** | **11.3 µs/packet** |
-
-**
 
 ---
 
