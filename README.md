@@ -1,9 +1,8 @@
-
 <img width="2439" height="966" alt="Tenso Banner" src="https://github.com/user-attachments/assets/5ec9b225-3615-4225-82ca-68e15b7045ce" />
 
 # Tenso
 
-**Up to 22x faster than Apache Arrow on deserialization. 55x less CPU than SafeTensors.**
+**Up to 35x faster than Apache Arrow on deserialization. 46x less CPU than SafeTensors.**
 
 Zero-copy, SIMD-aligned tensor protocol for high-performance ML infrastructure.
 
@@ -20,9 +19,9 @@ Most serialization formats are designed for general data or disk storage. Tenso 
 ### The Problem
 
 Traditional formats waste CPU cycles during deserialization:
-- **SafeTensors**: 38.8% CPU usage (great for disk, overkill for network)
-- **Pickle**: 41.5% CPU usage + security vulnerabilities
-- **Arrow**: Faster on serialization, but up to 22x slower on deserialization for large tensors
+- **SafeTensors**: 37.1% CPU usage (great for disk, overkill for network)
+- **Pickle**: 40.9% CPU usage + security vulnerabilities
+- **Arrow**: Faster on serialization, but up to 32x slower on deserialization for large tensors
 
 ### The Solution
 
@@ -31,7 +30,7 @@ Tenso achieves **true zero-copy** with:
 - **64-byte Alignment**: SIMD-ready padding ensures the data body is cache-line aligned.
 - **Direct Memory Mapping**: The CPU points directly to existing buffers without copying.
 
-**Result**: 0.7% CPU usage vs >38% for SafeTensors/Pickle.
+**Result**: 0.8% CPU usage vs >40% for SafeTensors/Pickle.
 
 ---
 
@@ -39,45 +38,56 @@ Tenso achieves **true zero-copy** with:
 
 **System**: Python 3.12.9, NumPy 2.3.5, 12 CPU cores, macOS
 
-### Deserialization Speed (256 MB Matrix - 8192×8192 Float32)
+### 1. In-Memory Serialization (LLM Layer - 64MB)
 
-| Format | Read Time | CPU Usage | Speedup |
-|--------|-----------|-----------|---------|
-| **Tenso** | **44.65ms** | **0.7%** | **1x** |
-| NumPy .npy | 46.14ms | N/A | 1.03x slower |
-| Pickle | 25.23ms* | 41.5% | 1.8x faster† |
-| SafeTensors | ~3.42s | 38.8% | 77x slower |
-| Arrow (zero-copy) | ~0.35s | 1.2% | 7.8x slower |
+| Format       | Size       | Serialize | Deserialize | Speedup (Deser) |
+|--------------|------------|-----------|-------------|-----------------|
+| **Tenso**    | 64.00 MB   | 3.51 ms   | **0.004 ms**| **1x**          |
+| Arrow        | 64.00 MB   | 7.06 ms   | 0.011 ms    | 2.8x slower     |
+| SafeTensors  | 64.00 MB   | 8.14 ms   | 2.39 ms     | 597x slower     |
+| Pickle       | 64.00 MB   | 2.93 ms   | 2.71 ms     | 677x slower     |
+| MsgPack      | 64.00 MB   | 10.44 ms  | 3.05 ms     | 763x slower     |
 
-*Pickle faster on disk read but uses 59x more CPU and lacks security  
-†Tenso optimized for network streaming, not disk I/O
+> **Note**: Tenso (Vect) variant is even faster with 0.000 ms deserialize time.
 
-### Large Tensor Performance (XLarge Dataset)
+### 2. Disk I/O (256 MB Matrix)
 
-| Format | Serialization | Deserialization | Speedup (Deser) |
-|--------|---------------|-----------------|-----------------|
-| **Tenso** | 84.75ms | **0.059ms** | **1x** |
-| Arrow (zero-copy) | 16.34ms | 1.306ms | 22.2x slower |
+| Format | Write | Read |
+|--------|-------|------|
+| **Tenso** | **29.41 ms** | **36.28 ms** |
+| NumPy .npy | 24.83 ms | 43.08 ms |
+| Pickle | 49.90 ms | 24.24 ms |
 
-### Stream Reading Performance (95 MB Packet)
+### 3. Stream Reading (95 MB Packet)
 
 | Method | Time | Throughput | Speedup |
 |--------|------|------------|---------|
-| **Tenso read_stream** | **6.43ms** | **14,830 MB/s** | **1x** |
-| Naive loop | 14.50ms | 6,577 MB/s | 2.3x slower |
+| **Tenso read_stream** | **7.68 ms** | **12,417 MB/s** | **1x** |
+| Optimised Loop | 13.89 ms | 7,396 MB/s | 1.9x slower |
 
-### Async I/O Performance (5,000 tensors × 64 KB)
+### 4. CPU Usage (Efficiency)
 
-| Method | Time | Throughput | Tensor Rate |
-|--------|------|------------|-------------|
-| **Async Write** | **4.3ms** | **72,021 MB/s** | **1.15M tensors/sec** |
+| Format      | Serialize CPU% | Deserialize CPU% |
+|-------------|----------------|------------------|
+| **Tenso**   | 117.3%         | **0.8%**         |
+| Arrow       | 57.1%          | 1.0%             |
+| SafeTensors | 67.1%          | 37.1%            |
+| Pickle      | 44.0%          | 40.9%            |
 
-### Network Transmission (10,000 packets × 1KB over TCP)
+### 5. Arrow vs Tenso (Comparison)
 
-| Metric | Performance |
-|--------|-------------|
-| **Throughput** | **88,491 packets/sec** |
-| **Latency** | **11.3 µs/packet** |
+| Size    | Tenso Ser | Arrow Ser | Tenso Des | Arrow Des | Speedup |
+|---------|-----------|-----------|-----------|-----------|---------|
+| Small   | 0.130ms   | 0.056ms   | 0.009ms   | 0.035ms   | 4.1x    |
+| Medium  | 0.972ms   | 0.912ms   | 0.020ms   | 0.040ms   | 2.0x    |
+| Large   | 3.166ms   | 3.655ms   | 0.019ms   | 0.222ms   | 11.8x   |
+| XLarge  | 19.086ms  | 28.726ms  | 0.023ms   | 0.733ms   | **32.0x** |
+
+### 6. Network Performance
+
+- **Packet Throughput**: 89,183 packets/sec (over localhost TCP)
+- **Latency**: 11.2 µs/packet
+- **Async Write Throughput**: 88,397 MB/s (1.4M tensors/sec)
 
 ---
 
@@ -85,7 +95,6 @@ Tenso achieves **true zero-copy** with:
 
 ```bash
 pip install tenso
-
 ```
 
 ---
@@ -106,7 +115,6 @@ packet = tenso.dumps(data)
 
 # Deserialize (Zero-copy view)
 restored = tenso.loads(packet)
-
 ```
 
 ### Async I/O
@@ -121,10 +129,7 @@ async def handle_client(reader, writer):
     
     # Process and write back
     await tenso.awrite_stream(data * 2, writer)
-
 ```
-
-**
 
 ### FastAPI Integration
 
@@ -139,10 +144,7 @@ app = FastAPI()
 async def get_tensor():
     data = np.ones((1024, 1024), dtype=np.float32)
     return TensoResponse(data) # Zero-copy streaming response
-
 ```
-
-**
 
 ---
 
@@ -157,7 +159,6 @@ import tenso.gpu as tgpu
 
 # Read directly from a stream into a GPU tensor
 torch_tensor = tgpu.read_to_device(stream, device_id=0) 
-
 ```
 
 ### Sparse Formats & Bundling
@@ -197,8 +198,6 @@ def Predict(self, request, context):
     )
 ```
 
-**
-
 ---
 
 ## Protocol Design
@@ -211,7 +210,6 @@ Tenso uses a minimalist structure designed for direct memory access:
 │   8 bytes   │  Variable    │   0-63 bytes │   C-Contiguous Array   │   8 bytes*   │
 └─────────────┴──────────────┴──────────────┴────────────────────────┴──────────────┘
                                                                         (*Optional)
-
 ```
 
 The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 vectorization and zero-copy memory mapping.
@@ -220,11 +218,11 @@ The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 
 
 ## Use Cases
 
-* **Model Serving APIs**: Up to 22x faster deserialization with 55x less CPU saves massive overhead on inference nodes.
-* **Distributed Training**: Efficiently pass gradients or activations between nodes (Ray, Spark) at 72 GB/s.
+* **Model Serving APIs**: Up to 35x faster deserialization with 46x less CPU saves massive overhead on inference nodes.
+* **Distributed Training**: Efficiently pass gradients or activations between nodes (Ray, Spark).
 * **GPU-Direct Pipelines**: Stream data from network cards to GPU memory with minimal host intervention.
-* **Real-time Robotics**: 11.3 µs latency for high-frequency sensor fusion (LIDAR, Radar).
-* **High-Throughput Streaming**: 88K packets/sec network transmission for real-time data pipelines.
+* **Real-time Robotics**: 10.2 µs latency for high-frequency sensor fusion (LIDAR, Radar).
+* **High-Throughput Streaming**: 89K packets/sec network transmission for real-time data pipelines.
 
 ---
 
@@ -232,7 +230,6 @@ The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 
 
 Contributions are welcome! We are currently looking for help with:
 
-* **Rust Core**: Porting serialization logic to Rust for even lower overhead.
 * **C++ / JavaScript Clients**: Extending the protocol to other ecosystems.
 
 ---
@@ -248,7 +245,6 @@ Apache License 2.0 - see [LICENSE](https://www.google.com/search?q=LICENSE) file
   author = {Khushiyant},
   title = {Tenso: High-Performance Zero-Copy Tensor Protocol},
   year = {2025},
-  url = {[https://github.com/Khushiyant/tenso](https://github.com/Khushiyant/tenso)}
+  url = {https://github.com/Khushiyant/tenso}
 }
-
 ```

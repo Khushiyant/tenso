@@ -1,9 +1,15 @@
 import ctypes
 import struct
-
 import numpy as np
-
 from .config import _MAGIC, _REV_DTYPE_MAP, FLAG_INTEGRITY
+
+# --- RUST INTEGRATION ---
+try:
+    from .tenso_rs import get_packet_info_rs
+
+    HAS_RUST = True
+except ImportError:
+    HAS_RUST = False
 
 
 def is_aligned(data: bytes, alignment: int = 64) -> bool:
@@ -57,7 +63,31 @@ def get_packet_info(data: bytes) -> dict:
     ------
     ValueError
         If the packet is too short or invalid.
+
+    Uses Rust implementation for performance if available, otherwise falls back to Python.
     """
+    # 1. Fast Path (Rust)
+    if HAS_RUST:
+        try:
+            info = get_packet_info_rs(data)
+
+            # Post-process Rust output to match Python API expectations
+            # Rust returns 'dtype_code' (int), tests expect 'dtype' (np.dtype)
+            if "dtype" not in info and "dtype_code" in info:
+                dtype = _REV_DTYPE_MAP.get(info["dtype_code"])
+                info["dtype"] = dtype
+
+                # Calculate data_size_bytes if missing
+                if "data_size_bytes" not in info and "total_elements" in info:
+                    itemsize = dtype.itemsize if dtype else 0
+                    info["data_size_bytes"] = info["total_elements"] * itemsize
+
+            return info
+        except ValueError as e:
+            # Rust raises ValueError on bad packets, propagate it
+            raise e
+
+    # 2. Slow Path (Python Fallback)
     if len(data) < 8:
         raise ValueError("Packet too short")
     magic, ver, flags, dtype_code, ndim = struct.unpack("<4sBBBB", data[:8])

@@ -11,8 +11,13 @@ permissions:
 
 jobs:
   release:
+    name: Prepare Release
     runs-on: ubuntu-latest
     concurrency: release
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,20 +28,67 @@ jobs:
         uses: python-semantic-release/python-semantic-release@v9.15.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Generate gRPC stubs for release
+
+  build-wheels:
+    name: Build wheels on ${{ matrix.os }}
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      # --- 1. Generate gRPC Stubs (Must happen before build) ---
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install gRPC tools
+        run: pip install grpcio-tools
+
+      - name: Generate gRPC code
+        shell: bash
         run: |
-          pip install grpcio-tools
           python -m grpc_tools.protoc -Isrc --python_out=src --grpc_python_out=src src/tenso/grpc/tenso_msg.proto
           python -m grpc_tools.protoc -Isrc --python_out=src --grpc_python_out=src src/tenso/grpc/benchmark_msg.proto
 
-      - name: Publish to PyPI
-        if: steps.release.outputs.released == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+      # --- 2. Build Rust/Python Wheels ---
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: auto
+      
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist
 
+  publish:
+    name: Publish to PyPI
+    needs: [release, build-wheels]
+    runs-on: ubuntu-latest
+    if: needs.release.outputs.released == 'true'
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+          
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+      
       # Trigger documentation build after successful release
       - name: Trigger Documentation Build
-        if: steps.release.outputs.released == 'true'
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

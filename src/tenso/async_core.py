@@ -82,4 +82,4 @@ async def awrite_stream(
     """
     for chunk in iter_dumps(tensor, strict=strict, check_integrity=check_integrity):
         writer.write(chunk)
-        await writer.drain()
+    await writer.drain()

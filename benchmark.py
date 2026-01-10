@@ -269,6 +269,7 @@ def run_serialization():
         {"name": "API Vector", "shape": (1536,), "dtype": np.float32},
         {"name": "CV Batch", "shape": (32, 256, 256, 3), "dtype": np.uint8},
         {"name": "LLM Layer", "shape": (4096, 4096), "dtype": np.float32},
+        {"name": "Bundle", "type": "dict", "size": 10},
     ]
 
     print(
@@ -277,7 +278,19 @@ def run_serialization():
     print("-" * 80)
 
     for scen in SCENARIOS:
-        if scen["dtype"] == np.uint8:
+        if scen.get("type") == "dict":
+            # Create a bundle of small tensors
+            data = {f"key_{i}": np.random.rand(100, 100).astype(np.float32) for i in range(scen["size"])}
+            # Helper for size calculation since data is a dict
+            class Dummy:
+                pass
+            dummy = Dummy()
+            dummy.nbytes = sum(x.nbytes for x in data.values())
+            # We can't use existing bench functions directly for dicts because they expect array-like in some places
+            # But bench_tenso and bench_pickle work with dicts.
+            # Define specific wrappers for this iteration if needed, or rely on duck typing.
+            # Let's adjust the loop to handle dicts.
+        elif scen["dtype"] == np.uint8:
             data = np.random.randint(0, 255, scen["shape"]).astype(np.uint8)
         else:
             data = np.random.rand(*scen["shape"]).astype(scen["dtype"])
@@ -285,15 +298,18 @@ def run_serialization():
         competitors = {
             "Pickle": bench_pickle(data),
             "Tenso": bench_tenso(data),
-            "Tenso (Vect)": bench_tenso_vectored(data),
         }
-        if "msgpack" in globals():
-            competitors["MsgPack"] = bench_msgpack(data)
-        if "st_save" in globals():
-            competitors["Safetensors"] = bench_safetensors(data)
-        if "pa" in globals():
-            competitors["Arrow"] = bench_arrow(data)
-
+        
+        # Only add array-specific formats if not a dict
+        if not isinstance(data, dict):
+            competitors["Tenso (Vect)"] = bench_tenso_vectored(data)
+            if "msgpack" in globals():
+                competitors["MsgPack"] = bench_msgpack(data)
+            if "st_save" in globals():
+                competitors["Safetensors"] = bench_safetensors(data)
+            if "pa" in globals():
+                competitors["Arrow"] = bench_arrow(data)
+        
         for name, (enc_func, dec_func) in competitors.items():
             try:
                 # Warmup
@@ -500,6 +516,7 @@ def run_stream_write():
         print(f"Latency:    {(t_total / COUNT) * 1_000_000:.1f} µs/packet")
     except Exception as e:
         print(f"Network write benchmark failed: {e}")
+
 
 def run_memory_overhead():
     """Run memory overhead benchmarks."""
@@ -835,6 +852,47 @@ def run_gpu_benchmark():
 
     try:
         import torch
+
+        import tenso.gpu as t_gpu
+
+        # Setup: Create a large tensor in RAM
+        shape = (4096, 4096)  # ~64MB float32
+        data = np.random.rand(*shape).astype(np.float32)
+        stream = io.BytesIO(tenso.dumps(data))
+
+        # Benchmark
+        t0 = time.perf_counter()
+        # This uses your pinned memory logic
+        t_gpu.read_to_device(stream, device_id=0)
+        torch.cuda.synchronize()  # Wait for GPU to finish
+        t_total = (time.perf_counter() - t0) * 1000
+
+        print(f"CPU -> GPU (Tenso): {t_total:.2f} ms")
+
+        # Compare to Standard PyTorch Load
+        stream.seek(0)
+        t0 = time.perf_counter()
+        # Standard way: Load to CPU -> Move to GPU
+        cpu_arr = tenso.loads(stream.read())
+        torch.tensor(cpu_arr).to("cuda")
+        torch.cuda.synchronize()
+        t_std = (time.perf_counter() - t0) * 1000
+
+        print(f"CPU -> GPU (Standard): {t_std:.2f} ms")
+        print(f"Speedup: {t_std / t_total:.1f}x")
+
+    except ImportError:
+        print("Skipping GPU benchmark (Torch/CUDA not found)")
+
+
+def run_gpu_benchmark():
+    print("\n" + "=" * 80)
+    print("BENCHMARK: GPU TRANSFER")
+    print("=" * 80)
+
+    try:
+        import torch
+
         import tenso.gpu as t_gpu
 
         # Setup: Create a large tensor in RAM
