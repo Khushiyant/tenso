@@ -1,6 +1,50 @@
 # CHANGELOG
 
 
+## v0.13.0 (2026-01-10)
+
+### Bug Fixes
+
+- Improve error handling in serialization and remove unused packet info function
+  ([`158743f`](https://github.com/Khushiyant/tenso/commit/158743ff824a26fd480422b1b26709366c463582))
+
+- Remove redundant gRPC installation steps and clean up test file
+  ([`3aa2b9e`](https://github.com/Khushiyant/tenso/commit/3aa2b9e1dc21e75e538adf963a6cb0f560d12d8e))
+
+### Chores
+
+- Add Rust acceleration status check in benchmark script
+  ([`41379be`](https://github.com/Khushiyant/tenso/commit/41379be5774c8c2750a2e1bdae7287d27eb1f6b9))
+
+- Update documentation build process and structure
+  ([`ff863de`](https://github.com/Khushiyant/tenso/commit/ff863de2341934923c8a1dd6378442123eaab08d))
+
+### Documentation
+
+- Update performance metrics and add GPU benchmark to README and benchmark.py
+  ([`b42681a`](https://github.com/Khushiyant/tenso/commit/b42681a9f197e312d6a251a518b00925fefddbe7))
+
+- Update performance metrics in README
+  ([`e6f3e1d`](https://github.com/Khushiyant/tenso/commit/e6f3e1dbbcc723c4b2eff0a1dc9314f62db0685f))
+
+### Features
+
+- Enhance Tenso serialization and deserialization with new features
+  ([`8c5f357`](https://github.com/Khushiyant/tenso/commit/8c5f357d9a24e5692e859330633319614761a369))
+
+- Added support for serializing and deserializing bundles (dictionaries of tensors) in
+  `benchmark.py` and `lib.rs`. - Introduced custom alignment options in the serialization process,
+  allowing for flexible memory alignment in `lib.rs` and `core.py`. - Implemented integrity checks
+  using XXH3 hashing in both serialization and deserialization paths. - Enhanced the `dumps` and
+  `loads` functions to support new data types including complex numbers and additional integer
+  types. - Optimized the `dump_to_fd` function for zero-allocation streaming to improve performance
+  when writing to file descriptors. - Added a test for the `dump_to_fd` functionality to ensure data
+  integrity and correctness after serialization and deserialization.
+
+- Integrate Rust backend for performance improvements in tensor operations
+  ([`e0a56b6`](https://github.com/Khushiyant/tenso/commit/e0a56b6b595c63ffe7cb8bc3717bd733e67fec42))
+
+
 ## v0.12.0 (2025-12-29)
 
 ### Features
