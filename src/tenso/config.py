@@ -23,6 +23,7 @@ FLAG_SPARSE = 8  #: Packet contains a Sparse COO tensor (int)
 FLAG_BUNDLE = 16  #: Packet contains a collection (dict) of tensors (int)
 FLAG_SPARSE_CSR = 32  #: Packet contains a Sparse CSR tensor (int)
 FLAG_SPARSE_CSC = 64  #: Packet contains a Sparse CSC tensor (int)
+FLAG_CUST_ALIGN = 128  #: Packet uses custom alignment (exponent byte follows shape) (int)
 
 # --- Dtype Mapping ---
 _DTYPE_MAP = {

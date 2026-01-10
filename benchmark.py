@@ -269,6 +269,7 @@ def run_serialization():
         {"name": "API Vector", "shape": (1536,), "dtype": np.float32},
         {"name": "CV Batch", "shape": (32, 256, 256, 3), "dtype": np.uint8},
         {"name": "LLM Layer", "shape": (4096, 4096), "dtype": np.float32},
+        {"name": "Bundle", "type": "dict", "size": 10},
     ]
 
     print(
@@ -277,7 +278,19 @@ def run_serialization():
     print("-" * 80)
 
     for scen in SCENARIOS:
-        if scen["dtype"] == np.uint8:
+        if scen.get("type") == "dict":
+            # Create a bundle of small tensors
+            data = {f"key_{i}": np.random.rand(100, 100).astype(np.float32) for i in range(scen["size"])}
+            # Helper for size calculation since data is a dict
+            class Dummy:
+                pass
+            dummy = Dummy()
+            dummy.nbytes = sum(x.nbytes for x in data.values())
+            # We can't use existing bench functions directly for dicts because they expect array-like in some places
+            # But bench_tenso and bench_pickle work with dicts.
+            # Define specific wrappers for this iteration if needed, or rely on duck typing.
+            # Let's adjust the loop to handle dicts.
+        elif scen["dtype"] == np.uint8:
             data = np.random.randint(0, 255, scen["shape"]).astype(np.uint8)
         else:
             data = np.random.rand(*scen["shape"]).astype(scen["dtype"])
@@ -285,15 +298,18 @@ def run_serialization():
         competitors = {
             "Pickle": bench_pickle(data),
             "Tenso": bench_tenso(data),
-            "Tenso (Vect)": bench_tenso_vectored(data),
         }
-        if "msgpack" in globals():
-            competitors["MsgPack"] = bench_msgpack(data)
-        if "st_save" in globals():
-            competitors["Safetensors"] = bench_safetensors(data)
-        if "pa" in globals():
-            competitors["Arrow"] = bench_arrow(data)
-
+        
+        # Only add array-specific formats if not a dict
+        if not isinstance(data, dict):
+            competitors["Tenso (Vect)"] = bench_tenso_vectored(data)
+            if "msgpack" in globals():
+                competitors["MsgPack"] = bench_msgpack(data)
+            if "st_save" in globals():
+                competitors["Safetensors"] = bench_safetensors(data)
+            if "pa" in globals():
+                competitors["Arrow"] = bench_arrow(data)
+        
         for name, (enc_func, dec_func) in competitors.items():
             try:
                 # Warmup
@@ -425,10 +441,6 @@ def run_stream_read():
     )
 
     # Legacy Loop Simulation
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
     stream.seek(0)
     t0 = time.perf_counter()
     chunks = []
@@ -440,26 +452,6 @@ def run_stream_read():
     full_data = b"".join(chunks)  # Standard Python way
     tenso.loads(full_data)
     t_old = (time.perf_counter() - t0) * 1000
-<<<<<<< HEAD
-=======
-    old_times = []
-    for _ in range(RUNS):
-        stream = FastStream(packet)
-        stream.seek(0)
-        t0 = time.perf_counter()
-        buffer = b""
-        while True:
-            chunk = stream.read(65536)
-            if not chunk:
-                break
-            buffer += chunk
-        tenso.loads(buffer)
-        old_times.append((time.perf_counter() - t0) * 1000)
-    
-    old_mean, old_std = np.mean(old_times), np.std(old_times)
->>>>>>> ddfc92b (fix: update performance metrics and benchmarks in README and benchmark.py)
-=======
->>>>>>> aca8de7 (fix: update performance metrics in README and benchmark script)
     print(
         f"{'Naive Loop':<20} | {t_old:>7.2f} ms | {size_mb / (t_old / 1000):>7.2f} MB/s"
     )
@@ -860,6 +852,7 @@ def run_gpu_benchmark():
 
     try:
         import torch
+
         import tenso.gpu as t_gpu
 
         # Setup: Create a large tensor in RAM
@@ -899,6 +892,7 @@ def run_gpu_benchmark():
 
     try:
         import torch
+
         import tenso.gpu as t_gpu
 
         # Setup: Create a large tensor in RAM

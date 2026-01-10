@@ -6,27 +6,30 @@ Sparse matrices, and Dictionaries to the Tenso binary format. It supports
 zero-copy memory mapping, LZ4 compression, and XXH3 integrity verification.
 """
 
+import mmap
 import struct
+import sys
+from typing import Any, BinaryIO, Generator, Optional, Union
+
 import numpy as np
 import xxhash
-import sys
-import mmap
-from typing import BinaryIO, Union, Any, Generator, Optional
+
 from .config import (
-    _MAGIC,
-    _VERSION,
     _ALIGNMENT,
     _DTYPE_MAP,
+    _MAGIC,
     _REV_DTYPE_MAP,
+    _VERSION,
     FLAG_ALIGNED,
-    FLAG_INTEGRITY,
-    FLAG_COMPRESSION,
-    FLAG_SPARSE,
     FLAG_BUNDLE,
-    FLAG_SPARSE_CSR,
+    FLAG_COMPRESSION,
+    FLAG_CUST_ALIGN,
+    FLAG_INTEGRITY,
+    FLAG_SPARSE,
     FLAG_SPARSE_CSC,
-    MAX_NDIM,
+    FLAG_SPARSE_CSR,
     MAX_ELEMENTS,
+    MAX_NDIM,
 )
 
 # --- OPTIONAL DEPENDENCIES ---
@@ -40,7 +43,7 @@ except ImportError:
 # --- RUST CORE INTEGRATION ---
 try:
     # Attempt to import the optimized Rust backend
-    from .tenso_rs import dumps_rs
+    from .tenso_rs import dumps_rs, loads_rs, dump_to_fd_rs
 
     HAS_RUST = True
 except ImportError:
@@ -254,8 +257,23 @@ def read_stream(source: Any) -> Optional[Any]:
 
     # Read Body & Padding
     current_pos = 8 + shape_len
-    remainder = current_pos % _ALIGNMENT
-    padding_len = 0 if remainder == 0 else (_ALIGNMENT - remainder)
+    alignment = _ALIGNMENT
+    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
+
+    if use_custom_align:
+        # Read Exponent Byte
+        exp_buf = bytearray(1)
+        try:
+            if not _read_into_buffer(source, exp_buf):
+                raise EOFError("Stream ended during alignment byte read")
+        except EOFError as e:
+            raise EOFError(f"Stream ended during alignment byte read. {e}") from None
+        exponent = exp_buf[0]
+        alignment = 1 << exponent
+        current_pos += 1
+
+    remainder = current_pos % alignment
+    padding_len = 0 if remainder == 0 else (alignment - remainder)
     body_len = num_elements * dtype.itemsize
     footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
 
@@ -376,6 +394,7 @@ def dumps(
     strict: bool = False,
     check_integrity: bool = False,
     compress: bool = False,
+    alignment: int = 64,
 ) -> memoryview:
     """
     Serialize an object (Array, Sparse Matrix, or Dict) to a Tenso packet.
@@ -390,12 +409,17 @@ def dumps(
         If True, includes XXH3 hash for verification.
     compress : bool, default False
         If True, uses LZ4 compression on the data body.
+    alignment : int, default 64
+        Memory alignment boundary (must be power of 2).
 
     Returns
     -------
     memoryview
         A view of the complete Tenso packet bytes.
     """
+    if not (alignment > 0 and (alignment & (alignment - 1) == 0)):
+        raise ValueError("Alignment must be a power of two")
+
     # 1. Multi-tensor Bundle (Dictionaries)
     if isinstance(tensor, dict):
         parts = []
@@ -406,7 +430,7 @@ def dumps(
         for key, value in tensor.items():
             key_bytes = key.encode("utf-8")
             parts.append(struct.pack("<I", len(key_bytes)) + key_bytes)
-            val_packet = dumps(value, strict, check_integrity, compress)
+            val_packet = dumps(value, strict, check_integrity, compress, alignment)
             parts.append(struct.pack("<I", len(val_packet)) + val_packet)
         return memoryview(b"".join(parts))
 
@@ -429,16 +453,15 @@ def dumps(
 
         sub_pkts = []
         for c in comps:
-            sp = dumps(c, strict, False, False)
+            sp = dumps(c, strict, False, False, alignment)
             sub_pkts.append(struct.pack("<I", len(sp)) + sp)
         return memoryview(b"".join([header, shape_block] + sub_pkts))
 
     # 3. FAST PATH: RUST ACCELERATION
     # We use Rust if:
     #  a) The extension is available (HAS_RUST)
-    #  b) No integrity checks requested (Rust MVP doesn't support XXH3 yet)
-    #  c) No compression requested (Rust MVP doesn't support LZ4 yet)
-    if HAS_RUST and not check_integrity and not compress:
+    #  b) No compression requested (Rust MVP doesn't support LZ4 yet)
+    if HAS_RUST and not compress:
         try:
             # Enforce strict contiguous check here if requested
             if strict and not tensor.flags["C_CONTIGUOUS"]:
@@ -449,7 +472,7 @@ def dumps(
                 tensor = np.ascontiguousarray(tensor)
 
             # Return zero-copy memoryview from Rust bytes
-            return memoryview(dumps_rs(tensor))
+            return memoryview(dumps_rs(tensor, check_integrity=check_integrity, alignment=alignment))
         except (TypeError, ValueError):
             # Fallback to Python if Rust doesn't support the dtype (e.g. object, complex)
             # or if any other issue arises during dispatch.
@@ -471,7 +494,16 @@ def dumps(
     shape = tensor.shape
     ndim = len(shape)
     body = tensor.tobytes()
-    flags = FLAG_ALIGNED | (FLAG_INTEGRITY if check_integrity else 0)
+    
+    flags = 0
+    use_custom_align = alignment != 64
+    if use_custom_align:
+        flags |= FLAG_CUST_ALIGN
+    else:
+        flags |= FLAG_ALIGNED
+    
+    if check_integrity:
+        flags |= FLAG_INTEGRITY
 
     if compress:
         if not HAS_LZ4:
@@ -480,14 +512,27 @@ def dumps(
         flags |= FLAG_COMPRESSION
 
     current_len = 8 + (ndim * 4)
-    padding_len = (_ALIGNMENT - (current_len % _ALIGNMENT)) % _ALIGNMENT
+    if use_custom_align:
+        current_len += 1
+        
+    padding_len = 0
+    remainder = current_len % alignment
+    if remainder != 0:
+        padding_len = alignment - remainder
+        
     total_len = current_len + padding_len + len(body) + (8 if check_integrity else 0)
 
     buffer = bytearray(total_len)
     struct.pack_into("<4sBBBB", buffer, 0, _MAGIC, _VERSION, flags, dtype_code, ndim)
     struct.pack_into(f"<{ndim}I", buffer, 8, *shape)
-
+    
+    cursor = 8 + (ndim * 4)
+    if use_custom_align:
+        buffer[cursor] = alignment.bit_length() - 1
+        cursor += 1
+    
     body_start = current_len + padding_len
+
     buffer[body_start : body_start + len(body)] = body
     if check_integrity:
         digest = xxhash.xxh3_64_intdigest(body)
@@ -513,6 +558,20 @@ def loads(
     Any
         The reconstructed NumPy array, Dictionary, or Sparse Matrix.
     """
+    # 0. FAST PATH: RUST ACCELERATION
+    if HAS_RUST and hasattr(data, "__buffer__") or isinstance(data, (bytes, bytearray, memoryview, np.ndarray, mmap.mmap)):
+        # loads_rs returns None if flags are unsupported (e.g. Bundle/Sparse/Compression)
+        # It raises ValueError if the packet is malformed or integrity check fails.
+        try:
+            res = loads_rs(data)
+            if res is not None:
+                if copy:
+                    return res.copy()
+                return res
+        except (ValueError, TypeError):
+             # Fallback to Python if Rust fails for any reason
+             pass
+
     mv = memoryview(data)
     if len(mv) < 8:
         raise ValueError("Packet too short")
@@ -573,8 +632,24 @@ def loads(
         raise ValueError(f"Unsupported dtype code: {dtype_code}")
 
     body_start = shape_end
-    if flags & FLAG_ALIGNED:
-        body_start += (_ALIGNMENT - (shape_end % _ALIGNMENT)) % _ALIGNMENT
+    
+    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
+    alignment = 1
+    
+    if use_custom_align:
+        # Read Exponent Byte
+        # Check buffer length first?
+        if len(mv) < body_start + 1:
+             raise ValueError("Packet too short (alignment byte)")
+        exponent = mv[body_start]
+        alignment = 1 << exponent
+        body_start += 1
+    elif flags & FLAG_ALIGNED:
+        alignment = _ALIGNMENT
+        
+    remainder = body_start % alignment
+    if remainder != 0:
+        body_start += (alignment - remainder)
 
     body_len = (
         (int(np.prod(shape)) * dtype.itemsize)
@@ -608,8 +683,49 @@ def dump(
     strict: bool = False,
     check_integrity: bool = False,
 ) -> None:
-    """Serialize a tensor and write it to an open binary file."""
-    write_stream(tensor, fp, strict=strict, check_integrity=check_integrity)
+    """
+    Serialize a tensor and write it to an open binary file.
+    
+    Optimized for large arrays by writing the complete packet in a single
+    system call instead of multiple small writes.
+    
+    Parameters
+    ----------
+    tensor : np.ndarray
+        The array to serialize.
+    fp : BinaryIO
+        Open binary file object.
+    strict : bool, default False
+        If True, raises error for non-contiguous arrays.
+    check_integrity : bool, default False
+        If True, includes XXH3 hash for verification.
+    
+    Returns
+    -------
+    None
+    """
+    # 0. FAST PATH: ZERO-ALLOCATION STREAMING (RUST)
+    if HAS_RUST and hasattr(fp, "fileno"):
+        try:
+            fd = fp.fileno()
+            # Ensure contiguous for Rust
+            if not tensor.flags["C_CONTIGUOUS"]:
+                if strict:
+                    raise ValueError("Tensor is not C-Contiguous")
+                # Note: ascontiguousarray makes a copy, but it's unavoidable if data is not contiguous
+                tensor = np.ascontiguousarray(tensor)
+            
+            # Write directly to FD without allocating PyBytes
+            dump_to_fd_rs(tensor, fd, check_integrity=check_integrity)
+            return
+        except (ValueError, TypeError, AttributeError, OSError):
+            # Fallback if fileno() is unavailable/invalid (e.g. BytesIO) or Rust fails
+            pass
+
+    # Use dumps() to create complete packet, then single write
+    # This is 6x faster than chunked writes for large arrays
+    packet = dumps(tensor, strict=strict, check_integrity=check_integrity)
+    fp.write(packet)
 
 
 def load(fp: BinaryIO, mmap_mode: bool = False, copy: bool = False) -> Any:

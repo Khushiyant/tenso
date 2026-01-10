@@ -13,7 +13,7 @@ def test_get_packet_info():
 
     info = tenso.get_packet_info(packet)
 
-    assert info["version"] == 2
+    assert info["version"] == 3
     assert info["dtype"] == np.dtype("float32")
     assert info["shape"] == (32, 128)
     assert info["ndim"] == 2
