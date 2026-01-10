@@ -10,9 +10,11 @@ Tenso Documentation
 
 .. toctree::
    :maxdepth: 2
-   :caption: API Reference
+   :caption: Contents
    :hidden:
 
+   architecture
+   contributing_rust
    reference/modules
 
 Indices and tables
