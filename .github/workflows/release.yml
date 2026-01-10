@@ -71,9 +71,45 @@ jobs:
           name: wheels-${{ matrix.os }}
           path: dist
 
+  build-sdist:
+    name: Build source distribution
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install gRPC tools
+        run: pip install grpcio-tools
+
+      - name: Generate gRPC code
+        shell: bash
+        run: |
+          python -m grpc_tools.protoc -Isrc --python_out=src --grpc_python_out=src src/tenso/grpc/tenso_msg.proto
+          python -m grpc_tools.protoc -Isrc --python_out=src --grpc_python_out=src src/tenso/grpc/benchmark_msg.proto
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
   publish:
     name: Publish to PyPI
-    needs: [release, build-wheels]
+    needs: [release, build-wheels, build-sdist]
     runs-on: ubuntu-latest
     if: needs.release.outputs.released == 'true'
     steps:

@@ -21,8 +21,11 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
     - name: Install gRPC tools
-      run: pip install grpcio-tools
+      run: uv pip install grpcio-tools --system
 
     - name: Generate gRPC code
       run: |
@@ -30,28 +33,16 @@ jobs:
               --python_out=src/tenso/grpc \
               --grpc_python_out=src/tenso/grpc \
               src/tenso/grpc/tenso_msg.proto
+        # Fix relative import for python 3
+        sed -i 's/^import tenso_msg_pb2/from . import tenso_msg_pb2/' src/tenso/grpc/tenso_msg_pb2_grpc.py
               
     - name: Install dependencies
       # Installs the package in editable mode along with 'dev' dependencies
       # defined in your pyproject.toml (pytest, pyarrow, safetensors, etc.)
       run: |
-        python -m pip install --upgrade pip
-        pip install -e ".[dev]"
-        pip install pytest
+        uv pip install --system -e ".[dev]"
+        uv pip install --system pytest
 
     - name: Run tests
       run: |
         pytest -v
-<<<<<<< HEAD
-
-    - name: Install gRPC tools
-      run: pip install grpcio-tools
-
-    - name: Generate gRPC code
-      run: |
-        python -m grpc_tools.protoc -Isrc/tenso/grpc \
-              --python_out=src/tenso/grpc \
-              --grpc_python_out=src/tenso/grpc \
-              src/tenso/grpc/tenso_msg.proto
-=======
->>>>>>> 9b6048f (feat: add gRPC support for tensor operations, including benchmarking and integration tests)
