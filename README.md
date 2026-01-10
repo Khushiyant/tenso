@@ -36,7 +36,7 @@ Tenso achieves **true zero-copy** with:
 
 ## Benchmarks
 
-**System**: Python 3.12.9, NumPy 2.3.5, 12 CPU cores, macOS
+**System**: Python 3.12.9, NumPy 2.3.5, 12 CPU cores, M4 Pro
 
 ### 1. In-Memory Serialization (LLM Layer - 64MB)
 
