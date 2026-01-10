@@ -23,6 +23,8 @@ jobs:
 
     - name: Install uv
       uses: astral-sh/setup-uv@v5
+      with:
+        cache-dependency-glob: "pyproject.toml"
 
     - name: Install gRPC tools
       run: uv pip install grpcio-tools --system
