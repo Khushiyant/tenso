@@ -1,6 +1,27 @@
 # CHANGELOG
 
 
+## v0.13.1 (2026-01-11)
+
+### Bug Fixes
+
+- Unify file descriptor handling for cross-platform compatibility in generic_dump
+  ([`e351c9b`](https://github.com/Khushiyant/tenso/commit/e351c9bb50e46aa1062b268d67fe28c3e05e5dae))
+
+### Chores
+
+- Add missing cache-dependency-glob for uv installation step
+  ([`91448ff`](https://github.com/Khushiyant/tenso/commit/91448ff1106e8f829328a2929e21efd9d58052e4))
+
+- Update system information in README.md
+  ([`c8f3b67`](https://github.com/Khushiyant/tenso/commit/c8f3b67423f2a83cd37d61e958c1e179cce6f8a8))
+
+### Documentation
+
+- Add architecture and contributing documentation for Rust integration
+  ([`70342bf`](https://github.com/Khushiyant/tenso/commit/70342bfba22ae33e54523e5a94f73b4765164195))
+
+
 ## v0.13.0 (2026-01-10)
 
 ### Bug Fixes
