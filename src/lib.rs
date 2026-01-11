@@ -6,7 +6,10 @@ use std::convert::TryInto;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 use num_complex::{Complex32, Complex64};
 use rayon::prelude::*;
+#[cfg(unix)]
 use std::os::unix::io::{RawFd, FromRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{RawHandle, FromRawHandle};
 use std::mem::ManuallyDrop;
 use std::io::{self, Write, Read};
 use std::fs::File;
@@ -290,10 +293,15 @@ macro_rules! serialize_impl {
 // DUMP TO FD Implementation (Optimized)
 // -----------------------------------------------------------------------------
 
+#[cfg(unix)]
+type RawFileDescriptor = RawFd;
+#[cfg(windows)]
+type RawFileDescriptor = RawHandle;
+
 fn generic_dump<T: numpy::Element>(
     py: Python,
     array: &PyAny,
-    fd: RawFd,
+    fd: RawFileDescriptor,
     check_integrity: bool,
     compress: bool,
     alignment: usize,
@@ -320,7 +328,10 @@ fn generic_dump<T: numpy::Element>(
     
     py.allow_threads(move || {
         let u8_slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, total_bytes) };
+        #[cfg(unix)]
         let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd)) };
+        #[cfg(windows)]
+        let mut file = unsafe { ManuallyDrop::new(File::from_raw_handle(fd)) };
 
         let use_custom_align = alignment != 64;
         let mut header_len = 8 + (ndim * 4);
@@ -351,7 +362,7 @@ fn generic_dump<T: numpy::Element>(
         }
         
         header_buf.resize(header_len + padding_len, 0);
-        file.write_all(&header_buf).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        file.write_all(&header_buf).map_err(|e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         // WrapperWriter computes hash of the data being written to file.
         // If compress=True, we write compressed data to file, so we hash compressed data.
@@ -360,16 +371,17 @@ fn generic_dump<T: numpy::Element>(
         if compress {
             // Streaming Compression
             let mut encoder = FrameEncoder::new(&mut wrapper);
-            encoder.write_all(u8_slice).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            encoder.finish().map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            encoder.write_all(u8_slice).map_err(|e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            encoder.finish().map_err(|e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         } else {
-            wrapper.write_all(u8_slice).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            wrapper.write_all(u8_slice).map_err(|e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
         
         let (_, hash_opt, bytes_written) = wrapper.finish();
 
         if let Some(hash) = hash_opt {
-             file.write_all(&hash.to_le_bytes()).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+             let hash: u64 = hash;
+             file.write_all(&hash.to_le_bytes()).map_err(|e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
         
         let footer_len = if check_integrity { 8 } else { 0 };
@@ -382,7 +394,7 @@ fn generic_dump<T: numpy::Element>(
 fn dump_to_fd_rs<'py>(
     py: Python<'py>,
     array: &'py PyAny,
-    fd: RawFd,
+    fd: RawFileDescriptor,
     check_integrity: bool,
     compress: bool,
     alignment: usize
