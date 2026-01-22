@@ -37,6 +37,7 @@ enum DType {
     Uint64,
     Complex64,
     Complex128,
+    BFloat16,
 }
 
 impl DType {
@@ -56,6 +57,7 @@ impl DType {
             12 => Ok(DType::Uint64),
             13 => Ok(DType::Complex64),
             14 => Ok(DType::Complex128),
+            15 => Ok(DType::BFloat16),
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Unsupported or unknown dtype code: {}",
                 code
@@ -79,6 +81,7 @@ impl DType {
             DType::Uint64 => 12,
             DType::Complex64 => 13,
             DType::Complex128 => 14,
+            DType::BFloat16 => 15,
         }
     }
 
@@ -98,6 +101,7 @@ impl DType {
             DType::Uint64 => 8,
             DType::Complex64 => 8,
             DType::Complex128 => 16,
+            DType::BFloat16 => 2,
         }
     }
 
@@ -117,6 +121,7 @@ impl DType {
             DType::Uint64 => "uint64",
             DType::Complex64 => "complex64",
             DType::Complex128 => "complex128",
+            DType::BFloat16 => "bfloat16",
         }
     }
 }
@@ -182,114 +187,287 @@ impl<W: Write> Write for WrapperWriter<W> {
 // Serialization Implementation (In-Memory)
 // -----------------------------------------------------------------------------
 
-macro_rules! serialize_impl {
-    ($py:expr, $array:expr, $dtype_code:ty, $dtype_enum:expr, $check_integrity:expr, $compress:expr, $alignment:expr) => {{
-        let array = $array.downcast::<PyArrayDyn<$dtype_code>>().map_err(|_| {
-            pyo3::exceptions::PyTypeError::new_err("Type mismatch in serialization dispatch")
-        })?;
+// Helper to write a dense array into a mutable byte slice.
+// Returns the number of bytes written.
+fn write_dense_to_slice(
+    _py: Python,
+    array: &PyAny,
+    target: &mut [u8],
+    check_integrity: bool,
+    compress: bool,
+    alignment: usize,
+) -> PyResult<usize> {
+    if !alignment.is_power_of_two() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
+    }
 
-        let ndim = array.ndim();
-        let shape = array.shape();
+    let dtype = array.getattr("dtype")?;
+    let name: String = dtype.getattr("name")?.extract()?;
+    let dtype_enum = match name.as_str() {
+        "float32" => DType::Float32,
+        "int32" => DType::Int32,
+        "float64" => DType::Float64,
+        "int64" => DType::Int64,
+        "uint8" => DType::Uint8,
+        "uint16" => DType::Uint16,
+        "bool" => DType::Bool,
+        "float16" => DType::Float16,
+        "int8" => DType::Int8,
+        "int16" => DType::Int16,
+        "uint32" => DType::Uint32,
+        "uint64" => DType::Uint64,
+        "complex64" => DType::Complex64,
+        "complex128" => DType::Complex128,
+        "bfloat16" => DType::BFloat16,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("Unsupported dtype: {}", name))),
+    };
 
-        let use_custom_align = $alignment != 64;
-        let mut header_len = 8 + (ndim * 4);
-        if use_custom_align {
-            header_len += 1;
+    // Generic way to get raw data pointer and size from any NumPy array
+    let nbytes: usize = array.getattr("nbytes")?.extract()?;
+    let data_ptr: usize = array.getattr("ctypes")?.getattr("data")?.extract()?;
+    let ndim: usize = array.getattr("ndim")?.extract()?;
+    let shape: Vec<usize> = array.getattr("shape")?.extract()?;
+
+    let u8_slice = unsafe {
+        std::slice::from_raw_parts(data_ptr as *const u8, nbytes)
+    };
+
+    let use_custom_align = alignment != 64;
+    let mut header_len = 8 + (ndim * 4);
+    if use_custom_align {
+        header_len += 1;
+    }
+
+    let remainder = header_len % alignment;
+    let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
+
+    let uncompressed_len = u8_slice.len();
+    
+    let (compressed_data, body_len, flags_compression) = if compress {
+         let data = lz4_compress(u8_slice);
+         let len = data.len();
+         (Some(data), len, 4u8)
+    } else {
+         (None, uncompressed_len, 0u8)
+    };
+    
+    let footer_len = if check_integrity { 8 } else { 0 };
+    let total_len = header_len + padding_len + body_len + footer_len;
+
+    if target.len() < total_len {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!("Buffer too small: {} < {}", target.len(), total_len)));
+    }
+
+    // Write Header
+    target[0..4].copy_from_slice(b"TNSO");
+    target[4] = 3; 
+    
+    let mut flags = 0;
+    if use_custom_align { flags |= 128; } else { flags |= 1; }
+    if check_integrity { flags |= 2; }
+    flags |= flags_compression;
+    target[5] = flags;
+
+    target[6] = dtype_enum.code();
+    target[7] = ndim as u8;
+
+    let mut cursor = 8;
+    for &dim in &shape {
+        target[cursor..cursor + 4].copy_from_slice(&(dim as u32).to_le_bytes());
+        cursor += 4;
+    }
+
+    if use_custom_align {
+        target[cursor] = alignment.trailing_zeros() as u8;
+    }
+
+    let body_start = header_len + padding_len;
+    let target_body = &mut target[body_start..body_start + body_len];
+
+    if let Some(ref c_data) = compressed_data {
+        target_body.copy_from_slice(c_data);
+        if check_integrity {
+             let hash = compute_integrity_hash(c_data);
+             let footer_start = body_start + body_len;
+             target[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
         }
-        
-        let alignment = $alignment;
-        let remainder = header_len % alignment;
-        let padding_len = if remainder == 0 {
-            0
-        } else {
-            alignment - remainder
-        };
-
-        let total_elements: usize = shape.iter().product();
-        let dtype = $dtype_enum;
-        let item_size = dtype.item_size();
-        let uncompressed_len = total_elements * item_size;
-
-        let slice = unsafe { array.as_slice() }.map_err(|_| {
-            pyo3::exceptions::PyValueError::new_err("Array must be C-Contiguous")
-        })?; 
-        let u8_slice = unsafe {
-            std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * item_size)
-        };
-
-        let (compressed_data, body_len, flags_compression) = if $compress {
-             let data = lz4_compress(u8_slice);
-             let len = data.len();
-             (Some(data), len, 4u8)
-        } else {
-             (None, uncompressed_len, 0u8)
-        };
-        
-        let footer_len = if $check_integrity { 8 } else { 0 };
-        let total_len = header_len + padding_len + body_len + footer_len;
-        
+    } else {
         const PARALLEL_THRESHOLD: usize = 1024 * 1024;
+        if body_len >= PARALLEL_THRESHOLD {
+            target_body.par_chunks_mut(128 * 1024)
+                .zip(u8_slice.par_chunks(128 * 1024))
+                .for_each(|(t, s)| t.copy_from_slice(s));
+        } else {
+            target_body.copy_from_slice(u8_slice);
+        }
 
-        PyBytes::new_with($py, total_len, |bytes: &mut [u8]| {
-            bytes[0..4].copy_from_slice(b"TNSO");
-            bytes[4] = 3; 
-            
-            let mut flags = 0;
-            if use_custom_align {
-                flags |= 128;
-            } else {
-                flags |= 1;
-            }
-            if $check_integrity {
-                flags |= 2;
-            }
-            flags |= flags_compression;
-            bytes[5] = flags;
-
-            bytes[6] = dtype.code();
-            bytes[7] = ndim as u8;
-
-            let mut cursor = 8;
-            for &dim in shape {
-                bytes[cursor..cursor + 4].copy_from_slice(&(dim as u32).to_le_bytes());
-                cursor += 4;
-            }
-
-            if use_custom_align {
-                bytes[cursor] = alignment.trailing_zeros() as u8;
-            }
-
-            let body_start = header_len + padding_len;
-            let target_slice = &mut bytes[body_start..body_start + body_len];
-
-            if let Some(ref c_data) = compressed_data {
-                target_slice.copy_from_slice(c_data);
-                if $check_integrity {
-                     let hash = compute_integrity_hash(c_data);
-                     let footer_start = body_start + body_len;
-                     bytes[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
-                }
-            } else {
-                if body_len >= PARALLEL_THRESHOLD {
-                    target_slice.par_chunks_mut(128 * 1024)
-                        .zip(u8_slice.par_chunks(128 * 1024))
-                        .for_each(|(t, s)| t.copy_from_slice(s));
-                } else {
-                    target_slice.copy_from_slice(u8_slice);
-                }
-
-                if $check_integrity {
-                    let hash = compute_integrity_hash(u8_slice);
-                    let footer_start = body_start + body_len;
-                    bytes[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
-                }
-            }
-            Ok(())
-        })
-    }};
+        if check_integrity {
+            let hash = compute_integrity_hash(u8_slice);
+            let footer_start = body_start + body_len;
+            target[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
+        }
+    }
+    
+    Ok(total_len)
 }
 
-// -----------------------------------------------------------------------------
+// Helper to calculate dense size without writing
+fn calc_dense_size(_py: Python, array: &PyAny, check_integrity: bool, compress: bool, alignment: usize) -> PyResult<usize> {
+    let ndim: usize = array.getattr("ndim")?.extract()?;
+    let nbytes: usize = array.getattr("nbytes")?.extract()?;
+    
+    let use_custom_align = alignment != 64;
+    let mut header_len = 8 + (ndim * 4);
+    if use_custom_align { header_len += 1; }
+    
+    let remainder = header_len % alignment;
+    let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
+    
+    let body_len = if compress {
+        return Err(pyo3::exceptions::PyValueError::new_err("Compression not yet supported for calculated sparse components"));
+    } else {
+        nbytes
+    };
+    
+    let footer_len = if check_integrity { 8 } else { 0 };
+    Ok(header_len + padding_len + body_len + footer_len)
+}
+
+fn serialize_sparse<'py>(py: Python<'py>, tensor: &'py PyAny, format: &str, _check_integrity: bool, alignment: usize) -> PyResult<&'py PyBytes> {
+    let (flag_code, comps) = match format {
+        "coo" => (8, vec!["data", "row", "col"]), // FLAG_SPARSE = 8
+        "csr" => (32, vec!["data", "indices", "indptr"]), // FLAG_SPARSE_CSR = 32
+        "csc" => (64, vec!["data", "indices", "indptr"]), // FLAG_SPARSE_CSC = 64
+        _ => return Err(pyo3::exceptions::PyValueError::new_err("Unknown sparse format")),
+    };
+
+    let shape_tuple: Vec<u32> = tensor.getattr("shape")?.extract()?;
+    let ndim = shape_tuple.len();
+
+    let mut component_arrays = Vec::with_capacity(3);
+    for name in comps {
+        let arr = tensor.getattr(name)?;
+        let contig = if arr.getattr("flags")?.getattr("c_contiguous")?.extract()? {
+            arr
+        } else {
+            let numpy = py.import("numpy")?;
+            numpy.call_method1("ascontiguousarray", (arr,))?
+        };
+        component_arrays.push(contig);
+    }
+
+    let main_header_len = 8 + (ndim * 4);
+    let mut total_len = main_header_len;
+    let mut comp_sizes = Vec::with_capacity(3);
+
+    for arr in &component_arrays {
+        let size = calc_dense_size(py, arr, false, false, alignment)?;
+        comp_sizes.push(size);
+        total_len += 4 + size; 
+    }
+
+    PyBytes::new_with(py, total_len, |bytes: &mut [u8]| {
+        bytes[0..4].copy_from_slice(b"TNSO");
+        bytes[4] = 3;
+        bytes[5] = flag_code; 
+        bytes[6] = 0; 
+        bytes[7] = ndim as u8;
+
+        let mut cursor = 8;
+        for &dim in &shape_tuple {
+            bytes[cursor..cursor+4].copy_from_slice(&(dim).to_le_bytes());
+            cursor += 4;
+        }
+
+        for (i, arr) in component_arrays.iter().enumerate() {
+            let size = comp_sizes[i];
+            bytes[cursor..cursor+4].copy_from_slice(&(size as u32).to_le_bytes());
+            cursor += 4;
+            let sub_slice = &mut bytes[cursor..cursor+size];
+            let _ = write_dense_to_slice(py, arr, sub_slice, false, false, alignment).unwrap();
+            cursor += size;
+        }
+        Ok(())
+    })
+}
+
+fn serialize_bundle<'py>(
+    py: Python<'py>,
+    dict: &'py PyDict,
+    check_integrity: bool,
+    compress: bool,
+    alignment: usize,
+) -> PyResult<&'py PyBytes> {
+    let mut total_len = 8; // Header
+    let mut entries = Vec::with_capacity(dict.len());
+
+    for (key, value) in dict.iter() {
+        let key_str: String = key.extract()?;
+        let key_bytes = key_str.as_bytes();
+        let key_len = key_bytes.len();
+
+        // Recursively call dumps_rs to get the packet for the value
+        // We can call the pyfunction itself to handle all types
+        let val_packet_obj = dumps_rs(py, value, check_integrity, compress, alignment)?;
+        let val_packet = val_packet_obj.as_bytes();
+        let val_len = val_packet.len();
+
+        total_len += 4 + key_len + 4 + val_len;
+        entries.push((key_bytes.to_vec(), val_packet.to_vec()));
+    }
+
+    PyBytes::new_with(py, total_len, |bytes: &mut [u8]| {
+        bytes[0..4].copy_from_slice(b"TNSO");
+        bytes[4] = 3;
+        bytes[5] = 16; // FLAG_BUNDLE = 16
+        bytes[6] = 0;
+        bytes[7] = entries.len() as u8; // min(len, 255) in python, but here we just cast
+
+        let mut cursor = 8;
+        for (key_bytes, val_bytes) in entries {
+            let k_len = key_bytes.len() as u32;
+            bytes[cursor..cursor + 4].copy_from_slice(&k_len.to_le_bytes());
+            cursor += 4;
+            bytes[cursor..cursor + key_bytes.len()].copy_from_slice(&key_bytes);
+            cursor += key_bytes.len();
+
+            let v_len = val_bytes.len() as u32;
+            bytes[cursor..cursor + 4].copy_from_slice(&v_len.to_le_bytes());
+            cursor += 4;
+            bytes[cursor..cursor + val_bytes.len()].copy_from_slice(&val_bytes);
+            cursor += val_bytes.len();
+        }
+        Ok(())
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (array, check_integrity=false, compress=false, alignment=64))]
+fn dumps_rs<'py>(py: Python<'py>, array: &'py PyAny, check_integrity: bool, compress: bool, alignment: usize) -> PyResult<&'py PyBytes> {
+    if !alignment.is_power_of_two() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
+    }
+
+    // CHECK FOR BUNDLE
+    if let Ok(dict) = array.downcast::<PyDict>() {
+        return serialize_bundle(py, dict, check_integrity, compress, alignment);
+    }
+
+    // CHECK FOR SPARSE
+    if let Ok(format_attr) = array.getattr("format") {
+        if let Ok(format_str) = format_attr.extract::<String>() {
+             return serialize_sparse(py, array, &format_str, check_integrity, alignment);
+        }
+    }
+
+    // DENSE PATH
+    let size = calc_dense_size(py, array, check_integrity, compress, alignment)?;
+    
+    PyBytes::new_with(py, size, |bytes: &mut [u8]| {
+         let _ = write_dense_to_slice(py, array, bytes, check_integrity, compress, alignment).unwrap();
+         Ok(())
+    })
+}
 // DUMP TO FD Implementation (Optimized)
 // -----------------------------------------------------------------------------
 
@@ -307,24 +485,20 @@ fn generic_dump<T: numpy::Element>(
     alignment: usize,
     dtype_enum: DType,
 ) -> PyResult<usize> {
-    let array = array.downcast::<PyArrayDyn<T>>().map_err(|_| {
+    let casted = array.downcast::<PyArrayDyn<T>>().map_err(|_| {
         pyo3::exceptions::PyTypeError::new_err("Type mismatch in serialization dispatch")
     })?;
 
-    let ndim = array.ndim();
-    let shape = array.shape().to_vec();
+    let ndim = casted.ndim();
+    let shape = casted.shape().to_vec();
 
-    let slice = unsafe { array.as_slice() }.map_err(|_| {
+    let slice = unsafe { casted.as_slice() }.map_err(|_| {
         pyo3::exceptions::PyValueError::new_err("Array must be C-Contiguous")
     })?;
     
     let item_size = dtype_enum.item_size();
     let total_bytes = slice.len() * item_size;
-    
-    // Safety: Extract raw pointer to pass to other thread.
-    // The PyArray object is held by the 'array' reference which is tied to the GIL-holding thread stack,
-    // which is blocked by allow_threads. So the data will not move or be GC'd.
-    let data_ptr = slice.as_ptr() as *const u8 as usize;
+    let data_ptr = slice.as_ptr() as usize;
     
     py.allow_threads(move || {
         let u8_slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, total_bytes) };
@@ -342,7 +516,7 @@ fn generic_dump<T: numpy::Element>(
         
         let mut header_buf = Vec::with_capacity(header_len + padding_len);
         header_buf.extend_from_slice(b"TNSO");
-        header_buf.push(3); // Version 3
+        header_buf.push(3); 
         
         let mut flags = 0;
         if use_custom_align { flags |= 128; } else { flags |= 1; }
@@ -364,12 +538,9 @@ fn generic_dump<T: numpy::Element>(
         header_buf.resize(header_len + padding_len, 0);
         file.write_all(&header_buf).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
 
-        // WrapperWriter computes hash of the data being written to file.
-        // If compress=True, we write compressed data to file, so we hash compressed data.
         let mut wrapper = WrapperWriter::new(&mut *file, check_integrity);
         
         if compress {
-            // Streaming Compression
             let mut encoder = FrameEncoder::new(&mut wrapper);
             encoder.write_all(u8_slice).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
             encoder.finish().map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
@@ -380,7 +551,6 @@ fn generic_dump<T: numpy::Element>(
         let (_, hash_opt, bytes_written) = wrapper.finish();
 
         if let Some(hash) = hash_opt {
-             let hash: u64 = hash;
              file.write_all(&hash.to_le_bytes()).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         }
         
@@ -420,41 +590,7 @@ fn dump_to_fd_rs<'py>(
         "uint64" => generic_dump::<u64>(py, array, fd, check_integrity, compress, alignment, DType::Uint64),
         "complex64" => generic_dump::<Complex32>(py, array, fd, check_integrity, compress, alignment, DType::Complex64),
         "complex128" => generic_dump::<Complex64>(py, array, fd, check_integrity, compress, alignment, DType::Complex128),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unsupported dtype: {}",
-            name
-        ))),
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Main Dumps Function
-// -----------------------------------------------------------------------------
-
-#[pyfunction]
-#[pyo3(signature = (array, check_integrity=false, compress=false, alignment=64))]
-fn dumps_rs<'py>(py: Python<'py>, array: &'py PyAny, check_integrity: bool, compress: bool, alignment: usize) -> PyResult<&'py PyBytes> {
-    if !alignment.is_power_of_two() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
-    }
-
-    let dtype = array.getattr("dtype")?;
-    let name: String = dtype.getattr("name")?.extract()?;
-
-    match name.as_str() {
-        "float32" => serialize_impl!(py, array, f32, DType::Float32, check_integrity, compress, alignment),
-        "int32" => serialize_impl!(py, array, i32, DType::Int32, check_integrity, compress, alignment),
-        "float64" => serialize_impl!(py, array, f64, DType::Float64, check_integrity, compress, alignment),
-        "int64" => serialize_impl!(py, array, i64, DType::Int64, check_integrity, compress, alignment),
-        "uint8" => serialize_impl!(py, array, u8, DType::Uint8, check_integrity, compress, alignment),
-        "uint16" => serialize_impl!(py, array, u16, DType::Uint16, check_integrity, compress, alignment),
-        "bool" => serialize_impl!(py, array, bool, DType::Bool, check_integrity, compress, alignment),
-        "int8" => serialize_impl!(py, array, i8, DType::Int8, check_integrity, compress, alignment),
-        "int16" => serialize_impl!(py, array, i16, DType::Int16, check_integrity, compress, alignment),
-        "uint32" => serialize_impl!(py, array, u32, DType::Uint32, check_integrity, compress, alignment),
-        "uint64" => serialize_impl!(py, array, u64, DType::Uint64, check_integrity, compress, alignment),
-        "complex64" => serialize_impl!(py, array, Complex32, DType::Complex64, check_integrity, compress, alignment),
-        "complex128" => serialize_impl!(py, array, Complex64, DType::Complex128, check_integrity, compress, alignment),
+        "bfloat16" => generic_dump::<u16>(py, array, fd, check_integrity, compress, alignment, DType::BFloat16),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Unsupported dtype: {}",
             name
@@ -549,27 +685,23 @@ fn deserialize_impl<'py>(
     let dtype_code = bytes[6];
     let ndim = bytes[7] as usize;
 
-    // Check for unsupported flags
     let supported_mask = 1 | 2 | 4 | 16 | 128;
     if (flags & !supported_mask) != 0 {
         return Ok(None);
     }
 
-    // --- BUNDLE PATH ---
     if (flags & FLAG_BUNDLE) != 0 {
         let res = PyDict::new(py);
-        let count = ndim; // For bundles, ndim holds the item count
+        let count = ndim; 
         let mut cursor = 8;
 
         for _ in 0..count {
-            // Read Key Length
             if cursor + 4 > bytes.len() {
                 return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (key len)"));
             }
             let k_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize;
             cursor += 4;
 
-            // Read Key
             if cursor + k_len > bytes.len() {
                 return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (key)"));
             }
@@ -577,20 +709,16 @@ fn deserialize_impl<'py>(
                 .map_err(|_| pyo3::exceptions::PyValueError::new_err("Invalid UTF-8 key"))?;
             cursor += k_len;
 
-            // Read Value Packet Length
             if cursor + 4 > bytes.len() {
                 return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (val len)"));
             }
             let v_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize;
             cursor += 4;
 
-            // Check boundaries
             if cursor + v_len > bytes.len() {
                  return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (value body)"));
             }
 
-            // Recursive Call
-            // Note: We pass the slice for the value packet
             let val_bytes = &bytes[cursor..cursor+v_len];
             let val_offset = absolute_offset + cursor;
             
@@ -598,7 +726,7 @@ fn deserialize_impl<'py>(
             
             match val_obj {
                 Some(obj) => res.set_item(key_str, obj)?,
-                None => return Ok(None), // Recursion failed (e.g. nested unsupported packet)
+                None => return Ok(None), 
             }
 
             cursor += v_len;
@@ -606,9 +734,6 @@ fn deserialize_impl<'py>(
         return Ok(Some(res.into()));
     }
 
-    // --- DENSE TENSOR PATH ---
-
-    // DoS Protection
     if ndim > MAX_NDIM {
         return Err(pyo3::exceptions::PyValueError::new_err(format!("Packet exceeds maximum dimensions ({} > {})", ndim, MAX_NDIM)));
     }
@@ -632,7 +757,6 @@ fn deserialize_impl<'py>(
         return Err(pyo3::exceptions::PyValueError::new_err("Packet header incomplete"));
     }
 
-    // Parse shape
     let mut shape = Vec::with_capacity(ndim);
     let mut cursor = 8;
     for _ in 0..ndim {
@@ -655,7 +779,6 @@ fn deserialize_impl<'py>(
     
     let num_elements: usize = shape.iter().product();
 
-    // DoS Protection
     if num_elements > MAX_ELEMENTS {
          return Err(pyo3::exceptions::PyValueError::new_err(format!("Packet exceeds maximum elements ({} > {})", num_elements, MAX_ELEMENTS)));
     }
@@ -668,15 +791,12 @@ fn deserialize_impl<'py>(
          return Err(pyo3::exceptions::PyValueError::new_err("Packet too short for header/padding"));
     }
     
-    // Determine body length (compressed or raw)
     let body_len = if (flags & 4) != 0 {
-        // Compressed: Body is everything until footer
         if available < body_start_rel + footer_len {
              return Err(pyo3::exceptions::PyValueError::new_err("Packet too short for compressed body"));
         }
         available - body_start_rel - footer_len
     } else {
-        // Raw: Body is exactly uncompressed_len
         uncompressed_len
     };
 
@@ -684,8 +804,7 @@ fn deserialize_impl<'py>(
          return Err(pyo3::exceptions::PyValueError::new_err("Packet too short for body"));
     }
     
-    // Integrity check
-    if (flags & 2) != 0 { // FLAG_INTEGRITY
+    if (flags & 2) != 0 { 
          let footer_start = body_start_rel + body_len;
          let expected_hash_bytes: [u8; 8] = bytes[footer_start..footer_start+8].try_into().map_err(|_| {
              pyo3::exceptions::PyValueError::new_err("Failed to read hash")
@@ -710,10 +829,7 @@ fn deserialize_impl<'py>(
     kwargs.set_item("dtype", dtype_name)?;
     
     let array = if (flags & 4) != 0 {
-        // Compressed Path: Decompress -> New Array
         let body_slice = &bytes[body_start_rel..body_start_rel+body_len];
-        
-        // Check for LZ4 Frame Magic: 0x04 0x22 0x4D 0x18
         let is_frame = body_slice.len() >= 4 && body_slice[0..4] == [0x04, 0x22, 0x4D, 0x18];
 
         let decompressed = if is_frame {
@@ -730,15 +846,12 @@ fn deserialize_impl<'py>(
         kwargs.set_item("count", num_elements)?;
         numpy.call_method("frombuffer", (py_bytes,), Some(kwargs))?
     } else {
-        // Zero-Copy Path
         kwargs.set_item("offset", absolute_offset + body_start_rel)?;
         kwargs.set_item("count", num_elements)?;
         numpy.call_method("frombuffer", (root_data,), Some(kwargs))?
     };
 
     let reshaped = array.call_method1("reshape", (shape,))?;
-    
-    // Set writeable=False
     let flags_attr = reshaped.getattr("flags")?;
     flags_attr.setattr("writeable", false)?;
 
@@ -764,3 +877,4 @@ fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(loads_rs, m)?)?;
     Ok(())
 }
+

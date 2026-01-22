@@ -58,7 +58,7 @@ def _get_allocator(size: int) -> Tuple[np.ndarray, Any]:
 
 def write_from_device(tensor: Any, dest: Any, check_integrity: bool = False) -> int:
     """
-    Serialize a GPU tensor directly to an I/O stream.
+    Serialize a GPU tensor directly to an I/O stream using pinned memory staging.
 
     Parameters
     ----------
@@ -75,10 +75,17 @@ def write_from_device(tensor: Any, dest: Any, check_integrity: bool = False) -> 
         Number of bytes written.
     """
     if HAS_CUPY and isinstance(tensor, cp.ndarray):
-        host_arr = cp.asnumpy(tensor)
+        # Use pinned memory for fast transfer
+        host_view, _ = _get_allocator(tensor.nbytes)
+        # Reshape view to match tensor for copy
+        target = host_view.view(tensor.dtype).reshape(tensor.shape)
+        tensor.get(out=target)
+        host_arr = target
     elif HAS_TORCH and isinstance(tensor, torch.Tensor):
-        host_arr = tensor.detach().cpu().numpy()
+        # Torch can move directly to pinned memory
+        host_arr = tensor.detach().to("cpu", pin_memory=True).numpy()
     elif HAS_JAX and hasattr(tensor, "device"):
+        # JAX currently doesn't have a simple pinned memory API like CuPy
         host_arr = np.asarray(tensor)
     else:
         host_arr = np.asarray(tensor)

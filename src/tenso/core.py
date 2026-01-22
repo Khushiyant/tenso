@@ -420,7 +420,27 @@ def dumps(
     if not (alignment > 0 and (alignment & (alignment - 1) == 0)):
         raise ValueError("Alignment must be a power of two")
 
-    # 1. Multi-tensor Bundle (Dictionaries)
+    # 1. FAST PATH: RUST ACCELERATION
+    if HAS_RUST and not compress:
+        try:
+            # Check if this type is handled by Rust
+            is_numpy = isinstance(tensor, np.ndarray)
+            is_sparse = hasattr(tensor, "format")
+            is_dict = isinstance(tensor, dict)
+            
+            if is_numpy or is_sparse or is_dict:
+                if is_numpy:
+                    if strict and not tensor.flags["C_CONTIGUOUS"]:
+                        raise ValueError("Tensor is not C-Contiguous")
+                    if not tensor.flags["C_CONTIGUOUS"]:
+                        tensor = np.ascontiguousarray(tensor)
+                
+                # dumps_rs handles Dense, Sparse, and Bundles
+                return memoryview(dumps_rs(tensor, check_integrity=check_integrity, alignment=alignment))
+        except (TypeError, ValueError):
+            pass
+
+    # 2. Multi-tensor Bundle (Dictionaries) - Python Fallback
     if isinstance(tensor, dict):
         parts = []
         header = struct.pack(
@@ -434,7 +454,7 @@ def dumps(
             parts.append(struct.pack("<I", len(val_packet)) + val_packet)
         return memoryview(b"".join(parts))
 
-    # 2. Sparse Formats (COO, CSR, CSC)
+    # 3. Sparse Formats (COO, CSR, CSC) - Python Fallback
     if hasattr(tensor, "format") and not isinstance(tensor, np.ndarray):
         fmt = tensor.format
         flag = {"coo": FLAG_SPARSE, "csr": FLAG_SPARSE_CSR, "csc": FLAG_SPARSE_CSC}.get(
@@ -457,28 +477,7 @@ def dumps(
             sub_pkts.append(struct.pack("<I", len(sp)) + sp)
         return memoryview(b"".join([header, shape_block] + sub_pkts))
 
-    # 3. FAST PATH: RUST ACCELERATION
-    # We use Rust if:
-    #  a) The extension is available (HAS_RUST)
-    #  b) No compression requested (Rust MVP doesn't support LZ4 yet)
-    if HAS_RUST and not compress:
-        try:
-            # Enforce strict contiguous check here if requested
-            if strict and not tensor.flags["C_CONTIGUOUS"]:
-                raise ValueError("Tensor is not C-Contiguous")
-
-            # Ensure contiguous for Rust (zero-copy requirement)
-            if not tensor.flags["C_CONTIGUOUS"]:
-                tensor = np.ascontiguousarray(tensor)
-
-            # Return zero-copy memoryview from Rust bytes
-            return memoryview(dumps_rs(tensor, check_integrity=check_integrity, alignment=alignment))
-        except (TypeError, ValueError):
-            # Fallback to Python if Rust doesn't support the dtype (e.g. object, complex)
-            # or if any other issue arises during dispatch.
-            pass
-
-    # 4. Standard Python Implementation (Fallback)
+    # 4. Standard Python Implementation (Fallback for Dense)
     if tensor.dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {tensor.dtype}")
 
