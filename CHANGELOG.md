@@ -1,7 +1,7 @@
 # CHANGELOG
 
 
-## v0.13.1 (2026-01-11)
+## v0.14.0 (2026-01-22)
 
 ### Bug Fixes
 
@@ -20,6 +20,11 @@
 
 - Add architecture and contributing documentation for Rust integration
   ([`70342bf`](https://github.com/Khushiyant/tenso/commit/70342bfba22ae33e54523e5a94f73b4765164195))
+
+### Features
+
+- Add support for bfloat16 data type and enhance serialization functions
+  ([`2efed76`](https://github.com/Khushiyant/tenso/commit/2efed76c5202e7eb51275aa19000d5b2774302f9))
 
 
 ## v0.13.0 (2026-01-10)
