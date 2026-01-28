@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.15.0 (2026-01-28)
+
+### Features
+
+- Add Shared Memory IPC support for efficient tensor transfer between processes
+  ([`6f40d2f`](https://github.com/Khushiyant/tenso/commit/6f40d2f21afe7210ff5c1253ac7757778d96afcc))
+
+
 ## v0.14.0 (2026-01-22)
 
 ### Bug Fixes
