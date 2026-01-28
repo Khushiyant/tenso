@@ -42,6 +42,12 @@ Tenso automatically selects the optimal implementation:
    - Handles: LZ4 compression, sparse matrices, bundles, complex dtypes
    - Still optimized with NumPy/xxhash
 
+3. **Shared Memory IPC**
+   
+   - Used for local inter-process communication
+   - Implementation: ``TensoShm`` class backed by ``dump_to_buffer_rs``
+   - Performance: Zero-copy transfer via memory mapping
+
 .. code-block:: python
 
     import numpy as np
@@ -57,10 +63,13 @@ Tenso automatically selects the optimal implementation:
 Rust Components
 ---------------
 
-The Rust extension (``tenso_rs``) provides three core functions exposed to Python via PyO3:
+The Rust extension (``tenso_rs``) provides core functions exposed to Python via PyO3:
 
 ``dumps_rs(tensor, check_integrity=False, alignment=64) -> bytes``
     Serialize a NumPy array with zero-copy efficiency.
+
+``dump_to_buffer_rs(array, buffer, check_integrity=False) -> int``
+    Serialize directly into a pre-allocated writable buffer (e.g., SharedMemory).
 
 ``loads_rs(packet) -> numpy.ndarray``
     Deserialize a Tenso packet with minimal memory copying.

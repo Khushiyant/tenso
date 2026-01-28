@@ -47,4 +47,11 @@ __all__ = [
     "get_packet_info",
     "is_aligned",
     "iter_dumps",
+    "TensoShm",
 ]
+
+# Optional SHM support
+try:
+    from .shm import TensoShm
+except ImportError:
+    TensoShm = None

@@ -150,6 +150,28 @@ async def get_tensor():
 
 ## Advanced Features
 
+### Inter-Process Communication (Shared Memory)
+
+Transfer tensors between local processes with **single-digit microsecond latency** using Shared Memory. This avoids socket overhead entirely by passing memory handles.
+
+```python
+from tenso import TensoShm
+import numpy as np
+
+# Process A: Write to Shared Memory
+data = np.random.randn(1024, 1024).astype(np.float32)
+# Automatically sizes and creates the SHM segment
+with TensoShm.create_from("shared_tensor_01", data) as shm:
+    print("Tensor is in SHM. Waiting for reader...")
+    input() # Keep process alive
+
+# Process B: Read from Shared Memory (Zero-Copy)
+with TensoShm("shared_tensor_01") as shm:
+    # Instant view of the data without copying
+    array = shm.get() 
+    print(f"Received: {array.shape}")
+```
+
 ### GPU Acceleration (Direct Transfer)
 
 Supports fast transfers between Tenso streams and device memory for **CuPy**, **PyTorch**, and **JAX** using pinned host memory.

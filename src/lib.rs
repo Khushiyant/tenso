@@ -598,6 +598,49 @@ fn dump_to_fd_rs<'py>(
     }
 }
 
+#[pyfunction]
+#[pyo3(signature = (array, buffer, check_integrity=false, compress=false, alignment=64))]
+fn dump_to_buffer_rs<'py>(
+    py: Python<'py>,
+    array: &'py PyAny,
+    buffer: &'py PyAny,
+    check_integrity: bool,
+    compress: bool,
+    alignment: usize
+) -> PyResult<usize> {
+    // get writable buffer
+    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
+    if py_buf.readonly() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+    }
+    
+    // Safety: we must ensure we don't violate aliasing rules if array and buffer overlap, 
+    // but for SHM use case they are distinct. PyBuffer ensures we have access.
+    // We treat the buffer as a raw mutable slice of u8.
+    let buf_len = py_buf.len_bytes();
+    let buf_ptr = py_buf.buf_ptr() as *mut u8;
+    let target_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) };
+
+    if !alignment.is_power_of_two() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
+    }
+
+    // CHECK FOR BUNDLE
+    if array.downcast::<PyDict>().is_ok() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err("Bundle serialization to pre-allocated buffer not yet implemented"));
+    }
+
+    // CHECK FOR SPARSE
+    if let Ok(format_attr) = array.getattr("format") {
+        if format_attr.extract::<String>().is_ok() {
+             return Err(pyo3::exceptions::PyNotImplementedError::new_err("Sparse serialization to pre-allocated buffer not yet implemented"));
+        }
+    }
+
+    // DENSE PATH
+    write_dense_to_slice(py, array, target_slice, check_integrity, compress, alignment)
+}
+
 // -----------------------------------------------------------------------------
 // Metadata Extraction Function
 // -----------------------------------------------------------------------------
@@ -873,6 +916,7 @@ fn loads_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<Option<PyObject>
 fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_packet_info_rs, m)?)?;
     m.add_function(wrap_pyfunction!(dumps_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(dump_to_buffer_rs, m)?)?;
     m.add_function(wrap_pyfunction!(dump_to_fd_rs, m)?)?;
     m.add_function(wrap_pyfunction!(loads_rs, m)?)?;
     Ok(())

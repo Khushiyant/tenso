@@ -925,6 +925,54 @@ def run_gpu_benchmark():
         print("Skipping GPU benchmark (Torch/CUDA not found)")
 
 
+def run_shm_benchmark():
+    """Run Shared Memory IPC benchmarks."""
+    print("\n" + "=" * 80)
+    print(f"BENCHMARK: SHARED MEMORY IPC (Integrity: {USE_INTEGRITY})")
+    print("=" * 80)
+
+    try:
+        from tenso import TensoShm
+    except ImportError:
+        print("TensoShm not available. Skipping.")
+        return
+
+    # Use a fairly large tensor to demonstrate throughput (e.g. 64MB)
+    shape = (4096, 4096)
+    data = np.random.rand(*shape).astype(np.float32)
+    size_mb = data.nbytes / (1024 * 1024)
+    shm_name = "tenso_bench_shm_01"
+
+    print(f"Dataset: {size_mb:.0f} MB Matrix {shape}")
+    print(f"{'OPERATION':<15} | {'TIME (ms)':<10} | {'THROUGHPUT':<15}")
+    print("-" * 60)
+
+    shm = None
+    try:
+        # Measure Write (Creation + Copy into SHM)
+        t0 = time.perf_counter()
+        shm = TensoShm.create_from(shm_name, data, check_integrity=USE_INTEGRITY)
+        t_write = (time.perf_counter() - t0) * 1000
+        
+        print(f"{'Write (Put)':<15} | {t_write:>7.3f} ms | {size_mb / (t_write / 1000):>7.2f} MB/s")
+
+        # Measure Read (Zero-copy mapping)
+        # We use a separate instance to simulate a reader process, although in same process
+        # the OS overhead for opening existing SHM is what we want to measure + mapping time.
+        t0 = time.perf_counter()
+        with TensoShm(shm_name) as reader:
+            res = reader.get()
+            del res
+        t_read = (time.perf_counter() - t0) * 1000
+        
+        print(f"{'Read (Get)':<15} | {t_read:>7.3f} ms | {size_mb / (t_read / 1000):>7.2f} MB/s")
+        
+    finally:
+        if shm:
+            shm.close()
+            shm.unlink()
+
+
 def print_summary():
     """Print system info and summary."""
     print("\n" + "=" * 80)
@@ -980,6 +1028,7 @@ Benchmark Modes:
             "dtypes",
             "arrow",
             "correctness",
+            "shm",
             "quick",
         ],
         default="all",
@@ -1015,6 +1064,9 @@ Benchmark Modes:
         run_arrow_comparison()
         run_correctness()
         run_async_benchmark()
+        run_shm_benchmark()
+    elif args.mode == "shm":
+        run_shm_benchmark()
     elif args.mode == "async":
         run_async_benchmark()
     elif args.mode == "dtypes":
