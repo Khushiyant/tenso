@@ -6,8 +6,7 @@ capabilities using POSIX Shared Memory. It allows zero-copy transfer of
 tensors between local processes.
 """
 
-import sys
-from typing import Any, Optional, Union
+from typing import Any, Optional, Self, Union
 import numpy as np
 
 try:
@@ -16,7 +15,6 @@ try:
 except ImportError:
     HAS_SHM = False
 
-from .config import MAX_NDIM
 try:
     from .tenso_rs import dump_to_buffer_rs, loads_rs
 except ImportError:
@@ -121,24 +119,32 @@ class TensoShm:
 
     @classmethod
     def create_from(
-        cls, 
-        name: str, 
-        obj: Any, 
-        check_integrity: bool = False, 
-        compress: bool = False, 
+        cls,
+        name: str,
+        obj: Any,
+        check_integrity: bool = False,
+        compress: bool = False,
         alignment: int = 64
-    ) -> "TensoShm":
+    ) -> Self:
         """
         Create a new SharedMemory segment sized to fit the object and write it.
         """
         if not isinstance(obj, np.ndarray):
             raise NotImplementedError("Only NumPy arrays supported for SHM auto-sizing currently.")
 
-        # Estimate size. 
-        # Header (max ~128 bytes) + Padding (max 64) + Body + Integrity (8)
-        # We add a 4KB safety margin to handle alignment/header variations safely.
-        estimated_size = obj.nbytes + 4096
-        
+        # Calculate exact overhead:
+        # Header: 8 bytes + (ndim * 4) for shape + optional alignment byte
+        # Padding: at most (alignment - 1) bytes
+        # Footer: 8 bytes if integrity check enabled
+        ndim = obj.ndim
+        header_size = 8 + (ndim * 4) + (1 if alignment != 64 else 0)
+        max_padding = alignment - 1
+        footer_size = 8 if check_integrity else 0
+
+        # Total overhead with small safety margin (256 bytes for edge cases)
+        overhead = header_size + max_padding + footer_size + 256
+        estimated_size = obj.nbytes + overhead
+
         shm = cls(name, create=True, size=estimated_size)
         try:
             shm.put(obj, check_integrity=check_integrity, compress=compress, alignment=alignment)

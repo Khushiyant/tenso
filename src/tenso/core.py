@@ -82,36 +82,38 @@ def _read_into_buffer(
     if n == 0:
         return True
 
+    # Cache method lookups outside the loop for performance
+    readinto = getattr(source, "readinto", None)
+    recv_into = getattr(source, "recv_into", None)
+    recv = getattr(source, "recv", None)
+    read = getattr(source, "read", None)
+
     pos = 0
     while pos < n:
-        read = 0
-        if hasattr(source, "readinto"):
-            read = source.readinto(view[pos:])
-        elif hasattr(source, "recv_into"):
+        bytes_read = 0
+        if readinto is not None:
+            bytes_read = readinto(view[pos:])
+        elif recv_into is not None:
             try:
-                read = source.recv_into(view[pos:])
+                bytes_read = recv_into(view[pos:])
             except BlockingIOError:
                 continue
         else:
             remaining = n - pos
-            chunk = (
-                source.recv(remaining)
-                if hasattr(source, "recv")
-                else source.read(remaining)
-            )
+            chunk = recv(remaining) if recv is not None else read(remaining)
 
             if chunk:
                 view[pos : pos + len(chunk)] = chunk
-                read = len(chunk)
+                bytes_read = len(chunk)
             else:
-                read = 0
+                bytes_read = 0
 
-        if read == 0:
+        if bytes_read == 0:
             if pos == 0:
                 return False
             raise EOFError(f"Expected {n} bytes, got {pos}")
 
-        pos += read
+        pos += bytes_read
     return True
 
 
@@ -374,17 +376,16 @@ def write_stream(
     int
         The total number of bytes written.
     """
-    chunks = list(iter_dumps(tensor, strict=strict, check_integrity=check_integrity))
-    written = 0
-
-    # Determine the correct method for writing
-    write_method = getattr(dest, "sendall", getattr(dest, "write", None))
+    # Determine the correct method for writing (cache lookup before iteration)
+    write_method = getattr(dest, "sendall", None) or getattr(dest, "write", None)
     if write_method is None:
         raise AttributeError(
             f"Destination {type(dest)} has no '.write' or '.sendall' method."
         )
 
-    for chunk in chunks:
+    # Stream directly from generator without materializing to list
+    written = 0
+    for chunk in iter_dumps(tensor, strict=strict, check_integrity=check_integrity):
         write_method(chunk)
         written += len(chunk)
     return written
@@ -427,14 +428,13 @@ def dumps(
             is_numpy = isinstance(tensor, np.ndarray)
             is_sparse = hasattr(tensor, "format")
             is_dict = isinstance(tensor, dict)
-            
+
             if is_numpy or is_sparse or is_dict:
-                if is_numpy:
-                    if strict and not tensor.flags["C_CONTIGUOUS"]:
+                if is_numpy and not tensor.flags["C_CONTIGUOUS"]:
+                    if strict:
                         raise ValueError("Tensor is not C-Contiguous")
-                    if not tensor.flags["C_CONTIGUOUS"]:
-                        tensor = np.ascontiguousarray(tensor)
-                
+                    tensor = np.ascontiguousarray(tensor)
+
                 # dumps_rs handles Dense, Sparse, and Bundles
                 return memoryview(dumps_rs(tensor, check_integrity=check_integrity, alignment=alignment))
         except (TypeError, ValueError):
@@ -558,7 +558,7 @@ def loads(
         The reconstructed NumPy array, Dictionary, or Sparse Matrix.
     """
     # 0. FAST PATH: RUST ACCELERATION
-    if HAS_RUST and hasattr(data, "__buffer__") or isinstance(data, (bytes, bytearray, memoryview, np.ndarray, mmap.mmap)):
+    if HAS_RUST and (hasattr(data, "__buffer__") or isinstance(data, (bytes, bytearray, memoryview, np.ndarray, mmap.mmap))):
         # loads_rs returns None if flags are unsupported (e.g. Bundle/Sparse/Compression)
         # It raises ValueError if the packet is malformed or integrity check fails.
         try:
@@ -623,7 +623,8 @@ def loads(
 
     shape_end = 8 + (ndim * 4)
     shape = struct.unpack(f"<{ndim}I", mv[8:shape_end])
-    if np.prod(shape) > MAX_ELEMENTS:
+    num_elements = int(np.prod(shape))
+    if num_elements > MAX_ELEMENTS:
         raise ValueError("Packet exceeds maximum elements")
 
     dtype = _REV_DTYPE_MAP.get(dtype_code)
@@ -631,27 +632,25 @@ def loads(
         raise ValueError(f"Unsupported dtype code: {dtype_code}")
 
     body_start = shape_end
-    
+
     use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
     alignment = 1
-    
+
     if use_custom_align:
-        # Read Exponent Byte
-        # Check buffer length first?
         if len(mv) < body_start + 1:
-             raise ValueError("Packet too short (alignment byte)")
+            raise ValueError("Packet too short (alignment byte)")
         exponent = mv[body_start]
         alignment = 1 << exponent
         body_start += 1
     elif flags & FLAG_ALIGNED:
         alignment = _ALIGNMENT
-        
+
     remainder = body_start % alignment
     if remainder != 0:
         body_start += (alignment - remainder)
 
     body_len = (
-        (int(np.prod(shape)) * dtype.itemsize)
+        (num_elements * dtype.itemsize)
         if not (flags & FLAG_COMPRESSION)
         else (len(mv) - body_start - (8 if flags & FLAG_INTEGRITY else 0))
     )
@@ -667,9 +666,7 @@ def loads(
     if flags & FLAG_COMPRESSION:
         body_data = lz4.frame.decompress(body_data)
 
-    arr = np.frombuffer(body_data, dtype=dtype, count=int(np.prod(shape))).reshape(
-        shape
-    )
+    arr = np.frombuffer(body_data, dtype=dtype, count=num_elements).reshape(shape)
     if copy:
         return arr.copy()
     arr.flags.writeable = False

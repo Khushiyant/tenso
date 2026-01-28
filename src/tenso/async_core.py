@@ -40,15 +40,16 @@ async def aread_stream(reader: asyncio.StreamReader) -> Optional[np.ndarray]:
 
     shape_bytes = await reader.readexactly(ndim * 4)
     shape = struct.unpack(f"<{ndim}I", shape_bytes)
-    if int(np.prod(shape)) > MAX_ELEMENTS:
-        raise ValueError(f"Packet exceeds maximum elements ({int(np.prod(shape))})")
+    num_elements = int(np.prod(shape))
+    if num_elements > MAX_ELEMENTS:
+        raise ValueError(f"Packet exceeds maximum elements ({num_elements})")
 
     pad_len = (_ALIGNMENT - ((8 + (ndim * 4)) % _ALIGNMENT)) % _ALIGNMENT
     if pad_len > 0:
         await reader.readexactly(pad_len)
 
     dtype = _REV_DTYPE_MAP.get(dtype_code)
-    body_data = await reader.readexactly(int(np.prod(shape)) * dtype.itemsize)
+    body_data = await reader.readexactly(num_elements * dtype.itemsize)
 
     if flags & FLAG_INTEGRITY:
         footer = await reader.readexactly(8)

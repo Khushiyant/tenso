@@ -7,8 +7,9 @@ and Tenso streams using pinned host memory.
 
 import struct
 import numpy as np
+import xxhash
 from typing import Any, Tuple
-from .config import _MAGIC, _ALIGNMENT, _REV_DTYPE_MAP
+from .config import _MAGIC, _ALIGNMENT, _REV_DTYPE_MAP, FLAG_INTEGRITY
 from .core import _read_into_buffer, dumps
 
 # --- BACKEND DETECTION ---
@@ -110,11 +111,18 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
     -------
     Any
         The GPU tensor.
+
+    Raises
+    ------
+    ValueError
+        If packet is invalid or integrity check fails.
+    EOFError
+        If stream ends prematurely.
     """
     header = bytearray(8)
     if not _read_into_buffer(source, header):
         return None
-    magic, _, _, dtype_code, ndim = struct.unpack("<4sBBBB", header)
+    magic, _, flags, dtype_code, ndim = struct.unpack("<4sBBBB", header)
     if magic != _MAGIC:
         raise ValueError("Invalid tenso packet")
 
@@ -123,19 +131,30 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
         raise EOFError("Stream ended during shape read")
     shape = struct.unpack(f"<{ndim}I", shape_bytes)
     dtype_np = _REV_DTYPE_MAP.get(dtype_code)
+    num_elements = int(np.prod(shape))
 
     current_pos = 8 + (ndim * 4)
     padding_len = (_ALIGNMENT - (current_pos % _ALIGNMENT)) % _ALIGNMENT
-    body_len = int(np.prod(shape) * dtype_np.itemsize)
+    body_len = num_elements * dtype_np.itemsize
+    has_integrity = (flags & FLAG_INTEGRITY) != 0
+    footer_len = 8 if has_integrity else 0
 
-    host_view, _ = _get_allocator(padding_len + body_len)
+    host_view, _ = _get_allocator(padding_len + body_len + footer_len)
     try:
         if not _read_into_buffer(source, host_view):
             raise EOFError("Stream ended during body read")
     except EOFError as e:
         raise EOFError(f"Stream ended during body read. {e}") from None
 
-    body_view = host_view[padding_len:].view(dtype=dtype_np).reshape(shape)
+    # Verify integrity if flag is set
+    if has_integrity:
+        body_data = host_view[padding_len : padding_len + body_len]
+        actual_hash = xxhash.xxh3_64_intdigest(body_data)
+        expected_hash = struct.unpack("<Q", host_view[padding_len + body_len :])[0]
+        if actual_hash != expected_hash:
+            raise ValueError("Integrity check failed: XXH3 mismatch")
+
+    body_view = host_view[padding_len : padding_len + body_len].view(dtype=dtype_np).reshape(shape)
 
     if BACKEND == "cupy":
         with cp.cuda.Device(device_id):
