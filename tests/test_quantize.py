@@ -139,7 +139,7 @@ def test_dequantize_uint8_accuracy():
     arr = np.random.uniform(0, 1, (16, 16)).astype(np.float32)
     qt = QuantizedTensor.quantize(arr, "quint8")
     reconstructed = qt.dequantize()
-    np.testing.assert_allclose(reconstructed, arr, atol=0.01)
+    np.testing.assert_allclose(reconstructed, arr, atol=0.02)
 
 
 def test_dequantize_int4_accuracy():

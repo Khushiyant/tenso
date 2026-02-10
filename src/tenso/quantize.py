@@ -6,7 +6,6 @@ with per-tensor, per-channel, and per-group quantization schemes.
 """
 
 import math
-from typing import Optional
 
 import numpy as np
 
@@ -14,7 +13,6 @@ from .config import (
     QDTYPE_QINT4,
     QDTYPE_QINT8,
     QDTYPE_QUINT4,
-    QDTYPE_QUINT8,
     QUANT_PER_CHANNEL,
     QUANT_PER_GROUP,
     QUANT_PER_TENSOR,
@@ -73,35 +71,7 @@ def _unpack_int4(packed: np.ndarray, num_elements: int, signed: bool) -> np.ndar
 
 
 class QuantizedTensor:
-    """A quantized tensor with scale/zero_point metadata.
-
-    Attributes
-    ----------
-    data : np.ndarray
-        Raw quantized data (uint8). For int4 types, values are packed 2 per byte.
-    scales : np.ndarray
-        Float32 scale factors.
-    zero_points : np.ndarray
-        Float32 zero points.
-    shape : tuple
-        Original tensor shape.
-    dtype_code : int
-        Quantized dtype code (16-19).
-    quant_scheme : int
-        Quantization scheme (0=per_tensor, 1=per_channel, 2=per_group).
-    group_size : int
-        Group size for per-group quantization (0 otherwise).
-    """
-
-    __slots__ = (
-        "data",
-        "scales",
-        "zero_points",
-        "shape",
-        "dtype_code",
-        "quant_scheme",
-        "group_size",
-    )
+    """A quantized tensor with scale/zero_point metadata."""
 
     def __init__(
         self,
@@ -198,7 +168,6 @@ class QuantizedTensor:
             zero_points = np.empty(num_channels, dtype=np.float32)
             quantized = np.empty(flat.shape, dtype=np.int8 if is_signed else np.uint8)
 
-            slices_per_channel = int(np.prod(shape)) // num_channels
             # Move axis to front for easier slicing
             moved = np.moveaxis(float_data, axis, 0)
             moved_flat = moved.reshape(num_channels, -1)

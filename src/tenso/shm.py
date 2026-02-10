@@ -27,8 +27,9 @@ except ImportError:
 class TensoShm:
     """
     A wrapper around SharedMemory for Tenso-protocol objects.
-    
-    Example:
+
+    Example::
+
         # Writer
         ary = np.random.rand(100, 100)
         with TensoShm.create_from("my_tensor", ary) as shm:
