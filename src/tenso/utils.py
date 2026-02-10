@@ -1,7 +1,7 @@
 import ctypes
 import struct
 import numpy as np
-from .config import _MAGIC, _REV_DTYPE_MAP, FLAG_INTEGRITY
+from .config import _MAGIC, _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_INTEGRITY
 
 # --- RUST INTEGRATION ---
 try:
@@ -74,13 +74,22 @@ def get_packet_info(data: bytes) -> dict:
             # Post-process Rust output to match Python API expectations
             # Rust returns 'dtype_code' (int), tests expect 'dtype' (np.dtype)
             if "dtype" not in info and "dtype_code" in info:
-                dtype = _REV_DTYPE_MAP.get(info["dtype_code"])
-                info["dtype"] = dtype
-
-                # Calculate data_size_bytes if missing
-                if "data_size_bytes" not in info and "total_elements" in info:
-                    itemsize = dtype.itemsize if dtype else 0
-                    info["data_size_bytes"] = info["total_elements"] * itemsize
+                dc = info["dtype_code"]
+                if dc in _QDTYPE_NAMES:
+                    info["dtype"] = _QDTYPE_NAMES[dc]
+                    info["quantized"] = True
+                    if "total_elements" in info:
+                        total = info["total_elements"]
+                        if dc in (18, 19):
+                            info["data_size_bytes"] = (total + 1) // 2
+                        else:
+                            info["data_size_bytes"] = total
+                else:
+                    dtype = _REV_DTYPE_MAP.get(dc)
+                    info["dtype"] = dtype
+                    if "data_size_bytes" not in info and "total_elements" in info:
+                        itemsize = dtype.itemsize if dtype else 0
+                        info["data_size_bytes"] = info["total_elements"] * itemsize
 
             return info
         except ValueError as e:
@@ -100,7 +109,7 @@ def get_packet_info(data: bytes) -> dict:
     shape = struct.unpack(f"<{ndim}I", data[8:shape_end])
     dtype = _REV_DTYPE_MAP.get(dtype_code, None)
 
-    return {
+    info = {
         "version": ver,
         "dtype": dtype,
         "shape": shape,
@@ -111,3 +120,15 @@ def get_packet_info(data: bytes) -> dict:
         "total_elements": int(np.prod(shape)),
         "data_size_bytes": int(np.prod(shape)) * (dtype.itemsize if dtype else 0),
     }
+
+    # Quantized dtype resolution
+    if dtype_code in _QDTYPE_NAMES:
+        info["dtype"] = _QDTYPE_NAMES[dtype_code]
+        info["quantized"] = True
+        total = int(np.prod(shape))
+        if dtype_code in (18, 19):  # 4-bit types
+            info["data_size_bytes"] = (total + 1) // 2
+        else:
+            info["data_size_bytes"] = total
+
+    return info

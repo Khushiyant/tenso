@@ -25,6 +25,25 @@ FLAG_SPARSE_CSR = 32  #: Packet contains a Sparse CSR tensor (int)
 FLAG_SPARSE_CSC = 64  #: Packet contains a Sparse CSC tensor (int)
 FLAG_CUST_ALIGN = 128  #: Packet uses custom alignment (exponent byte follows shape) (int)
 
+# --- Quantized Dtype Codes ---
+QDTYPE_QINT8 = 16   #: 8-bit signed quantized (int)
+QDTYPE_QUINT8 = 17  #: 8-bit unsigned quantized (int)
+QDTYPE_QINT4 = 18   #: 4-bit signed quantized (packed, 2 per byte) (int)
+QDTYPE_QUINT4 = 19  #: 4-bit unsigned quantized (packed, 2 per byte) (int)
+
+_QDTYPE_NAMES = {
+    QDTYPE_QINT8: "qint8",
+    QDTYPE_QUINT8: "quint8",
+    QDTYPE_QINT4: "qint4",
+    QDTYPE_QUINT4: "quint4",
+}
+_QDTYPE_FROM_NAME = {v: k for k, v in _QDTYPE_NAMES.items()}
+
+# --- Quantization Schemes ---
+QUANT_PER_TENSOR = 0   #: Single scale/zero_point for the entire tensor (int)
+QUANT_PER_CHANNEL = 1  #: One scale/zero_point per channel slice (int)
+QUANT_PER_GROUP = 2    #: One scale/zero_point per group of elements (int)
+
 # --- Dtype Mapping ---
 _DTYPE_MAP = {
     np.dtype("float32"): 1,

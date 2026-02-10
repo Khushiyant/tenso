@@ -816,6 +816,11 @@ fn deserialize_impl<'py>(
     
     let body_start_rel = header_len + padding_len;
 
+    // Quantized types (codes 16-19) are handled by the Python layer
+    if dtype_code >= 16 && dtype_code <= 19 {
+        return Ok(None);
+    }
+
     let dtype = DType::from_code(dtype_code)?;
     let dtype_name = dtype.name();
     let item_size = dtype.item_size();

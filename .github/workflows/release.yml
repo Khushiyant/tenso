@@ -30,23 +30,33 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
   build-wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: Build wheels (${{ matrix.os }} ${{ matrix.target }})
     needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest,  target: x86_64 }
+          - { os: ubuntu-latest,  target: aarch64 }
+          - { os: macos-13,       target: x86_64 }
+          - { os: macos-14,       target: aarch64 }
+          - { os: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.release.outputs.tag }}
 
       # --- 1. Generate gRPC Stubs (Must happen before build) ---
-      - name: Set up Python
+      - name: Set up Python versions
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
 
       - name: Install gRPC tools
         run: pip install grpcio-tools
@@ -57,18 +67,26 @@ jobs:
           python -m grpc_tools.protoc -Isrc --python_out=src --grpc_python_out=src src/tenso/grpc/tenso_msg.proto
           python -m grpc_tools.protoc -Isrc --python_out=src --grpc_python_out=src src/tenso/grpc/benchmark_msg.proto
 
-      # --- 2. Build Rust/Python Wheels ---
+      # --- 2. Cross-compilation support ---
+      - name: Set up QEMU
+        if: matrix.target == 'aarch64' && runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # --- 3. Build Rust/Python Wheels ---
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
           manylinux: auto
-      
+
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist
 
   build-sdist:

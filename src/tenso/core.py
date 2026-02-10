@@ -30,7 +30,12 @@ from .config import (
     FLAG_SPARSE_CSR,
     MAX_ELEMENTS,
     MAX_NDIM,
+    QDTYPE_QINT4,
+    QDTYPE_QINT8,
+    QDTYPE_QUINT4,
+    QDTYPE_QUINT8,
 )
+from .quantize import QuantizedTensor
 
 # --- OPTIONAL DEPENDENCIES ---
 try:
@@ -51,6 +56,260 @@ except ImportError:
     HAS_RUST = False
 
 IS_LITTLE_ENDIAN = sys.byteorder == "little"
+
+_QUANTIZED_CODES = (QDTYPE_QINT8, QDTYPE_QUINT8, QDTYPE_QINT4, QDTYPE_QUINT4)
+_4BIT_CODES = (QDTYPE_QINT4, QDTYPE_QUINT4)
+
+
+def _quantized_body_size(dtype_code: int, num_elements: int) -> int:
+    if dtype_code in _4BIT_CODES:
+        return (num_elements + 1) // 2
+    return num_elements
+
+
+def _serialize_quantized(
+    qt: "QuantizedTensor", check_integrity: bool, alignment: int
+) -> memoryview:
+    """Serialize a QuantizedTensor to a Tenso packet."""
+    import math
+
+    shape = qt.shape
+    ndim = len(shape)
+    num_elements = int(np.prod(shape))
+
+    use_custom_align = alignment != 64
+    flags = 0
+    if use_custom_align:
+        flags |= FLAG_CUST_ALIGN
+    else:
+        flags |= FLAG_ALIGNED
+    if check_integrity:
+        flags |= FLAG_INTEGRITY
+
+    # Quant metadata: 1 byte scheme + 4 bytes group_size + 4 bytes num_scales
+    #                  + num_scales*4 scales + num_scales*4 zero_points
+    num_scales = len(qt.scales)
+    quant_meta_len = 1 + 4 + 4 + num_scales * 4 + num_scales * 4
+
+    header_len = 8 + ndim * 4 + quant_meta_len
+    if use_custom_align:
+        header_len += 1
+
+    remainder = header_len % alignment
+    padding_len = 0 if remainder == 0 else (alignment - remainder)
+
+    body_len = _quantized_body_size(qt.dtype_code, num_elements)
+    footer_len = 8 if check_integrity else 0
+    total_len = header_len + padding_len + body_len + footer_len
+
+    buffer = bytearray(total_len)
+
+    # Header
+    struct.pack_into("<4sBBBB", buffer, 0, _MAGIC, _VERSION, flags, qt.dtype_code, ndim)
+    struct.pack_into(f"<{ndim}I", buffer, 8, *shape)
+
+    cursor = 8 + ndim * 4
+
+    # Quant metadata
+    buffer[cursor] = qt.quant_scheme
+    cursor += 1
+    struct.pack_into("<I", buffer, cursor, qt.group_size)
+    cursor += 4
+    struct.pack_into("<I", buffer, cursor, num_scales)
+    cursor += 4
+    # Scales
+    scales_bytes = qt.scales.tobytes()
+    buffer[cursor : cursor + len(scales_bytes)] = scales_bytes
+    cursor += len(scales_bytes)
+    # Zero points
+    zp_bytes = qt.zero_points.tobytes()
+    buffer[cursor : cursor + len(zp_bytes)] = zp_bytes
+    cursor += len(zp_bytes)
+
+    # Alignment exponent
+    if use_custom_align:
+        buffer[cursor] = alignment.bit_length() - 1
+        cursor += 1
+
+    # Body
+    body_start = header_len + padding_len
+    buffer[body_start : body_start + body_len] = bytes(qt.data[:body_len])
+
+    # Integrity footer
+    if check_integrity:
+        body_data = buffer[body_start : body_start + body_len]
+        digest = xxhash.xxh3_64_intdigest(body_data)
+        struct.pack_into("<Q", buffer, body_start + body_len, digest)
+
+    return memoryview(buffer)
+
+
+def _deserialize_quantized(
+    mv: memoryview, flags: int, dtype_code: int, ndim: int, copy: bool
+) -> "QuantizedTensor":
+    """Deserialize a QuantizedTensor from a Tenso packet memoryview."""
+    shape_end = 8 + ndim * 4
+    shape = struct.unpack(f"<{ndim}I", mv[8:shape_end])
+    num_elements = int(np.prod(shape))
+
+    cursor = shape_end
+
+    # Quant metadata
+    quant_scheme = mv[cursor]
+    cursor += 1
+    group_size = struct.unpack("<I", mv[cursor : cursor + 4])[0]
+    cursor += 4
+    num_scales = struct.unpack("<I", mv[cursor : cursor + 4])[0]
+    cursor += 4
+    scales = np.frombuffer(
+        mv[cursor : cursor + num_scales * 4], dtype=np.float32
+    ).copy()
+    cursor += num_scales * 4
+    zero_points = np.frombuffer(
+        mv[cursor : cursor + num_scales * 4], dtype=np.float32
+    ).copy()
+    cursor += num_scales * 4
+
+    # Alignment
+    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
+    if use_custom_align:
+        exponent = mv[cursor]
+        alignment = 1 << exponent
+        cursor += 1
+    elif flags & FLAG_ALIGNED:
+        alignment = _ALIGNMENT
+    else:
+        alignment = 1
+
+    header_len = cursor
+    remainder = header_len % alignment
+    padding_len = 0 if remainder == 0 else (alignment - remainder)
+    body_start = header_len + padding_len
+
+    body_len = _quantized_body_size(dtype_code, num_elements)
+    footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
+
+    # Integrity check
+    if flags & FLAG_INTEGRITY:
+        body_data = mv[body_start : body_start + body_len]
+        expected = struct.unpack(
+            "<Q", mv[body_start + body_len : body_start + body_len + 8]
+        )[0]
+        if xxhash.xxh3_64_intdigest(body_data) != expected:
+            raise ValueError("Integrity check failed: XXH3 mismatch")
+
+    data = np.frombuffer(mv[body_start : body_start + body_len], dtype=np.uint8)
+    if copy:
+        data = data.copy()
+    else:
+        data = np.array(data)
+
+    return QuantizedTensor(
+        data=data,
+        scales=scales,
+        zero_points=zero_points,
+        shape=shape,
+        dtype_code=dtype_code,
+        quant_scheme=quant_scheme,
+        group_size=group_size,
+    )
+
+
+def _read_stream_quantized(
+    source, flags: int, dtype_code: int, ndim: int
+) -> "QuantizedTensor":
+    """Read a quantized tensor from a stream."""
+    # Read shape
+    shape_len = ndim * 4
+    shape_bytes = bytearray(shape_len)
+    try:
+        if not _read_into_buffer(source, shape_bytes):
+            raise EOFError("Stream ended during quantized shape read")
+    except EOFError as e:
+        raise EOFError(f"Stream ended during quantized shape read. {e}") from None
+    shape = struct.unpack(f"<{ndim}I", shape_bytes)
+    num_elements = int(np.prod(shape))
+
+    # Read quant metadata header (1 + 4 + 4 = 9 bytes)
+    meta_header = bytearray(9)
+    try:
+        if not _read_into_buffer(source, meta_header):
+            raise EOFError("Stream ended during quant metadata read")
+    except EOFError as e:
+        raise EOFError(f"Stream ended during quant metadata read. {e}") from None
+
+    quant_scheme = meta_header[0]
+    group_size = struct.unpack("<I", meta_header[1:5])[0]
+    num_scales = struct.unpack("<I", meta_header[5:9])[0]
+
+    # Read scales and zero_points
+    sz_len = num_scales * 4 * 2  # scales + zero_points
+    sz_bytes = bytearray(sz_len)
+    try:
+        if not _read_into_buffer(source, sz_bytes):
+            raise EOFError("Stream ended during scales/zero_points read")
+    except EOFError as e:
+        raise EOFError(f"Stream ended during scales/zero_points read. {e}") from None
+
+    scales = np.frombuffer(sz_bytes[: num_scales * 4], dtype=np.float32).copy()
+    zero_points = np.frombuffer(sz_bytes[num_scales * 4 :], dtype=np.float32).copy()
+
+    # Current position for alignment calculation
+    current_pos = 8 + shape_len + 9 + sz_len
+
+    # Alignment
+    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
+    if use_custom_align:
+        exp_buf = bytearray(1)
+        try:
+            if not _read_into_buffer(source, exp_buf):
+                raise EOFError("Stream ended during alignment byte read")
+        except EOFError as e:
+            raise EOFError(f"Stream ended during alignment byte read. {e}") from None
+        alignment = 1 << exp_buf[0]
+        current_pos += 1
+    elif flags & FLAG_ALIGNED:
+        alignment = _ALIGNMENT
+    else:
+        alignment = 1
+
+    remainder = current_pos % alignment
+    padding_len = 0 if remainder == 0 else (alignment - remainder)
+    body_len = _quantized_body_size(dtype_code, num_elements)
+    footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
+
+    # Read padding + body + footer
+    total_remaining = padding_len + body_len + footer_len
+    data_buffer = bytearray(total_remaining)
+    try:
+        if not _read_into_buffer(source, data_buffer):
+            raise EOFError("Stream ended during quantized body read")
+    except EOFError as e:
+        raise EOFError(f"Stream ended during quantized body read. {e}") from None
+
+    # Verify integrity
+    if footer_len > 0:
+        body_slice = data_buffer[padding_len : padding_len + body_len]
+        actual_hash = xxhash.xxh3_64_intdigest(body_slice)
+        expected_hash = struct.unpack(
+            "<Q", data_buffer[padding_len + body_len : padding_len + body_len + 8]
+        )[0]
+        if actual_hash != expected_hash:
+            raise ValueError("Integrity check failed: XXH3 mismatch")
+
+    data = np.frombuffer(
+        data_buffer, dtype=np.uint8, offset=padding_len, count=body_len
+    ).copy()
+
+    return QuantizedTensor(
+        data=data,
+        scales=scales,
+        zero_points=zero_points,
+        shape=shape,
+        dtype_code=dtype_code,
+        quant_scheme=quant_scheme,
+        group_size=group_size,
+    )
 
 
 def _read_into_buffer(
@@ -234,6 +493,10 @@ def read_stream(source: Any) -> Optional[Any]:
             return sparse.csr_matrix((c1, c2, c3), shape=shape)
         return sparse.csc_matrix((c1, c2, c3), shape=shape)
 
+    # 3.5 Handle Quantized Types
+    if dtype_code in _QUANTIZED_CODES:
+        return _read_stream_quantized(source, flags, dtype_code, ndim)
+
     # 4. Dense Array Logic (DoS Protection & Buffer Allocation)
     if ndim > MAX_NDIM:
         raise ValueError(f"Packet exceeds maximum dimensions ({ndim} > {MAX_NDIM})")
@@ -321,6 +584,11 @@ def iter_dumps(
     Union[bytes, memoryview]
         Sequential chunks of the Tenso packet.
     """
+    # Handle QuantizedTensor by delegating to dumps
+    if isinstance(tensor, QuantizedTensor):
+        yield bytes(dumps(tensor, check_integrity=check_integrity))
+        return
+
     if tensor.dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {tensor.dtype}")
 
@@ -429,6 +697,12 @@ def dumps(
             is_sparse = hasattr(tensor, "format")
             is_dict = isinstance(tensor, dict)
 
+            # Skip Rust for dicts containing QuantizedTensor values
+            if is_dict and any(isinstance(v, QuantizedTensor) for v in tensor.values()):
+                is_dict = False
+                is_numpy = False
+                is_sparse = False
+
             if is_numpy or is_sparse or is_dict:
                 if is_numpy and not tensor.flags["C_CONTIGUOUS"]:
                     if strict:
@@ -439,6 +713,10 @@ def dumps(
                 return memoryview(dumps_rs(tensor, check_integrity=check_integrity, alignment=alignment))
         except (TypeError, ValueError):
             pass
+
+    # 1.5. Quantized Tensor (always Python path)
+    if isinstance(tensor, QuantizedTensor):
+        return _serialize_quantized(tensor, check_integrity, alignment)
 
     # 2. Multi-tensor Bundle (Dictionaries) - Python Fallback
     if isinstance(tensor, dict):
@@ -616,6 +894,10 @@ def loads(
         if flags & FLAG_SPARSE_CSR:
             return sparse.csr_matrix((c1, c2, c3), shape=shape)
         return sparse.csc_matrix((c1, c2, c3), shape=shape)
+
+    # 2.5. Quantized Types
+    if dtype_code in _QUANTIZED_CODES:
+        return _deserialize_quantized(mv, flags, dtype_code, ndim, copy)
 
     # 3. Dense Array Deserialization
     if ndim > MAX_NDIM:

@@ -13,6 +13,7 @@ Main API:
 """
 
 from .core import dumps, loads, dump, load, read_stream, write_stream, iter_dumps
+from .quantize import QuantizedTensor
 from .utils import get_packet_info, is_aligned
 
 
@@ -47,6 +48,7 @@ __all__ = [
     "get_packet_info",
     "is_aligned",
     "iter_dumps",
+    "QuantizedTensor",
     "TensoShm",
 ]
 
