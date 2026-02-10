@@ -1,6 +1,29 @@
 # CHANGELOG
 
 
+## v0.16.0 (2026-02-10)
+
+### Chores
+
+- Enhance performance and integrity checks in async I/O and GPU modules
+  ([`4f4efec`](https://github.com/Khushiyant/tenso/commit/4f4efecb0a1b8ec97c2ae1c3ef27b42723c642e4))
+
+### Features
+
+- Add support for quantized tensors with 4-bit and 8-bit representations
+  ([`97c18e0`](https://github.com/Khushiyant/tenso/commit/97c18e02217e7a92d80e58b36622634ac75ac237))
+
+- Updated GitHub Actions workflow to include Python 3.13. - Enhanced deserialization logic to handle
+  quantized types (codes 16-19) in `src/lib.rs`. - Introduced `QuantizedTensor` class in
+  `src/tenso/quantize.py` for managing quantized tensor data. - Added quantization schemes
+  (per-tensor, per-channel, per-group) and corresponding methods for quantization and
+  dequantization. - Implemented serialization and deserialization functions for quantized tensors in
+  `src/tenso/core.py`. - Updated configuration in `src/tenso/config.py` to define quantized dtype
+  codes and names. - Enhanced utility functions in `src/tenso/utils.py` to support quantized data
+  types. - Created comprehensive tests for quantized tensor functionality in
+  `tests/test_quantize.py`.
+
+
 ## v0.15.0 (2026-01-28)
 
 ### Features
