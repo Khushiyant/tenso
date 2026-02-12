@@ -1,6 +1,27 @@
 # CHANGELOG
 
 
+## v0.17.0 (2026-02-12)
+
+### Chores
+
+- Remove Python 3.13 from workflow matrix in release and test configurations
+  ([`cb98f7c`](https://github.com/Khushiyant/tenso/commit/cb98f7c09b0feb13ee9abd8eda3ee0f8d05c85dd))
+
+### Features
+
+- Add Ray integration for zero-copy tensor serialization
+  ([`72259e0`](https://github.com/Khushiyant/tenso/commit/72259e0f967fac90e0d058fce52c7c88b864e33c))
+
+Registers Tenso as a custom serializer for Ray, replacing pickle-based serialization with Tenso's
+  zero-copy protocol for numpy arrays, QuantizedTensors, and optionally PyTorch/JAX tensors.
+
+- Add tenso.ray module with register()/unregister() API - Support for numpy arrays, dict bundles,
+  and QuantizedTensors - Optional torch.Tensor and JAX array serialization - Add ray optional
+  dependency in pyproject.toml - Add comprehensive tests (unit + Ray integration) - Add usage
+  example demonstrating object store, remote functions, actors, and chained pipelines
+
+
 ## v0.16.0 (2026-02-10)
 
 ### Chores
