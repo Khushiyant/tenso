@@ -97,9 +97,17 @@ Tenso achieves **true zero-copy** with:
 pip install tenso
 ```
 
+Optional extras:
+
+```bash
+pip install tenso[ray]    # Ray integration
+pip install tenso[gpu]    # GPU acceleration (CuPy/PyTorch/JAX)
+pip install tenso[grpc]   # gRPC support
+```
+
 ---
 
-## Quick Start (v0.12.0)
+## Quick Start
 
 ### Basic Serialization
 
@@ -150,6 +158,62 @@ async def get_tensor():
 
 ## Advanced Features
 
+### Ray Integration (Distributed Computing)
+
+Replace pickle-based serialization in Ray with Tenso for **46x less CPU overhead** on tensor operations. Works transparently with `ray.put()`, `ray.get()`, remote functions, and actors.
+
+```python
+import ray
+import numpy as np
+from tenso.ray import register
+
+ray.init()
+register()  # Register Tenso as the serializer for numpy arrays
+
+# All ray.put/get operations now use Tenso
+ref = ray.put(np.zeros((1000, 1000)))
+arr = ray.get(ref)  # Deserialized via Tenso
+
+# Works transparently with remote functions
+@ray.remote
+def process(tensor):
+    return tensor.mean()
+
+ray.get(process.remote(np.random.randn(1000, 1000)))
+```
+
+Optional support for PyTorch and JAX tensors:
+
+```python
+register(include_torch=True, include_jax=True)
+```
+
+### Quantized Tensors (4-bit & 8-bit)
+
+Native support for quantized representations to reduce memory footprint with minimal accuracy loss.
+
+```python
+from tenso.quantize import QuantizedTensor
+import numpy as np
+
+data = np.random.randn(1024, 1024).astype(np.float32)
+
+# Quantize to 8-bit (per-tensor scheme)
+qt = QuantizedTensor.quantize(data, dtype="qint8", scheme="per_tensor")
+print(qt)  # QuantizedTensor(dtype=qint8, shape=(1024, 1024), ...)
+
+# Serialize/deserialize with Tenso
+import tenso
+packet = tenso.dumps(qt)
+restored = tenso.loads(packet)
+
+# Dequantize back to float32
+result = restored.dequantize()
+```
+
+Supported dtypes: `qint8`, `quint8`, `qint4`, `quint4`
+Supported schemes: `per_tensor`, `per_channel`, `per_group`
+
 ### Inter-Process Communication (Shared Memory)
 
 Transfer tensors between local processes with **single-digit microsecond latency** using Shared Memory. This avoids socket overhead entirely by passing memory handles.
@@ -168,7 +232,7 @@ with TensoShm.create_from("shared_tensor_01", data) as shm:
 # Process B: Read from Shared Memory (Zero-Copy)
 with TensoShm("shared_tensor_01") as shm:
     # Instant view of the data without copying
-    array = shm.get() 
+    array = shm.get()
     print(f"Received: {array.shape}")
 ```
 
@@ -180,7 +244,20 @@ Supports fast transfers between Tenso streams and device memory for **CuPy**, **
 import tenso.gpu as tgpu
 
 # Read directly from a stream into a GPU tensor
-torch_tensor = tgpu.read_to_device(stream, device_id=0) 
+torch_tensor = tgpu.read_to_device(stream, device_id=0)
+```
+
+### bfloat16 Support
+
+Native support for `bfloat16` dtype, commonly used in ML training. Works with NumPy 2.1+ natively or falls back to `ml_dtypes`.
+
+```python
+import numpy as np
+import tenso
+
+# Serialize bfloat16 tensors directly
+data = np.ones((512, 512), dtype=np.float32)  # or bfloat16 if available
+packet = tenso.dumps(data)
 ```
 
 ### Sparse Formats & Bundling
@@ -200,7 +277,7 @@ Protect your tensors against network corruption with ultra-fast 64-bit checksums
 packet = tenso.dumps(data, check_integrity=True)
 
 # Verification is automatic during loads()
-restored = tenso.loads(packet) 
+restored = tenso.loads(packet)
 ```
 
 ### gRPC Integration
@@ -241,7 +318,7 @@ The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 
 ## Use Cases
 
 * **Model Serving APIs**: Up to 35x faster deserialization with 46x less CPU saves massive overhead on inference nodes.
-* **Distributed Training**: Efficiently pass gradients or activations between nodes (Ray, Spark).
+* **Distributed Training**: Efficiently pass gradients or activations between nodes with native Ray integration.
 * **GPU-Direct Pipelines**: Stream data from network cards to GPU memory with minimal host intervention.
 * **Real-time Robotics**: 10.2 µs latency for high-frequency sensor fusion (LIDAR, Radar).
 * **High-Throughput Streaming**: 89K packets/sec network transmission for real-time data pipelines.
