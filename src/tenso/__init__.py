@@ -57,3 +57,6 @@ try:
     from .shm import TensoShm
 except ImportError:
     TensoShm = None
+
+# Ray integration is imported explicitly via tenso.ray
+# Usage: from tenso.ray import register
