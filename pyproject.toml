@@ -47,12 +47,13 @@ dev = [
     "ml_dtypes>=0.4.0",
 ]
 gpu = [
-    "cupy-cuda12x; sys_platform != 'darwin'", 
-    "torch", 
+    "cupy-cuda12x; sys_platform != 'darwin'",
+    "torch",
     "jax[cuda]; sys_platform != 'darwin'",
     "jax; sys_platform == 'darwin'"
 ]
 api = ["fastapi", "uvicorn"]
+ray = ["ray[default]>=2.9.0"]
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
