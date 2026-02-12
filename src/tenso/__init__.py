@@ -50,6 +50,7 @@ __all__ = [
     "iter_dumps",
     "QuantizedTensor",
     "TensoShm",
+    "TensoCache",
 ]
 
 # Optional SHM support
@@ -57,6 +58,12 @@ try:
     from .shm import TensoShm
 except ImportError:
     TensoShm = None
+
+# Optional Cache support
+try:
+    from .cache import TensoCache
+except ImportError:
+    TensoCache = None
 
 # Ray integration is imported explicitly via tenso.ray
 # Usage: from tenso.ray import register
