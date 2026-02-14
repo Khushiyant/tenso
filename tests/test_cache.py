@@ -1,6 +1,7 @@
 """Comprehensive test suite for TensoCache."""
 
 import multiprocessing
+import struct
 import subprocess
 import sys
 import textwrap
@@ -10,7 +11,27 @@ import time
 import numpy as np
 import pytest
 
-from tenso.cache import TensoCache, _MAX_KEY_LEN
+from tenso.cache import (
+    TensoCache,
+    _H_LOCK,
+    _H_LOCK_TIME,
+    _MAX_KEY_LEN,
+    _STATUS_ACTIVE,
+)
+
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    torch = None
+    _HAS_TORCH = False
+
+try:
+    import jax
+    _HAS_JAX = True
+except ImportError:
+    jax = None
+    _HAS_JAX = False
 
 
 # ---------------------------------------------------------------------------
@@ -554,3 +575,210 @@ class TestEdgeCases:
     def test_create_false_requires_name(self):
         with pytest.raises(ValueError, match="name is required"):
             TensoCache(create=False)
+
+
+# ---------------------------------------------------------------------------
+# Framework Support (PyTorch / JAX)
+# ---------------------------------------------------------------------------
+
+class TestFrameworkSupport:
+    @pytest.mark.skipif(not _HAS_TORCH, reason="PyTorch not installed")
+    def test_put_torch_tensor(self, cache):
+        """Put a torch.Tensor, get back numpy."""
+        t = torch.randn(10, 5, dtype=torch.float32)
+        cache.put("torch_t", t)
+        result = cache.get("torch_t")
+        assert result is not None
+        assert isinstance(result, np.ndarray)
+        np.testing.assert_array_almost_equal(result, t.numpy())
+
+    @pytest.mark.skipif(not _HAS_TORCH, reason="PyTorch not installed")
+    def test_get_to_torch(self, cache):
+        """Put numpy, get as torch.Tensor."""
+        arr = np.random.randn(10, 5).astype(np.float32)
+        cache.put("np_t", arr)
+        result = cache.get("np_t", device="torch")
+        assert isinstance(result, torch.Tensor)
+        np.testing.assert_array_almost_equal(result.numpy(), arr)
+
+    @pytest.mark.skipif(not _HAS_TORCH, reason="PyTorch not installed")
+    def test_torch_roundtrip(self, cache):
+        """Put torch, get as torch."""
+        t = torch.arange(20, dtype=torch.float64)
+        cache.put("rt", t)
+        result = cache.get("rt", device="torch")
+        assert isinstance(result, torch.Tensor)
+        assert torch.equal(result, t)
+
+    @pytest.mark.skipif(not _HAS_JAX, reason="JAX not installed")
+    def test_put_jax_tensor(self, cache):
+        """Put a JAX array, get back numpy."""
+        import jax.numpy as jnp
+        t = jnp.ones((4, 3), dtype=jnp.float32)
+        cache.put("jax_t", t)
+        result = cache.get("jax_t")
+        assert result is not None
+        assert isinstance(result, np.ndarray)
+        np.testing.assert_array_equal(result, np.ones((4, 3), dtype=np.float32))
+
+    @pytest.mark.skipif(not _HAS_JAX, reason="JAX not installed")
+    def test_get_to_jax(self, cache):
+        """Put numpy, get as JAX array."""
+        arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        cache.put("np_jax", arr)
+        result = cache.get("np_jax", device="jax")
+        assert isinstance(result, jax.Array)
+        np.testing.assert_array_equal(np.asarray(result), arr)
+
+    @pytest.mark.skipif(not _HAS_JAX, reason="JAX not installed")
+    def test_jax_roundtrip(self, cache):
+        """Put JAX array, get as JAX array."""
+        import jax.numpy as jnp
+        t = jnp.arange(10, dtype=jnp.float32)
+        cache.put("jax_rt", t)
+        result = cache.get("jax_rt", device="jax")
+        assert isinstance(result, jax.Array)
+        np.testing.assert_array_equal(np.asarray(result), np.arange(10, dtype=np.float32))
+
+    def test_get_unsupported_device_raises(self, cache):
+        """Unknown framework name should raise ValueError."""
+        arr = np.array([1.0], dtype=np.float32)
+        cache.put("v", arr)
+        with pytest.raises(ValueError, match="Unsupported device framework"):
+            cache.get("v", device="tensorflow")
+
+    @pytest.mark.skipif(not _HAS_TORCH, reason="PyTorch not installed")
+    def test_device_requires_copy(self, cache):
+        """Device get should return independent data (not sharing SHM buffer)."""
+        arr = np.ones(100, dtype=np.float32)
+        cache.put("dc", arr)
+        t = cache.get("dc", device="torch")
+        # Modify the torch tensor — original cache should be unaffected
+        t[0] = 999.0
+        original = cache.get("dc")
+        assert original[0] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Spinlock
+# ---------------------------------------------------------------------------
+
+class TestSpinlock:
+    def test_acquire_release(self, cache):
+        """Basic spinlock cycle: acquire, verify lock word, release."""
+        buf = cache._shm.buf
+        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 0
+
+        cache._shm_lock_acquire()
+        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 1
+        assert struct.unpack_from('<d', buf, _H_LOCK_TIME)[0] > 0
+
+        cache._shm_lock_release()
+        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 0
+        assert struct.unpack_from('<d', buf, _H_LOCK_TIME)[0] == 0.0
+
+    def test_timeout(self, cache):
+        """Manually set lock word, verify TimeoutError."""
+        buf = cache._shm.buf
+        # Simulate a held lock with a recent timestamp
+        struct.pack_into('<I', buf, _H_LOCK, 1)
+        struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic())
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            cache._shm_lock_acquire(timeout=0.2)
+
+        # Cleanup
+        struct.pack_into('<I', buf, _H_LOCK, 0)
+        struct.pack_into('<d', buf, _H_LOCK_TIME, 0.0)
+
+    def test_stale_recovery(self, cache):
+        """Set lock with old timestamp, verify force-acquire."""
+        buf = cache._shm.buf
+        # Simulate a stale lock from a crashed process (very old timestamp)
+        struct.pack_into('<I', buf, _H_LOCK, 1)
+        struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic() - 60.0)
+
+        # Should force-acquire without timing out
+        cache._shm_lock_acquire(timeout=1.0)
+        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 1
+
+        cache._shm_lock_release()
+        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Cross-process writes
+# ---------------------------------------------------------------------------
+
+class TestCrossProcessWrite:
+    def test_concurrent_subprocess_writes(self, cache):
+        """4 subprocesses writing 20 keys each; verify data integrity."""
+        name = cache.name
+
+        code = textwrap.dedent(f"""\
+        import sys
+        import numpy as np
+        from tenso.cache import TensoCache
+
+        worker_id = int(sys.argv[1])
+        c = TensoCache(name="{name}", create=False)
+        for i in range(20):
+            key = f"w{{worker_id}}_{{i}}"
+            arr = np.full(50, worker_id * 100 + i, dtype=np.float32)
+            try:
+                c.put(key, arr)
+            except MemoryError:
+                pass  # pool may be full, that's okay
+        c.close()
+        """)
+
+        procs = []
+        for wid in range(4):
+            p = subprocess.Popen(
+                [sys.executable, "-c", code, str(wid)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            procs.append(p)
+
+        for p in procs:
+            p.wait(timeout=30)
+
+        # Verify integrity of surviving entries
+        errors = []
+        for wid in range(4):
+            for i in range(20):
+                key = f"w{wid}_{i}"
+                result = cache.get(key)
+                if result is not None:
+                    expected = np.full(50, wid * 100 + i, dtype=np.float32)
+                    if not np.array_equal(result, expected):
+                        errors.append(f"{key}: data mismatch")
+
+        assert len(errors) == 0, f"Data integrity errors: {errors}"
+
+        # At least some keys should be present
+        surviving_keys = cache.keys()
+        assert len(surviving_keys) > 0, "No keys survived concurrent writes"
+
+
+# ---------------------------------------------------------------------------
+# Write barrier
+# ---------------------------------------------------------------------------
+
+class TestWriteBarrier:
+    def test_entry_visible_after_put(self, cache):
+        """After put(), the entry slot must have STATUS_ACTIVE."""
+        arr = np.arange(10, dtype=np.float32)
+        cache.put("barrier_test", arr)
+
+        # Find the slot for this key
+        slot = cache._key_to_slot.get("barrier_test")
+        assert slot is not None
+
+        off = cache._slot_offset(slot)
+        status = cache._shm.buf[off + 0]  # _E_STATUS is at offset 0
+        assert status == _STATUS_ACTIVE
+
+        # Verify data is correct
+        result = cache.get("barrier_test")
+        np.testing.assert_array_equal(result, arr)

@@ -1,10 +1,8 @@
-use numpy::PyArrayDyn;
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 use std::convert::TryInto;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
-use num_complex::{Complex32, Complex64};
 use rayon::prelude::*;
 #[cfg(unix)]
 use std::os::unix::io::{RawFd, FromRawFd};
@@ -476,7 +474,7 @@ type RawFileDescriptor = RawFd;
 #[cfg(windows)]
 type RawFileDescriptor = RawHandle;
 
-fn generic_dump<T: numpy::Element>(
+fn dump_to_fd_impl(
     py: Python,
     array: &PyAny,
     fd: RawFileDescriptor,
@@ -485,21 +483,16 @@ fn generic_dump<T: numpy::Element>(
     alignment: usize,
     dtype_enum: DType,
 ) -> PyResult<usize> {
-    let casted = array.downcast::<PyArrayDyn<T>>().map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err("Type mismatch in serialization dispatch")
-    })?;
+    let is_contiguous: bool = array.getattr("flags")?.getattr("c_contiguous")?.extract()?;
+    if !is_contiguous {
+        return Err(pyo3::exceptions::PyValueError::new_err("Array must be C-Contiguous"));
+    }
 
-    let ndim = casted.ndim();
-    let shape = casted.shape().to_vec();
+    let ndim: usize = array.getattr("ndim")?.extract()?;
+    let shape: Vec<usize> = array.getattr("shape")?.extract()?;
+    let total_bytes: usize = array.getattr("nbytes")?.extract()?;
+    let data_ptr: usize = array.getattr("ctypes")?.getattr("data")?.extract()?;
 
-    let slice = unsafe { casted.as_slice() }.map_err(|_| {
-        pyo3::exceptions::PyValueError::new_err("Array must be C-Contiguous")
-    })?;
-    
-    let item_size = dtype_enum.item_size();
-    let total_bytes = slice.len() * item_size;
-    let data_ptr = slice.as_ptr() as usize;
-    
     py.allow_threads(move || {
         let u8_slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, total_bytes) };
         #[cfg(unix)]
@@ -576,26 +569,28 @@ fn dump_to_fd_rs<'py>(
     let dtype = array.getattr("dtype")?;
     let name: String = dtype.getattr("name")?.extract()?;
 
-    match name.as_str() {
-        "float32" => generic_dump::<f32>(py, array, fd, check_integrity, compress, alignment, DType::Float32),
-        "int32" => generic_dump::<i32>(py, array, fd, check_integrity, compress, alignment, DType::Int32),
-        "float64" => generic_dump::<f64>(py, array, fd, check_integrity, compress, alignment, DType::Float64),
-        "int64" => generic_dump::<i64>(py, array, fd, check_integrity, compress, alignment, DType::Int64),
-        "uint8" => generic_dump::<u8>(py, array, fd, check_integrity, compress, alignment, DType::Uint8),
-        "uint16" => generic_dump::<u16>(py, array, fd, check_integrity, compress, alignment, DType::Uint16),
-        "bool" => generic_dump::<bool>(py, array, fd, check_integrity, compress, alignment, DType::Bool),
-        "int8" => generic_dump::<i8>(py, array, fd, check_integrity, compress, alignment, DType::Int8),
-        "int16" => generic_dump::<i16>(py, array, fd, check_integrity, compress, alignment, DType::Int16),
-        "uint32" => generic_dump::<u32>(py, array, fd, check_integrity, compress, alignment, DType::Uint32),
-        "uint64" => generic_dump::<u64>(py, array, fd, check_integrity, compress, alignment, DType::Uint64),
-        "complex64" => generic_dump::<Complex32>(py, array, fd, check_integrity, compress, alignment, DType::Complex64),
-        "complex128" => generic_dump::<Complex64>(py, array, fd, check_integrity, compress, alignment, DType::Complex128),
-        "bfloat16" => generic_dump::<u16>(py, array, fd, check_integrity, compress, alignment, DType::BFloat16),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+    let dtype_enum = match name.as_str() {
+        "float32" => DType::Float32,
+        "int32" => DType::Int32,
+        "float64" => DType::Float64,
+        "int64" => DType::Int64,
+        "uint8" => DType::Uint8,
+        "uint16" => DType::Uint16,
+        "bool" => DType::Bool,
+        "int8" => DType::Int8,
+        "int16" => DType::Int16,
+        "uint32" => DType::Uint32,
+        "uint64" => DType::Uint64,
+        "complex64" => DType::Complex64,
+        "complex128" => DType::Complex128,
+        "bfloat16" => DType::BFloat16,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Unsupported dtype: {}",
             name
         ))),
-    }
+    };
+
+    dump_to_fd_impl(py, array, fd, check_integrity, compress, alignment, dtype_enum)
 }
 
 #[pyfunction]

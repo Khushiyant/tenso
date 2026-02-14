@@ -49,13 +49,10 @@ jobs:
           ref: ${{ needs.release.outputs.tag }}
 
       # --- 1. Generate gRPC Stubs (Must happen before build) ---
-      - name: Set up Python versions
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: |
-            3.10
-            3.11
-            3.12
+          python-version: "3.12"
 
       - name: Install gRPC tools
         run: pip install grpcio-tools
@@ -79,7 +76,7 @@ jobs:
         with:
           command: build
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           manylinux: auto
 
       - name: Upload wheels

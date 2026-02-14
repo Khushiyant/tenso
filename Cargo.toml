@@ -9,9 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # PyO3 is the bridge between Rust and Python
-pyo3 = { version = "0.20.0", features = ["extension-module"] }
-numpy = "0.20.0"  # For zero-copy array access
+pyo3 = { version = "0.22", features = ["extension-module", "gil-refs", "abi3-py311"] }
 xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
-num-complex = "0.4"
 rayon = "1.8"
 lz4_flex = "0.11"

@@ -21,8 +21,10 @@ Memory Layout (single SHM segment):
 """
 
 import struct
+import sys
 import threading
 import time
+from contextlib import contextmanager
 from multiprocessing import shared_memory
 from typing import Optional
 
@@ -45,10 +47,33 @@ try:
 except ImportError:
     _HAS_QUANTIZE = False
 
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    torch = None
+    _HAS_TORCH = False
+
+try:
+    import jax
+    import jax.numpy as jnp
+    _HAS_JAX = True
+except ImportError:
+    jax = None
+    jnp = None
+    _HAS_JAX = False
+
+try:
+    import cupy as cp
+    _HAS_CUPY = True
+except ImportError:
+    cp = None
+    _HAS_CUPY = False
+
 # -- Constants --
 
 _CACHE_MAGIC = b"TCSH"
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _POOL_HEADER_SIZE = 4096
 _ENTRY_SIZE = 256
 _DATA_ALIGNMENT = 64
@@ -66,10 +91,11 @@ _H_WATERMARK = 32     # 8 bytes  (bump allocator offset into data region)
 _H_LRU_HEAD = 40      # 4 bytes
 _H_LRU_TAIL = 44      # 4 bytes
 _H_FREE_LIST = 48     # 8 bytes  (offset of first free chunk in data region, 0=none)
-_H_LOCK = 56          # 4 bytes
-_H_GENERATION = 60    # 8 bytes
-_H_HITS = 68          # 8 bytes
-_H_MISSES = 76        # 8 bytes
+_H_LOCK = 56          # 4 bytes (0=unlocked, 1=locked)
+_H_LOCK_TIME = 60     # 8 bytes (monotonic timestamp of acquisition)
+_H_GENERATION = 68    # 8 bytes
+_H_HITS = 76          # 8 bytes
+_H_MISSES = 84        # 8 bytes
 
 # Entry slot field offsets (within each 256-byte slot)
 _E_STATUS = 0         # 1 byte  (0=free, 1=active)
@@ -111,6 +137,64 @@ _STATUS_ACTIVE = 1
 
 # Free chunk header in data region: size(8 bytes) + next_offset(8 bytes)
 _FREE_CHUNK_HEADER = 16
+
+
+def _to_numpy(tensor) -> np.ndarray:
+    """Convert a framework tensor (PyTorch, JAX, CuPy) to numpy.
+
+    Falls back to np.asarray for unknown types.
+    """
+    if isinstance(tensor, np.ndarray):
+        return tensor
+    if _HAS_TORCH and isinstance(tensor, torch.Tensor):
+        return tensor.detach().cpu().numpy()
+    if _HAS_JAX and isinstance(tensor, jax.Array):
+        return np.asarray(tensor)
+    if _HAS_CUPY and isinstance(tensor, cp.ndarray):
+        return tensor.get()
+    return np.asarray(tensor)
+
+
+def _numpy_to_device(arr: np.ndarray, device: str):
+    """Convert a numpy array to a framework tensor on the specified device.
+
+    Device spec format: "framework" or "framework:device_spec".
+    Examples: "torch", "torch:cuda:0", "jax", "cupy", "cupy:0".
+    """
+    parts = device.split(":", 1)
+    framework = parts[0].lower()
+
+    if framework == "torch":
+        if not _HAS_TORCH:
+            raise ValueError("PyTorch is not installed")
+        t = torch.from_numpy(arr)
+        if len(parts) > 1:
+            t = t.to(parts[1])
+        return t
+
+    if framework == "jax":
+        if not _HAS_JAX:
+            raise ValueError("JAX is not installed")
+        result = jnp.array(arr)
+        if len(parts) > 1:
+            device_id = int(parts[1])
+            devices = jax.devices()
+            if device_id < len(devices):
+                result = jax.device_put(result, devices[device_id])
+        return result
+
+    if framework == "cupy":
+        if not _HAS_CUPY:
+            raise ValueError("CuPy is not installed")
+        if len(parts) > 1:
+            with cp.cuda.Device(int(parts[1])):
+                return cp.array(arr)
+        return cp.array(arr)
+
+    raise ValueError(
+        f"Unsupported device framework: {framework!r}. "
+        f"Supported: 'torch', 'jax', 'cupy'."
+    )
 
 
 def _parse_size(size) -> int:
@@ -214,6 +298,7 @@ class TensoCache:
             struct.pack_into('<I', buf, _H_LRU_TAIL, _SENTINEL)
             struct.pack_into('<Q', buf, _H_FREE_LIST, 0)
             struct.pack_into('<I', buf, _H_LOCK, 0)
+            struct.pack_into('<d', buf, _H_LOCK_TIME, 0.0)
             struct.pack_into('<Q', buf, _H_GENERATION, 0)
             struct.pack_into('<Q', buf, _H_HITS, 0)
             struct.pack_into('<Q', buf, _H_MISSES, 0)
@@ -272,6 +357,68 @@ class TensoCache:
 
     def _write_header_u64(self, offset: int, value: int):
         struct.pack_into('<Q', self._shm.buf, offset, value)
+
+    # -- SHM spinlock (cross-process safety) --
+
+    _STALE_LOCK_THRESHOLD = 30.0  # seconds before force-acquiring a stale lock
+
+    def _shm_lock_acquire(self, timeout: float = 5.0):
+        """
+        Acquire the SHM spinlock for cross-process mutual exclusion.
+
+        Uses a 4-byte lock word at _H_LOCK. Spins with 100us sleep.
+        Stale locks (held > 30s) are force-acquired with a stderr warning
+        to recover from crashed processes.
+
+        Note: struct.pack_into on a 4-byte-aligned field is atomic at the
+        hardware level on x86/ARM. For extreme multi-writer contention,
+        an external multiprocessing.Lock is recommended.
+        """
+        buf = self._shm.buf
+        deadline = time.monotonic() + timeout
+
+        while True:
+            lock_val = struct.unpack_from('<I', buf, _H_LOCK)[0]
+            if lock_val == 0:
+                # Unlocked — acquire
+                struct.pack_into('<I', buf, _H_LOCK, 1)
+                struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic())
+                return
+
+            # Lock is held — check for staleness
+            lock_time = struct.unpack_from('<d', buf, _H_LOCK_TIME)[0]
+            if lock_time > 0 and (time.monotonic() - lock_time) > self._STALE_LOCK_THRESHOLD:
+                print(
+                    f"TensoCache: force-acquiring stale SHM lock "
+                    f"(held for {time.monotonic() - lock_time:.1f}s, "
+                    f"likely crashed process)",
+                    file=sys.stderr,
+                )
+                struct.pack_into('<I', buf, _H_LOCK, 1)
+                struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic())
+                return
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"TensoCache: SHM lock acquisition timed out after {timeout}s"
+                )
+
+            time.sleep(0.0001)  # 100μs spin
+
+    def _shm_lock_release(self):
+        """Release the SHM spinlock."""
+        buf = self._shm.buf
+        struct.pack_into('<d', buf, _H_LOCK_TIME, 0.0)
+        struct.pack_into('<I', buf, _H_LOCK, 0)
+
+    @contextmanager
+    def _shm_locked(self):
+        """Context manager wrapping SHM lock acquire/release."""
+        self._shm_lock_acquire()
+        try:
+            yield
+        finally:
+            self._shm_lock_release()
 
     # -- Generation-based local index invalidation --
 
@@ -337,7 +484,11 @@ class TensoCache:
         buf = self._shm.buf
         off = self._slot_offset(slot)
         key_bytes = key.encode('utf-8')
-        buf[off + _E_STATUS] = _STATUS_ACTIVE
+
+        # Write barrier: mark FREE so concurrent readers skip this entry
+        buf[off + _E_STATUS] = _STATUS_FREE
+
+        # Write all metadata fields
         buf[off + _E_KEY_LEN] = len(key_bytes)
         buf[off + _E_KEY: off + _E_KEY + len(key_bytes)] = key_bytes
         # Zero remaining key space
@@ -359,6 +510,9 @@ class TensoCache:
         struct.pack_into('<d', buf, off + _E_TTL, ttl or 0.0)
         struct.pack_into('<I', buf, off + _E_LRU_PREV, _SENTINEL)
         struct.pack_into('<I', buf, off + _E_LRU_NEXT, _SENTINEL)
+
+        # Release barrier: metadata fully written, now visible to readers
+        buf[off + _E_STATUS] = _STATUS_ACTIVE
 
     def _clear_entry(self, slot: int):
         buf = self._shm.buf
@@ -617,6 +771,8 @@ class TensoCache:
 
         Tries Rust fast path first, falls back to Python dumps().
         """
+        if not isinstance(tensor, np.ndarray) and not (_HAS_QUANTIZE and isinstance(tensor, QuantizedTensor)):
+            tensor = _to_numpy(tensor)
         if quantize_dtype is not None and _HAS_QUANTIZE:
             tensor = QuantizedTensor.quantize(tensor, quantize_dtype)
 
@@ -635,6 +791,8 @@ class TensoCache:
 
     def _estimate_packet_size(self, tensor, quantize_dtype=None) -> int:
         """Estimate the serialized packet size for allocation."""
+        if not isinstance(tensor, np.ndarray) and not (_HAS_QUANTIZE and isinstance(tensor, QuantizedTensor)):
+            tensor = _to_numpy(tensor)
         if quantize_dtype is not None and _HAS_QUANTIZE:
             tensor = QuantizedTensor.quantize(tensor, quantize_dtype)
 
@@ -661,8 +819,9 @@ class TensoCache:
         ----------
         key : str
             Cache key (max 128 bytes UTF-8).
-        tensor : np.ndarray or QuantizedTensor
-            Tensor to store.
+        tensor : np.ndarray, QuantizedTensor, or framework tensor
+            Tensor to store. PyTorch, JAX, and CuPy tensors are
+            automatically converted to numpy before caching.
         ttl : float, optional
             Time-to-live in seconds. None means no expiry.
         quantize : str, optional
@@ -684,101 +843,106 @@ class TensoCache:
         if len(key_bytes) > _MAX_KEY_LEN:
             raise ValueError(f"Key too long: {len(key_bytes)} bytes (max {_MAX_KEY_LEN})")
 
+        # Convert framework tensors outside the lock (GPU→CPU can be expensive)
+        if not isinstance(tensor, np.ndarray) and not (_HAS_QUANTIZE and isinstance(tensor, QuantizedTensor)):
+            tensor = _to_numpy(tensor)
+
         with self._lock:
             self._check_closed()
-            self._sync_index()
+            with self._shm_locked():
+                self._sync_index()
 
-            # Pre-quantize if requested
-            obj_to_store = tensor
-            if quantize is not None and _HAS_QUANTIZE and isinstance(tensor, np.ndarray):
-                obj_to_store = QuantizedTensor.quantize(tensor, quantize)
+                # Pre-quantize if requested
+                obj_to_store = tensor
+                if quantize is not None and _HAS_QUANTIZE and isinstance(tensor, np.ndarray):
+                    obj_to_store = QuantizedTensor.quantize(tensor, quantize)
 
-            # Estimate size needed
-            estimated = self._estimate_packet_size(obj_to_store)
-            alloc_size = _align_up(estimated, _DATA_ALIGNMENT)
-            alloc_size = max(alloc_size, _FREE_CHUNK_HEADER)
+                # Estimate size needed
+                estimated = self._estimate_packet_size(obj_to_store)
+                alloc_size = _align_up(estimated, _DATA_ALIGNMENT)
+                alloc_size = max(alloc_size, _FREE_CHUNK_HEADER)
 
-            # Check for in-place update
-            existing_slot = self._key_to_slot.get(key)
-            if existing_slot is not None:
-                entry = self._read_entry(existing_slot)
-                if entry['alloc_size'] >= alloc_size:
-                    # Reuse existing allocation
-                    data_off = entry['data_offset']
-                    actual_alloc = entry['alloc_size']
-                    buf_slice = self._shm.buf[data_off:data_off + actual_alloc]
-                    packet_size = self._serialize_tensor(obj_to_store, buf_slice)
+                # Check for in-place update
+                existing_slot = self._key_to_slot.get(key)
+                if existing_slot is not None:
+                    entry = self._read_entry(existing_slot)
+                    if entry['alloc_size'] >= alloc_size:
+                        # Reuse existing allocation
+                        data_off = entry['data_offset']
+                        actual_alloc = entry['alloc_size']
+                        buf_slice = self._shm.buf[data_off:data_off + actual_alloc]
+                        packet_size = self._serialize_tensor(obj_to_store, buf_slice)
 
-                    # Extract metadata from packet
-                    dtype_code, ndim, shape = self._extract_metadata(
-                        self._shm.buf[data_off:data_off + packet_size]
-                    )
+                        # Extract metadata from packet
+                        dtype_code, ndim, shape = self._extract_metadata(
+                            self._shm.buf[data_off:data_off + packet_size]
+                        )
 
-                    now = time.monotonic()
-                    self._write_entry(
-                        existing_slot, key, data_off, actual_alloc, packet_size,
-                        dtype_code, ndim, shape, ttl or 0.0, now
-                    )
-                    self._lru_move_to_head(existing_slot)
-                    self._bump_generation()
-                    return packet_size
-                else:
-                    # Free old allocation and re-allocate
-                    self._delete_slot(existing_slot)
+                        now = time.monotonic()
+                        self._write_entry(
+                            existing_slot, key, data_off, actual_alloc, packet_size,
+                            dtype_code, ndim, shape, ttl or 0.0, now
+                        )
+                        self._lru_move_to_head(existing_slot)
+                        self._bump_generation()
+                        return packet_size
+                    else:
+                        # Free old allocation and re-allocate
+                        self._delete_slot(existing_slot)
 
-            # Allocate space
-            data_off = self._allocate(alloc_size)
-            if data_off == 0:
-                # Try eviction
-                if not self._evict_for_space(alloc_size):
-                    raise MemoryError(
-                        f"Cannot allocate {alloc_size} bytes in TensoCache pool "
-                        f"(free: {self._read_header_u64(_H_FREE_BYTES)} bytes)"
-                    )
+                # Allocate space
                 data_off = self._allocate(alloc_size)
                 if data_off == 0:
-                    raise MemoryError("Allocation failed after eviction")
+                    # Try eviction
+                    if not self._evict_for_space(alloc_size):
+                        raise MemoryError(
+                            f"Cannot allocate {alloc_size} bytes in TensoCache pool "
+                            f"(free: {self._read_header_u64(_H_FREE_BYTES)} bytes)"
+                        )
+                    data_off = self._allocate(alloc_size)
+                    if data_off == 0:
+                        raise MemoryError("Allocation failed after eviction")
 
-            actual_alloc = _align_up(estimated, _DATA_ALIGNMENT)
-            actual_alloc = max(actual_alloc, _FREE_CHUNK_HEADER)
+                actual_alloc = _align_up(estimated, _DATA_ALIGNMENT)
+                actual_alloc = max(actual_alloc, _FREE_CHUNK_HEADER)
 
-            # Find a free entry slot
-            slot = self._find_free_slot()
-            if slot < 0:
-                # Evict LRU tail to free a slot
-                tail = self._read_header_u32(_H_LRU_TAIL)
-                if tail == _SENTINEL:
-                    self._free_data(data_off, alloc_size)
-                    raise MemoryError("No free entry slots in TensoCache")
-                self._delete_slot(tail)
+                # Find a free entry slot
                 slot = self._find_free_slot()
                 if slot < 0:
-                    self._free_data(data_off, alloc_size)
-                    raise MemoryError("No free entry slots after eviction")
+                    # Evict LRU tail to free a slot
+                    tail = self._read_header_u32(_H_LRU_TAIL)
+                    if tail == _SENTINEL:
+                        self._free_data(data_off, alloc_size)
+                        raise MemoryError("No free entry slots in TensoCache")
+                    self._delete_slot(tail)
+                    slot = self._find_free_slot()
+                    if slot < 0:
+                        self._free_data(data_off, alloc_size)
+                        raise MemoryError("No free entry slots after eviction")
 
-            # Serialize into allocated region
-            buf_slice = self._shm.buf[data_off:data_off + alloc_size]
-            packet_size = self._serialize_tensor(obj_to_store, buf_slice)
+                # Serialize into allocated region
+                buf_slice = self._shm.buf[data_off:data_off + alloc_size]
+                packet_size = self._serialize_tensor(obj_to_store, buf_slice)
 
-            # Extract metadata from the serialized packet
-            dtype_code, ndim, shape = self._extract_metadata(
-                self._shm.buf[data_off:data_off + packet_size]
-            )
+                # Extract metadata from the serialized packet
+                dtype_code, ndim, shape = self._extract_metadata(
+                    self._shm.buf[data_off:data_off + packet_size]
+                )
 
-            now = time.monotonic()
-            self._write_entry(
-                slot, key, data_off, alloc_size, packet_size,
-                dtype_code, ndim, shape, ttl or 0.0, now
-            )
-            self._lru_insert_head(slot)
+                now = time.monotonic()
+                self._write_entry(
+                    slot, key, data_off, alloc_size, packet_size,
+                    dtype_code, ndim, shape, ttl or 0.0, now
+                )
+                self._lru_insert_head(slot)
 
-            # Update active count and local index
-            active = self._read_header_u32(_H_ACTIVE)
-            self._write_header_u32(_H_ACTIVE, active + 1)
-            self._key_to_slot[key] = slot
-            self._bump_generation()
+                # Update active count and local index
+                active = self._read_header_u32(_H_ACTIVE)
+                self._write_header_u32(_H_ACTIVE, active + 1)
+                self._key_to_slot[key] = slot
+                self._bump_generation()
 
-            return packet_size
+                return packet_size
 
     def _extract_metadata(self, packet_bytes) -> tuple:
         """Extract dtype_code, ndim, shape from a tenso packet header."""
@@ -800,7 +964,7 @@ class TensoCache:
         except Exception:
             return 0, 0, ()
 
-    def get(self, key: str, copy: bool = False):
+    def get(self, key: str, copy: bool = False, device: str = None):
         """
         Retrieve a tensor from the cache.
 
@@ -810,10 +974,15 @@ class TensoCache:
             Cache key.
         copy : bool
             If True, return a writeable copy. Default returns zero-copy view.
+        device : str, optional
+            Target device for the result. Format: "framework" or
+            "framework:device_spec" (e.g. "torch", "torch:cuda:0", "jax",
+            "cupy:0"). When set, the result is converted from numpy.
+            Implies copy (SHM buffer cannot be shared with frameworks).
 
         Returns
         -------
-        Optional[np.ndarray]
+        Optional[np.ndarray or framework tensor]
             The tensor, or None if not found or expired.
         """
         with self._lock:
@@ -867,6 +1036,12 @@ class TensoCache:
             self._lru_move_to_head(slot)
             self._inc_hits()
 
+            # Convert to target device if requested
+            if device is not None:
+                if not copy and isinstance(result, np.ndarray):
+                    result = result.copy()  # can't share SHM buffer with frameworks
+                result = _numpy_to_device(result, device)
+
             return result
 
     def delete(self, key: str) -> bool:
@@ -885,15 +1060,16 @@ class TensoCache:
         """
         with self._lock:
             self._check_closed()
-            self._sync_index()
+            with self._shm_locked():
+                self._sync_index()
 
-            slot = self._key_to_slot.get(key)
-            if slot is None:
-                return False
+                slot = self._key_to_slot.get(key)
+                if slot is None:
+                    return False
 
-            self._delete_slot(slot)
-            self._bump_generation()
-            return True
+                self._delete_slot(slot)
+                self._bump_generation()
+                return True
 
     def info(self, key: str) -> Optional[dict]:
         """
@@ -986,26 +1162,27 @@ class TensoCache:
         """Remove all entries from the cache."""
         with self._lock:
             self._check_closed()
-            buf = self._shm.buf
+            with self._shm_locked():
+                buf = self._shm.buf
 
-            # Clear all active entries
-            for i in range(self._max_entries):
-                off = _POOL_HEADER_SIZE + i * _ENTRY_SIZE
-                buf[off + _E_STATUS] = _STATUS_FREE
-                struct.pack_into('<I', buf, off + _E_LRU_PREV, _SENTINEL)
-                struct.pack_into('<I', buf, off + _E_LRU_NEXT, _SENTINEL)
+                # Clear all active entries
+                for i in range(self._max_entries):
+                    off = _POOL_HEADER_SIZE + i * _ENTRY_SIZE
+                    buf[off + _E_STATUS] = _STATUS_FREE
+                    struct.pack_into('<I', buf, off + _E_LRU_PREV, _SENTINEL)
+                    struct.pack_into('<I', buf, off + _E_LRU_NEXT, _SENTINEL)
 
-            # Reset pool header
-            self._write_header_u32(_H_ACTIVE, 0)
-            self._write_header_u64(_H_FREE_BYTES,
-                                   self._data_region_end - self._data_region_offset)
-            self._write_header_u64(_H_WATERMARK, self._data_region_offset)
-            self._write_header_u32(_H_LRU_HEAD, _SENTINEL)
-            self._write_header_u32(_H_LRU_TAIL, _SENTINEL)
-            self._write_header_u64(_H_FREE_LIST, 0)
+                # Reset pool header
+                self._write_header_u32(_H_ACTIVE, 0)
+                self._write_header_u64(_H_FREE_BYTES,
+                                       self._data_region_end - self._data_region_offset)
+                self._write_header_u64(_H_WATERMARK, self._data_region_offset)
+                self._write_header_u32(_H_LRU_HEAD, _SENTINEL)
+                self._write_header_u32(_H_LRU_TAIL, _SENTINEL)
+                self._write_header_u64(_H_FREE_LIST, 0)
 
-            self._key_to_slot.clear()
-            self._bump_generation()
+                self._key_to_slot.clear()
+                self._bump_generation()
 
     def __len__(self) -> int:
         with self._lock:
@@ -1085,6 +1262,12 @@ class TensoCache:
         """Close access to the shared memory pool."""
         if not self._closed:
             self._closed = True
+            try:
+                lock_val = struct.unpack_from('<I', self._shm.buf, _H_LOCK)[0]
+                if lock_val == 1:
+                    self._shm_lock_release()
+            except Exception:
+                pass
             try:
                 self._shm.close()
             except Exception:
