@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.19.3 (2026-02-14)
+
+### Bug Fixes
+
+- Refine stale lock condition in TensoCache to improve reliability
+  ([`0162d5b`](https://github.com/Khushiyant/tenso/commit/0162d5bb968b12c391ff2c8a07ec31036d5b6819))
+
+
 ## v0.19.2 (2026-02-14)
 
 ### Bug Fixes
