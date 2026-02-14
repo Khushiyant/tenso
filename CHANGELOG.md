@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.19.2 (2026-02-14)
+
+### Bug Fixes
+
+- Improve shared memory handling and remove unnecessary garbage collection
+  ([`ae3449b`](https://github.com/Khushiyant/tenso/commit/ae3449bcdd77fe2860715d0b1557f3f974c42f34))
+
+
 ## v0.19.1 (2026-02-14)
 
 ### Bug Fixes
