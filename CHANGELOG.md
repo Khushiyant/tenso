@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.18.0 (2026-02-14)
+
+### Documentation
+
+- Enhance README with Ray integration and advanced features
+  ([`2c3769e`](https://github.com/Khushiyant/tenso/commit/2c3769e4486d00668bbbe7e2f1ebe41c9c84c78d))
+
+### Features
+
+- Add tensocache in-system
+  ([`62262e1`](https://github.com/Khushiyant/tenso/commit/62262e1870d6e55edb7615954c7310a73a803430))
+
+
 ## v0.17.0 (2026-02-12)
 
 ### Chores
