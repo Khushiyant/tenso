@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.19.4 (2026-02-14)
+
+### Bug Fixes
+
+- Update installation instructions to use 'tenso[api]' for gRPC and FastAPI integration
+  ([`e93d8aa`](https://github.com/Khushiyant/tenso/commit/e93d8aa1297e720ab4113dd4ed75aed5b63f7023))
+
+
 ## v0.19.3 (2026-02-14)
 
 ### Bug Fixes
