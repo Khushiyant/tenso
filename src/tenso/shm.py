@@ -63,9 +63,13 @@ class TensoShm:
 
     def close(self):
         """Close access to the shared memory."""
-        import gc
-        gc.collect()
-        self._shm.close()
+        try:
+            self._shm.close()
+        except BufferError:
+            # Zero-copy numpy views still reference the mmap.
+            # Disarm __del__ so it won't re-raise the same error.
+            self._shm._buf = None
+            self._shm._mmap = None
 
     def unlink(self):
         """Request that the shared memory be destroyed."""
@@ -108,16 +112,19 @@ class TensoShm:
     def get(self) -> Optional[Union[np.ndarray, dict]]:
         """
         Deserialize the object currently in shared memory.
-        
+
+        Returns a zero-copy view into the shared memory buffer.
+        The view remains valid as long as the underlying SHM segment
+        has not been unlinked.
+
         Returns
         -------
         Optional[Union[np.ndarray, dict]]
-            The reconstructed object (zero-copy view if possible).
+            The reconstructed object (zero-copy view).
         """
         if loads_rs is None:
              raise NotImplementedError("Tenso Rust extension is required for SHM operations")
-        
-        # loads_rs takes a buffer protocol object
+
         return loads_rs(self._shm.buf)
 
     @classmethod

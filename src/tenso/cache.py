@@ -1268,10 +1268,13 @@ class TensoCache:
                     self._shm_lock_release()
             except Exception:
                 pass
-            import gc
-            gc.collect()
             try:
                 self._shm.close()
+            except BufferError:
+                # Zero-copy numpy views still reference the mmap.
+                # Disarm __del__ so it won't re-raise the same error.
+                self._shm._buf = None
+                self._shm._mmap = None
             except Exception:
                 pass
 
