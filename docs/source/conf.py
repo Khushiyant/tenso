@@ -68,6 +68,10 @@ extensions = [
 templates_path = ["_templates"]
 exclude_patterns = []
 
+# Suppress duplicate cross-reference warnings for re-exported symbols
+# (e.g. QuantizedTensor is defined in tenso.quantize and re-exported from tenso)
+suppress_warnings = ["ref.python"]
+
 # Theme configuration
 html_static_path = ["_static"]
 html_theme = "furo"

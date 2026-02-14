@@ -63,6 +63,8 @@ class TensoShm:
 
     def close(self):
         """Close access to the shared memory."""
+        import gc
+        gc.collect()
         self._shm.close()
 
     def unlink(self):

@@ -1,4 +1,5 @@
 
+import gc
 import pytest
 import numpy as np
 import sys
@@ -21,20 +22,22 @@ def test_shm_roundtrip():
         # Create and Write
         shm_writer = TensoShm.create_from(name, data, check_integrity=True)
         assert shm_writer.name == name
-        
+
         # Read back in same process (simulating IPC via same handle/buffer)
-        read_data = shm_writer.get()
-        
+        # Copy immediately to decouple from the shared memory buffer,
+        # since numpy.frombuffer returns a zero-copy view.
+        read_data = np.array(shm_writer.get())
+
         assert read_data is not None
         np.testing.assert_array_equal(data, read_data)
-        
+
         del read_data
-        
+
         with TensoShm(name) as shm_reader:
-            read_data_2 = shm_reader.get()
+            read_data_2 = np.array(shm_reader.get())
             np.testing.assert_array_equal(data, read_data_2)
             del read_data_2
-            
+
     finally:
         if shm_writer:
             shm_writer.close()
@@ -44,16 +47,17 @@ def test_shm_roundtrip():
 def test_shm_manual_put():
     name = "tenso_test_shm_02"
     data = np.array([1, 2, 3, 4], dtype=np.int32)
-    
+
     # Manually create SHM
     shm = multiprocessing.shared_memory.SharedMemory(name=name, create=True, size=1024)
-    ts = TensoShm(name) 
-    
+    ts = TensoShm(name)
+
     try:
         bytes_written = ts.put(data)
         assert bytes_written > 0
-        
-        res = ts.get()
+
+        # Copy to decouple from the shared memory buffer
+        res = np.array(ts.get())
         np.testing.assert_array_equal(data, res)
         del res
     finally:

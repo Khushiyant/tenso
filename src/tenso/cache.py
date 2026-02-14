@@ -1268,6 +1268,8 @@ class TensoCache:
                     self._shm_lock_release()
             except Exception:
                 pass
+            import gc
+            gc.collect()
             try:
                 self._shm.close()
             except Exception:

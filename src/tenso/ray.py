@@ -84,8 +84,7 @@ def register(
     Raises
     ------
     ImportError
-        If ray is not installed, or if requested optional frameworks
-        (torch, jax) are not available.
+        If ray is not installed or if optional frameworks are not available.
 
     Examples
     --------

@@ -185,7 +185,7 @@ class TestLRUEviction:
             cache.put("new", arr * 99)
 
             # k0 was promoted, should survive
-            result_k0 = cache.get("k0")
+            result_k0 = cache.get("k0", copy=True)
             assert result_k0 is not None, "'k0' should survive (was promoted to MRU)"
             np.testing.assert_array_equal(result_k0, arr * 0)
 
@@ -193,7 +193,7 @@ class TestLRUEviction:
             assert cache.get("k1") is None, "'k1' should be evicted (was LRU tail)"
 
             # "new" should be present
-            result_new = cache.get("new")
+            result_new = cache.get("new", copy=True)
             assert result_new is not None
             np.testing.assert_array_equal(result_new, arr * 99)
         finally:

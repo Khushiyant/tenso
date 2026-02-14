@@ -5,9 +5,9 @@ use std::convert::TryInto;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 use rayon::prelude::*;
 #[cfg(unix)]
-use std::os::unix::io::{RawFd, FromRawFd};
+use std::os::unix::io::FromRawFd;
 #[cfg(windows)]
-use std::os::windows::io::{RawHandle, FromRawHandle};
+use std::os::windows::io::FromRawHandle;
 use std::mem::ManuallyDrop;
 use std::io::{self, Write, Read};
 use std::fs::File;
@@ -469,15 +469,10 @@ fn dumps_rs<'py>(py: Python<'py>, array: &'py PyAny, check_integrity: bool, comp
 // DUMP TO FD Implementation (Optimized)
 // -----------------------------------------------------------------------------
 
-#[cfg(unix)]
-type RawFileDescriptor = RawFd;
-#[cfg(windows)]
-type RawFileDescriptor = RawHandle;
-
 fn dump_to_fd_impl(
     py: Python,
     array: &PyAny,
-    fd: RawFileDescriptor,
+    fd: i32,
     check_integrity: bool,
     compress: bool,
     alignment: usize,
@@ -498,7 +493,12 @@ fn dump_to_fd_impl(
         #[cfg(unix)]
         let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd)) };
         #[cfg(windows)]
-        let mut file = unsafe { ManuallyDrop::new(File::from_raw_handle(fd)) };
+        let mut file = unsafe {
+            // Convert C runtime fd to Windows HANDLE
+            extern "C" { fn _get_osfhandle(fd: i32) -> isize; }
+            let handle = _get_osfhandle(fd) as *mut std::ffi::c_void;
+            ManuallyDrop::new(File::from_raw_handle(handle))
+        };
 
         let use_custom_align = alignment != 64;
         let mut header_len = 8 + (ndim * 4);
@@ -557,7 +557,7 @@ fn dump_to_fd_impl(
 fn dump_to_fd_rs<'py>(
     py: Python<'py>,
     array: &'py PyAny,
-    fd: RawFileDescriptor,
+    fd: i32,
     check_integrity: bool,
     compress: bool,
     alignment: usize
