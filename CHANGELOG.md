@@ -1,6 +1,20 @@
 # CHANGELOG
 
 
+## v0.19.0 (2026-02-14)
+
+### Features
+
+- Update dependencies and enhance TensoCache with framework support
+  ([`281eeb1`](https://github.com/Khushiyant/tenso/commit/281eeb14b243dd221950092c14dfac49606e02f2))
+
+- Updated PyO3 and numpy dependencies in Cargo.toml for compatibility with Python 3.11. - Refactored
+  the Rust implementation in lib.rs to improve array handling and serialization. - Enhanced
+  TensoCache in cache.py to support PyTorch, JAX, and CuPy tensors, including conversion functions.
+  - Implemented a spinlock mechanism for shared memory access to ensure thread safety. - Added
+  comprehensive tests for framework support and spinlock functionality in test_cache.py.
+
+
 ## v0.18.0 (2026-02-14)
 
 ### Documentation
