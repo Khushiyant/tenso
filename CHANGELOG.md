@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.19.1 (2026-02-14)
+
+### Bug Fixes
+
+- Enhance memory management and improve documentation clarity
+  ([`dc298aa`](https://github.com/Khushiyant/tenso/commit/dc298aa2938c35c371f01a7d43b2bf5ca7c952ca))
+
+
 ## v0.19.0 (2026-02-14)
 
 ### Features
