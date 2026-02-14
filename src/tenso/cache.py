@@ -387,7 +387,7 @@ class TensoCache:
 
             # Lock is held — check for staleness
             lock_time = struct.unpack_from('<d', buf, _H_LOCK_TIME)[0]
-            if lock_time > 0 and (time.monotonic() - lock_time) > self._STALE_LOCK_THRESHOLD:
+            if lock_time != 0.0 and (lock_time < 0 or (time.monotonic() - lock_time) > self._STALE_LOCK_THRESHOLD):
                 print(
                     f"TensoCache: force-acquiring stale SHM lock "
                     f"(held for {time.monotonic() - lock_time:.1f}s, "
