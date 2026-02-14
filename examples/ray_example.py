@@ -5,7 +5,7 @@ Tenso replaces Ray's default pickle serialization with zero-copy
 binary protocol, reducing CPU usage by ~46x for tensor operations.
 
 Usage:
-    pip install 'tenso[ray]'
+    pip install 'tenso[api]'
     python ray_example.py
 """
 

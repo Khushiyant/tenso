@@ -100,7 +100,7 @@ def register(
     except ImportError:
         raise ImportError(
             "Ray is required for this integration. "
-            "Install it with: pip install 'tenso[ray]'"
+            "Install it with: pip install 'tenso[api]'"
         )
 
     # numpy arrays

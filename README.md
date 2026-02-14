@@ -100,9 +100,8 @@ pip install tenso
 Optional extras:
 
 ```bash
-pip install tenso[ray]    # Ray integration
+pip install tenso[api]    # gRPC, FastAPI, Ray integration
 pip install tenso[gpu]    # GPU acceleration (CuPy/PyTorch/JAX)
-pip install tenso[grpc]   # gRPC support
 ```
 
 ---

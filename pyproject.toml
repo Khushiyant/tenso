@@ -24,9 +24,12 @@ module-name = "tenso.tenso_rs" # This compiles the rust binary as a submodule
 features = ["pyo3/extension-module"]
 
 [project.optional-dependencies]
-grpc = [
+api = [
     "grpcio>=1.76.0",
     "grpcio-tools>=1.76.0",
+    "fastapi", 
+    "uvicorn",
+    "ray[default]>=2.9.0"
 ]
 dev = [
     "maturin>=1.10.2",
@@ -52,8 +55,6 @@ gpu = [
     "jax[cuda]; sys_platform != 'darwin'",
     "jax; sys_platform == 'darwin'"
 ]
-api = ["fastapi", "uvicorn"]
-ray = ["ray[default]>=2.9.0"]
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
