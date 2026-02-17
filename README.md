@@ -32,6 +32,8 @@ Tenso achieves **true zero-copy** with:
 
 **Result**: 0.8% CPU usage vs >40% for SafeTensors/Pickle.
 
+
+
 ---
 
 ## Benchmarks
@@ -88,6 +90,13 @@ Tenso achieves **true zero-copy** with:
 - **Packet Throughput**: 89,183 packets/sec (over localhost TCP)
 - **Latency**: 11.2 µs/packet
 - **Async Write Throughput**: 88,397 MB/s (1.4M tensors/sec)
+
+---
+
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Khushiyant/tenso&type=timeline&legend=bottom-right)](https://www.star-history.com/#Khushiyant/tenso&type=timeline&legend=bottom-right)
 
 ---
 
