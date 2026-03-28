@@ -25,6 +25,14 @@ FLAG_SPARSE_CSR = 32  #: Packet contains a Sparse CSR tensor (int)
 FLAG_SPARSE_CSC = 64  #: Packet contains a Sparse CSC tensor (int)
 FLAG_CUST_ALIGN = 128  #: Packet uses custom alignment (exponent byte follows shape) (int)
 
+# --- Extended Format Flags ---
+FLAG_STRING = 256      #: Packet contains packed variable-length string tensor (int)
+FLAG_RAGGED = 512      #: Packet contains ragged/jagged array (int)
+
+# --- String/Ragged Dtype Codes ---
+DTYPE_STRING = 20      #: Variable-length UTF-8 string elements (int)
+DTYPE_BYTES = 21       #: Variable-length raw byte elements (int)
+
 # --- Quantized Dtype Codes ---
 QDTYPE_QINT8 = 16   #: 8-bit signed quantized (int)
 QDTYPE_QUINT8 = 17  #: 8-bit unsigned quantized (int)

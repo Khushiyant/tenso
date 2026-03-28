@@ -29,3 +29,4 @@ docs/source/reference/
 # Added by cargo
 *.so
 /target
+.DS_Store

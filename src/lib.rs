@@ -313,20 +313,23 @@ fn write_dense_to_slice(
 fn calc_dense_size(_py: Python, array: &PyAny, check_integrity: bool, compress: bool, alignment: usize) -> PyResult<usize> {
     let ndim: usize = array.getattr("ndim")?.extract()?;
     let nbytes: usize = array.getattr("nbytes")?.extract()?;
-    
+
     let use_custom_align = alignment != 64;
     let mut header_len = 8 + (ndim * 4);
     if use_custom_align { header_len += 1; }
-    
+
     let remainder = header_len % alignment;
     let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
-    
+
     let body_len = if compress {
-        return Err(pyo3::exceptions::PyValueError::new_err("Compression not yet supported for calculated sparse components"));
+        // LZ4 worst-case: input size + header overhead. lz4_flex block compression
+        // can expand by at most ~0.4%, plus a small fixed overhead.
+        let worst_case = lz4_flex::block::get_maximum_output_size(nbytes);
+        worst_case
     } else {
         nbytes
     };
-    
+
     let footer_len = if check_integrity { 8 } else { 0 };
     Ok(header_len + padding_len + body_len + footer_len)
 }
@@ -593,6 +596,134 @@ fn dump_to_fd_rs<'py>(
     dump_to_fd_impl(py, array, fd, check_integrity, compress, alignment, dtype_enum)
 }
 
+// Write a sparse tensor into a pre-allocated buffer slice.
+fn write_sparse_to_slice(
+    py: Python,
+    tensor: &PyAny,
+    format: &str,
+    target: &mut [u8],
+    _check_integrity: bool,
+    alignment: usize,
+) -> PyResult<usize> {
+    let (flag_code, comps) = match format {
+        "coo" => (8u8, vec!["data", "row", "col"]),
+        "csr" => (32u8, vec!["data", "indices", "indptr"]),
+        "csc" => (64u8, vec!["data", "indices", "indptr"]),
+        _ => return Err(pyo3::exceptions::PyValueError::new_err("Unknown sparse format")),
+    };
+
+    let shape_tuple: Vec<u32> = tensor.getattr("shape")?.extract()?;
+    let ndim = shape_tuple.len();
+
+    let mut component_arrays = Vec::with_capacity(3);
+    for name in comps {
+        let arr = tensor.getattr(name)?;
+        let contig = if arr.getattr("flags")?.getattr("c_contiguous")?.extract()? {
+            arr
+        } else {
+            let numpy = py.import("numpy")?;
+            numpy.call_method1("ascontiguousarray", (arr,))?
+        };
+        component_arrays.push(contig);
+    }
+
+    let main_header_len = 8 + (ndim * 4);
+    let mut total_len = main_header_len;
+    let mut comp_sizes = Vec::with_capacity(3);
+
+    for arr in &component_arrays {
+        let size = calc_dense_size(py, arr, false, false, alignment)?;
+        comp_sizes.push(size);
+        total_len += 4 + size;
+    }
+
+    if target.len() < total_len {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Buffer too small for sparse: {} < {}", target.len(), total_len)
+        ));
+    }
+
+    // Write main header
+    target[0..4].copy_from_slice(b"TNSO");
+    target[4] = 3;
+    target[5] = flag_code;
+    target[6] = 0;
+    target[7] = ndim as u8;
+
+    let mut cursor = 8;
+    for &dim in &shape_tuple {
+        target[cursor..cursor + 4].copy_from_slice(&dim.to_le_bytes());
+        cursor += 4;
+    }
+
+    // Write each component as: [4-byte size][dense packet]
+    for (i, arr) in component_arrays.iter().enumerate() {
+        let size = comp_sizes[i];
+        target[cursor..cursor + 4].copy_from_slice(&(size as u32).to_le_bytes());
+        cursor += 4;
+        let sub_slice = &mut target[cursor..cursor + size];
+        write_dense_to_slice(py, arr, sub_slice, false, false, alignment)?;
+        cursor += size;
+    }
+
+    Ok(total_len)
+}
+
+// Write a bundle (dict) into a pre-allocated buffer slice.
+fn write_bundle_to_slice(
+    py: Python,
+    dict: &PyDict,
+    target: &mut [u8],
+    check_integrity: bool,
+    compress: bool,
+    alignment: usize,
+) -> PyResult<usize> {
+    // First pass: serialize all entries to collect their bytes
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(dict.len());
+    let mut total_len = 8usize; // header
+
+    for (key, value) in dict.iter() {
+        let key_str: String = key.extract()?;
+        let key_bytes = key_str.into_bytes();
+
+        let val_packet_obj = dumps_rs(py, value, check_integrity, compress, alignment)?;
+        let val_bytes = val_packet_obj.as_bytes().to_vec();
+
+        total_len += 4 + key_bytes.len() + 4 + val_bytes.len();
+        entries.push((key_bytes, val_bytes));
+    }
+
+    if target.len() < total_len {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Buffer too small for bundle: {} < {}", target.len(), total_len)
+        ));
+    }
+
+    // Write header
+    target[0..4].copy_from_slice(b"TNSO");
+    target[4] = 3;
+    target[5] = 16; // FLAG_BUNDLE
+    target[6] = 0;
+    target[7] = entries.len() as u8;
+
+    let mut cursor = 8;
+    for (key_bytes, val_bytes) in &entries {
+        let k_len = key_bytes.len() as u32;
+        target[cursor..cursor + 4].copy_from_slice(&k_len.to_le_bytes());
+        cursor += 4;
+        target[cursor..cursor + key_bytes.len()].copy_from_slice(key_bytes);
+        cursor += key_bytes.len();
+
+        let v_len = val_bytes.len() as u32;
+        target[cursor..cursor + 4].copy_from_slice(&v_len.to_le_bytes());
+        cursor += 4;
+        target[cursor..cursor + val_bytes.len()].copy_from_slice(val_bytes);
+        cursor += val_bytes.len();
+    }
+
+    Ok(total_len)
+}
+
 #[pyfunction]
 #[pyo3(signature = (array, buffer, check_integrity=false, compress=false, alignment=64))]
 fn dump_to_buffer_rs<'py>(
@@ -621,14 +752,14 @@ fn dump_to_buffer_rs<'py>(
     }
 
     // CHECK FOR BUNDLE
-    if array.downcast::<PyDict>().is_ok() {
-        return Err(pyo3::exceptions::PyNotImplementedError::new_err("Bundle serialization to pre-allocated buffer not yet implemented"));
+    if let Ok(dict) = array.downcast::<PyDict>() {
+        return write_bundle_to_slice(py, dict, target_slice, check_integrity, compress, alignment);
     }
 
     // CHECK FOR SPARSE
     if let Ok(format_attr) = array.getattr("format") {
-        if format_attr.extract::<String>().is_ok() {
-             return Err(pyo3::exceptions::PyNotImplementedError::new_err("Sparse serialization to pre-allocated buffer not yet implemented"));
+        if let Ok(format_str) = format_attr.extract::<String>() {
+            return write_sparse_to_slice(py, array, &format_str, target_slice, check_integrity, alignment);
         }
     }
 
@@ -912,6 +1043,202 @@ fn loads_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<Option<PyObject>
 }
 
 
+// -----------------------------------------------------------------------------
+// Cross-Process Robust Mutex (POSIX pthread_mutex in shared memory)
+// -----------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod shm_mutex {
+    use std::time::Duration;
+
+    // Layout placed in shared memory: pthread_mutex_t (platform-dependent size)
+    // On macOS: 64 bytes, on Linux: 40 bytes. We reserve 64 bytes.
+    pub const MUTEX_SIZE: usize = 64;
+
+    extern "C" {
+        fn pthread_mutexattr_init(attr: *mut libc::pthread_mutexattr_t) -> libc::c_int;
+        fn pthread_mutexattr_setpshared(attr: *mut libc::pthread_mutexattr_t, pshared: libc::c_int) -> libc::c_int;
+        fn pthread_mutexattr_destroy(attr: *mut libc::pthread_mutexattr_t) -> libc::c_int;
+        fn pthread_mutex_init(mutex: *mut libc::pthread_mutex_t, attr: *const libc::pthread_mutexattr_t) -> libc::c_int;
+        fn pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
+        fn pthread_mutex_unlock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
+        fn pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
+        fn pthread_mutex_destroy(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
+
+        // Robust mutex support (Linux)
+        #[cfg(target_os = "linux")]
+        fn pthread_mutexattr_setrobust(attr: *mut libc::pthread_mutexattr_t, robust: libc::c_int) -> libc::c_int;
+        #[cfg(target_os = "linux")]
+        fn pthread_mutex_consistent(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
+    }
+
+    /// Initialize a process-shared mutex at the given memory location.
+    /// The caller must ensure `ptr` points to at least MUTEX_SIZE bytes of
+    /// zeroed shared memory.
+    pub unsafe fn init_mutex(ptr: *mut u8) -> Result<(), String> {
+        let mutex = ptr as *mut libc::pthread_mutex_t;
+        let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+
+        if pthread_mutexattr_init(&mut attr) != 0 {
+            return Err("pthread_mutexattr_init failed".into());
+        }
+        if pthread_mutexattr_setpshared(&mut attr, libc::PTHREAD_PROCESS_SHARED) != 0 {
+            pthread_mutexattr_destroy(&mut attr);
+            return Err("pthread_mutexattr_setpshared failed".into());
+        }
+
+        // On Linux, enable robust mutex so we can recover from crashed holders
+        #[cfg(target_os = "linux")]
+        {
+            if pthread_mutexattr_setrobust(&mut attr, 1 /* PTHREAD_MUTEX_ROBUST */) != 0 {
+                pthread_mutexattr_destroy(&mut attr);
+                return Err("pthread_mutexattr_setrobust failed".into());
+            }
+        }
+
+        let rc = pthread_mutex_init(mutex, &attr);
+        pthread_mutexattr_destroy(&mut attr);
+        if rc != 0 {
+            return Err(format!("pthread_mutex_init failed: {}", rc));
+        }
+        Ok(())
+    }
+
+    /// Lock the mutex with a timeout. Returns Ok(true) if lock was acquired
+    /// after recovering from a dead owner (Linux robust mutex).
+    pub unsafe fn lock_mutex(ptr: *mut u8, timeout: Duration) -> Result<bool, String> {
+        let mutex = ptr as *mut libc::pthread_mutex_t;
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let rc = pthread_mutex_trylock(mutex);
+            if rc == 0 {
+                return Ok(false); // normal acquisition
+            }
+
+            // EOWNERDEAD: previous holder crashed (Linux robust mutex)
+            #[cfg(target_os = "linux")]
+            if rc == libc::EOWNERDEAD {
+                pthread_mutex_consistent(mutex);
+                return Ok(true); // recovered
+            }
+
+            if rc == libc::EBUSY {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("Mutex lock timed out after {:?}", timeout));
+                }
+                std::thread::sleep(Duration::from_micros(50));
+                continue;
+            }
+
+            return Err(format!("pthread_mutex_trylock failed: {}", rc));
+        }
+    }
+
+    /// Unlock the mutex.
+    pub unsafe fn unlock_mutex(ptr: *mut u8) -> Result<(), String> {
+        let mutex = ptr as *mut libc::pthread_mutex_t;
+        let rc = pthread_mutex_unlock(mutex);
+        if rc != 0 {
+            return Err(format!("pthread_mutex_unlock failed: {}", rc));
+        }
+        Ok(())
+    }
+
+    pub unsafe fn destroy_mutex(ptr: *mut u8) -> Result<(), String> {
+        let mutex = ptr as *mut libc::pthread_mutex_t;
+        let rc = pthread_mutex_destroy(mutex);
+        if rc != 0 {
+            return Err(format!("pthread_mutex_destroy failed: {}", rc));
+        }
+        Ok(())
+    }
+}
+
+/// Initialize a POSIX process-shared mutex at a given offset in a buffer.
+/// The buffer must be backed by shared memory and have at least 64 bytes
+/// available at the given offset.
+#[cfg(unix)]
+#[pyfunction]
+fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
+    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
+    if py_buf.readonly() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+    }
+    let buf_len = py_buf.len_bytes();
+    let ptr = py_buf.buf_ptr() as *mut u8;
+
+    if offset + shm_mutex::MUTEX_SIZE > buf_len {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Insufficient space: need {} bytes at offset {}, buffer is {} bytes",
+                    shm_mutex::MUTEX_SIZE, offset, buf_len)
+        ));
+    }
+
+    unsafe {
+        shm_mutex::init_mutex(ptr.add(offset))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+}
+
+/// Lock a POSIX process-shared mutex. Returns True if the lock was recovered
+/// from a dead owner (Linux robust mutex), False otherwise.
+#[cfg(unix)]
+#[pyfunction]
+#[pyo3(signature = (buffer, offset, timeout_secs=5.0))]
+fn shm_mutex_lock(buffer: &PyAny, offset: usize, timeout_secs: f64) -> PyResult<bool> {
+    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
+    if py_buf.readonly() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+    }
+    let ptr = py_buf.buf_ptr() as *mut u8;
+    let timeout = std::time::Duration::from_secs_f64(timeout_secs);
+
+    unsafe {
+        shm_mutex::lock_mutex(ptr.add(offset), timeout)
+            .map_err(|e| pyo3::exceptions::PyTimeoutError::new_err(e))
+    }
+}
+
+/// Unlock a POSIX process-shared mutex.
+#[cfg(unix)]
+#[pyfunction]
+fn shm_mutex_unlock(buffer: &PyAny, offset: usize) -> PyResult<()> {
+    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
+    if py_buf.readonly() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+    }
+    let ptr = py_buf.buf_ptr() as *mut u8;
+
+    unsafe {
+        shm_mutex::unlock_mutex(ptr.add(offset))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+}
+
+/// Destroy a POSIX process-shared mutex.
+#[cfg(unix)]
+#[pyfunction]
+fn shm_mutex_destroy(buffer: &PyAny, offset: usize) -> PyResult<()> {
+    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
+    if py_buf.readonly() {
+        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+    }
+    let ptr = py_buf.buf_ptr() as *mut u8;
+
+    unsafe {
+        shm_mutex::destroy_mutex(ptr.add(offset))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+}
+
+/// Return the size in bytes needed for one POSIX process-shared mutex.
+#[cfg(unix)]
+#[pyfunction]
+fn shm_mutex_size() -> usize {
+    shm_mutex::MUTEX_SIZE
+}
+
 #[pymodule]
 fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_packet_info_rs, m)?)?;
@@ -919,6 +1246,14 @@ fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dump_to_buffer_rs, m)?)?;
     m.add_function(wrap_pyfunction!(dump_to_fd_rs, m)?)?;
     m.add_function(wrap_pyfunction!(loads_rs, m)?)?;
+    #[cfg(unix)]
+    {
+        m.add_function(wrap_pyfunction!(shm_mutex_init, m)?)?;
+        m.add_function(wrap_pyfunction!(shm_mutex_lock, m)?)?;
+        m.add_function(wrap_pyfunction!(shm_mutex_unlock, m)?)?;
+        m.add_function(wrap_pyfunction!(shm_mutex_destroy, m)?)?;
+        m.add_function(wrap_pyfunction!(shm_mutex_size, m)?)?;
+    }
     Ok(())
 }
 

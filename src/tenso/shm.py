@@ -9,6 +9,8 @@ tensors between local processes.
 from typing import Any, Optional, Self, Union
 import numpy as np
 
+from .core import dumps, loads as core_loads
+
 try:
     from multiprocessing import shared_memory
     HAS_SHM = True
@@ -84,30 +86,42 @@ class TensoShm:
         # User must call unlink() explicitly or use a specific cleanup strategy.
 
     def put(
-        self, 
-        obj: Any, 
-        check_integrity: bool = False, 
-        compress: bool = False, 
+        self,
+        obj: Any,
+        check_integrity: bool = False,
+        compress: bool = False,
         alignment: int = 64
     ) -> int:
         """
         Serialize an object directly into the shared memory.
-        
+
+        Supports NumPy arrays, sparse matrices, and dicts via the Rust fast-path.
+        Falls back to Python serialization + copy if the Rust extension is unavailable.
+
         Returns
         -------
         int
             Number of bytes written.
         """
-        if dump_to_buffer_rs is None:
-            raise NotImplementedError("Tenso Rust extension is required for SHM operations")
+        if dump_to_buffer_rs is not None:
+            try:
+                return dump_to_buffer_rs(
+                    obj,
+                    self._shm.buf,
+                    check_integrity=check_integrity,
+                    compress=compress,
+                    alignment=alignment,
+                )
+            except (NotImplementedError, TypeError):
+                pass
 
-        return dump_to_buffer_rs(
-            obj, 
-            self._shm.buf, 
-            check_integrity=check_integrity, 
-            compress=compress, 
-            alignment=alignment
-        )
+        # Fallback: serialize to bytes then copy into SHM
+        packet = bytes(dumps(obj, check_integrity=check_integrity, compress=compress, alignment=alignment))
+        buf = self._shm.buf
+        if len(packet) > len(buf):
+            raise MemoryError(f"Packet ({len(packet)} bytes) exceeds SHM size ({len(buf)} bytes)")
+        buf[:len(packet)] = packet
+        return len(packet)
 
     def get(self) -> Optional[Union[np.ndarray, dict]]:
         """
@@ -122,10 +136,13 @@ class TensoShm:
         Optional[Union[np.ndarray, dict]]
             The reconstructed object (zero-copy view).
         """
-        if loads_rs is None:
-             raise NotImplementedError("Tenso Rust extension is required for SHM operations")
+        if loads_rs is not None:
+            result = loads_rs(self._shm.buf)
+            if result is not None:
+                return result
 
-        return loads_rs(self._shm.buf)
+        # Fallback to Python deserialization
+        return core_loads(self._shm.buf)
 
     @classmethod
     def create_from(
@@ -138,22 +155,10 @@ class TensoShm:
     ) -> Self:
         """
         Create a new SharedMemory segment sized to fit the object and write it.
+
+        Supports NumPy arrays, sparse matrices (COO/CSR/CSC), and dicts of arrays.
         """
-        if not isinstance(obj, np.ndarray):
-            raise NotImplementedError("Only NumPy arrays supported for SHM auto-sizing currently.")
-
-        # Calculate exact overhead:
-        # Header: 8 bytes + (ndim * 4) for shape + optional alignment byte
-        # Padding: at most (alignment - 1) bytes
-        # Footer: 8 bytes if integrity check enabled
-        ndim = obj.ndim
-        header_size = 8 + (ndim * 4) + (1 if alignment != 64 else 0)
-        max_padding = alignment - 1
-        footer_size = 8 if check_integrity else 0
-
-        # Total overhead with small safety margin (256 bytes for edge cases)
-        overhead = header_size + max_padding + footer_size + 256
-        estimated_size = obj.nbytes + overhead
+        estimated_size = cls._estimate_size(obj, check_integrity, alignment)
 
         shm = cls(name, create=True, size=estimated_size)
         try:
@@ -163,3 +168,40 @@ class TensoShm:
             shm.close()
             shm.unlink()
             raise
+
+    @staticmethod
+    def _estimate_size(obj: Any, check_integrity: bool, alignment: int) -> int:
+        """Estimate SHM size needed for an object."""
+        footer_size = 8 if check_integrity else 0
+        safety = 256
+
+        if isinstance(obj, np.ndarray):
+            ndim = obj.ndim
+            header_size = 8 + (ndim * 4) + (1 if alignment != 64 else 0)
+            return header_size + (alignment - 1) + obj.nbytes + footer_size + safety
+
+        if isinstance(obj, dict):
+            total = 8  # bundle header
+            for key, value in obj.items():
+                key_bytes = key.encode('utf-8') if isinstance(key, str) else str(key).encode('utf-8')
+                total += 4 + len(key_bytes) + 4
+                total += TensoShm._estimate_size(value, check_integrity, alignment)
+            return total + safety
+
+        if hasattr(obj, 'format') and hasattr(obj, 'data'):
+            fmt = getattr(obj, 'format', '')
+            shape = obj.shape
+            ndim = len(shape)
+            total = 8 + (ndim * 4)  # main header
+            comps = []
+            if fmt == 'coo':
+                comps = [obj.data, obj.row, obj.col]
+            elif fmt in ('csr', 'csc'):
+                comps = [obj.data, obj.indices, obj.indptr]
+            for c in comps:
+                c = np.asarray(c)
+                h = 8 + (c.ndim * 4) + (1 if alignment != 64 else 0)
+                total += 4 + h + (alignment - 1) + c.nbytes + footer_size
+            return total + safety
+
+        raise TypeError(f"Unsupported type for SHM auto-sizing: {type(obj)}")

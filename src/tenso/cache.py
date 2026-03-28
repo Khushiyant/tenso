@@ -42,6 +42,15 @@ except ImportError:
     _HAS_RUST = False
 
 try:
+    from .tenso_rs import (
+        shm_mutex_init, shm_mutex_lock, shm_mutex_unlock,
+        shm_mutex_destroy, shm_mutex_size,
+    )
+    _HAS_ROBUST_MUTEX = True
+except ImportError:
+    _HAS_ROBUST_MUTEX = False
+
+try:
     from .quantize import QuantizedTensor
     _HAS_QUANTIZE = True
 except ImportError:
@@ -91,11 +100,14 @@ _H_WATERMARK = 32     # 8 bytes  (bump allocator offset into data region)
 _H_LRU_HEAD = 40      # 4 bytes
 _H_LRU_TAIL = 44      # 4 bytes
 _H_FREE_LIST = 48     # 8 bytes  (offset of first free chunk in data region, 0=none)
-_H_LOCK = 56          # 4 bytes (0=unlocked, 1=locked)
+_H_LOCK = 56          # 4 bytes (0=unlocked, 1=locked) — spinlock fallback
 _H_LOCK_TIME = 60     # 8 bytes (monotonic timestamp of acquisition)
 _H_GENERATION = 68    # 8 bytes
 _H_HITS = 76          # 8 bytes
 _H_MISSES = 84        # 8 bytes
+_H_MUTEX_INIT = 92    # 1 byte (0=not initialized, 1=robust mutex initialized)
+_H_MUTEX = 128        # 64 bytes — POSIX pthread_mutex_t (process-shared, robust)
+                      # Aligned to 64 bytes for portability
 
 # Entry slot field offsets (within each 256-byte slot)
 _E_STATUS = 0         # 1 byte  (0=free, 1=active)
@@ -314,6 +326,7 @@ class TensoCache:
             self._max_entries = max_entries
             self._data_region_offset = data_region_offset
             self._data_region_end = pool_size
+            self._use_robust_mutex = self._init_robust_mutex()
 
         else:
             if name is None:
@@ -339,6 +352,10 @@ class TensoCache:
                 _POOL_HEADER_SIZE + entry_table_size, _DATA_ALIGNMENT
             )
             self._data_region_end = self._pool_size
+            # Attach to existing robust mutex if creator initialized one
+            self._use_robust_mutex = (
+                _HAS_ROBUST_MUTEX and buf[_H_MUTEX_INIT] == 1
+            )
 
     @property
     def name(self) -> str:
@@ -358,34 +375,59 @@ class TensoCache:
     def _write_header_u64(self, offset: int, value: int):
         struct.pack_into('<Q', self._shm.buf, offset, value)
 
-    # -- SHM spinlock (cross-process safety) --
+    # -- SHM locking (cross-process safety) --
+    #
+    # Two strategies are available:
+    #   1. Robust POSIX pthread_mutex via tenso_rs (preferred). Uses
+    #      PTHREAD_PROCESS_SHARED and, on Linux, PTHREAD_MUTEX_ROBUST so
+    #      the kernel auto-recovers if a holder crashes — no 30-second
+    #      stale-lock window and no CPU-thrashing spinloop.
+    #   2. Python spinlock fallback (original). Used when the Rust
+    #      extension is not compiled or on non-Unix platforms.
 
     _STALE_LOCK_THRESHOLD = 30.0  # seconds before force-acquiring a stale lock
 
+    def _init_robust_mutex(self):
+        """Initialize the POSIX robust mutex in the pool header (once)."""
+        if not _HAS_ROBUST_MUTEX:
+            return False
+        buf = self._shm.buf
+        if buf[_H_MUTEX_INIT] == 1:
+            return True  # already initialized by the creating process
+        try:
+            shm_mutex_init(buf, _H_MUTEX)
+            buf[_H_MUTEX_INIT] = 1
+            return True
+        except Exception as exc:
+            print(f"TensoCache: robust mutex init failed ({exc}), "
+                  f"falling back to spinlock", file=sys.stderr)
+            return False
+
     def _shm_lock_acquire(self, timeout: float = 5.0):
         """
-        Acquire the SHM spinlock for cross-process mutual exclusion.
+        Acquire the SHM lock for cross-process mutual exclusion.
 
-        Uses a 4-byte lock word at _H_LOCK. Spins with 100us sleep.
-        Stale locks (held > 30s) are force-acquired with a stderr warning
-        to recover from crashed processes.
-
-        Note: struct.pack_into on a 4-byte-aligned field is atomic at the
-        hardware level on x86/ARM. For extreme multi-writer contention,
-        an external multiprocessing.Lock is recommended.
+        Prefers the Rust-backed POSIX robust mutex when available.
+        Falls back to the original Python spinlock otherwise.
         """
+        if self._use_robust_mutex:
+            recovered = shm_mutex_lock(self._shm.buf, _H_MUTEX, timeout)
+            if recovered:
+                print("TensoCache: recovered lock from crashed process",
+                      file=sys.stderr)
+            return
+
+        # --- Spinlock fallback ---
         buf = self._shm.buf
         deadline = time.monotonic() + timeout
 
         while True:
             lock_val = struct.unpack_from('<I', buf, _H_LOCK)[0]
             if lock_val == 0:
-                # Unlocked — acquire
                 struct.pack_into('<I', buf, _H_LOCK, 1)
                 struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic())
                 return
 
-            # Lock is held — check for staleness
             lock_time = struct.unpack_from('<d', buf, _H_LOCK_TIME)[0]
             if lock_time != 0.0 and (lock_time < 0 or (time.monotonic() - lock_time) > self._STALE_LOCK_THRESHOLD):
                 print(
@@ -406,7 +448,11 @@ class TensoCache:
             time.sleep(0.0001)  # 100μs spin
 
     def _shm_lock_release(self):
-        """Release the SHM spinlock."""
+        """Release the SHM lock."""
+        if self._use_robust_mutex:
+            shm_mutex_unlock(self._shm.buf, _H_MUTEX)
+            return
+
         buf = self._shm.buf
         struct.pack_into('<d', buf, _H_LOCK_TIME, 0.0)
         struct.pack_into('<I', buf, _H_LOCK, 0)
@@ -1263,9 +1309,10 @@ class TensoCache:
         if not self._closed:
             self._closed = True
             try:
-                lock_val = struct.unpack_from('<I', self._shm.buf, _H_LOCK)[0]
-                if lock_val == 1:
-                    self._shm_lock_release()
+                if not self._use_robust_mutex:
+                    lock_val = struct.unpack_from('<I', self._shm.buf, _H_LOCK)[0]
+                    if lock_val == 1:
+                        self._shm_lock_release()
             except Exception:
                 pass
             try:

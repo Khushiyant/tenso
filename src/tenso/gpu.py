@@ -166,3 +166,144 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
     elif BACKEND == "jax":
         return jax.device_put(body_view, device=jax.devices()[device_id])
     return body_view
+
+
+# ---------------------------------------------------------------------------
+# GPU Direct Storage / RDMA Abstraction
+# ---------------------------------------------------------------------------
+
+class GPUDirectTransfer:
+    """
+    Abstraction layer for GPU-Direct Storage and RDMA transfers.
+
+    When available, uses NVIDIA GPUDirect Storage (GDS) to bypass CPU
+    staging entirely — network/storage data lands directly in GPU memory.
+    Falls back gracefully to pinned-memory staging when GDS is unavailable.
+
+    Example::
+
+        gdt = GPUDirectTransfer(device_id=0)
+
+        # From a file descriptor (e.g., NVMe SSD or network socket)
+        tensor = gdt.read_from_fd(fd, shape=(1, 3, 224, 224), dtype=np.float32)
+
+        # From a Tenso packet buffer already in host memory
+        tensor = gdt.read_packet(packet_bytes)
+    """
+
+    def __init__(self, device_id: int = 0):
+        self.device_id = device_id
+        self._gds_available = False
+        self._backend = BACKEND
+
+        # Detect GDS (cuFile) availability
+        if HAS_CUPY:
+            try:
+                import kvikio
+                self._gds_available = True
+                self._kvikio = kvikio
+            except ImportError:
+                pass
+
+    @property
+    def gds_available(self) -> bool:
+        return self._gds_available
+
+    def read_from_fd(
+        self,
+        fd: int,
+        shape: tuple,
+        dtype: np.dtype,
+        offset: int = 0,
+    ) -> Any:
+        """
+        Read raw tensor data from a file descriptor directly into GPU memory.
+
+        Uses GPUDirect Storage (kvikio/cuFile) when available, bypassing
+        CPU RAM entirely. Falls back to pinned memory staging otherwise.
+
+        Parameters
+        ----------
+        fd : int
+            OS-level file descriptor.
+        shape : tuple
+            Tensor shape.
+        dtype : np.dtype
+            Element data type.
+        offset : int
+            Byte offset into the file where data begins.
+
+        Returns
+        -------
+        GPU tensor (CuPy, PyTorch, or JAX array).
+        """
+        dtype = np.dtype(dtype)
+        nbytes = int(np.prod(shape)) * dtype.itemsize
+
+        if self._gds_available and self._backend == "cupy":
+            return self._gds_read(fd, shape, dtype, nbytes, offset)
+
+        return self._staged_read(fd, shape, dtype, nbytes, offset)
+
+    def _gds_read(self, fd, shape, dtype, nbytes, offset):
+        """GPU-Direct Storage path via kvikio."""
+        import os
+
+        with cp.cuda.Device(self.device_id):
+            gpu_buf = cp.empty(int(np.prod(shape)), dtype=dtype)
+            gpu_ptr = gpu_buf.data.ptr
+
+            f = self._kvikio.CuFile(os.fdopen(fd, 'rb', closefd=False))
+            bytes_read = f.pread(gpu_buf, nbytes, file_offset=offset)
+            f.close()
+
+            if bytes_read != nbytes:
+                raise IOError(
+                    f"GDS short read: expected {nbytes}, got {bytes_read}"
+                )
+
+            return gpu_buf.reshape(shape)
+
+    def _staged_read(self, fd, shape, dtype, nbytes, offset):
+        """Fallback: pinned memory staging."""
+        import os
+
+        host_view, _ = _get_allocator(nbytes)
+        f = os.fdopen(fd, 'rb', closefd=False)
+        f.seek(offset)
+
+        pos = 0
+        mv = memoryview(host_view)
+        while pos < nbytes:
+            chunk = f.read(nbytes - pos)
+            if not chunk:
+                raise EOFError(f"Short read: expected {nbytes}, got {pos}")
+            mv[pos:pos + len(chunk)] = chunk
+            pos += len(chunk)
+
+        arr = host_view[:nbytes].view(dtype).reshape(shape)
+
+        if self._backend == "cupy":
+            with cp.cuda.Device(self.device_id):
+                return cp.array(arr)
+        elif self._backend == "torch":
+            return torch.from_numpy(arr).to(
+                device=f"cuda:{self.device_id}", non_blocking=True
+            )
+        elif self._backend == "jax":
+            return jax.device_put(arr, device=jax.devices()[self.device_id])
+        return arr
+
+    def read_packet(self, source: Any, device_id: int = None) -> Any:
+        """
+        Read a Tenso packet and transfer to GPU.
+
+        Delegates to read_to_device() but can be extended with GDS
+        for direct-from-network transfers.
+        """
+        did = device_id if device_id is not None else self.device_id
+        return read_to_device(source, device_id=did)
+
+    def __repr__(self) -> str:
+        gds = "GDS" if self._gds_available else "staged"
+        return f"GPUDirectTransfer(device={self.device_id}, mode={gds}, backend={self._backend})"
