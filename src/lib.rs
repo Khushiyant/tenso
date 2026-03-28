@@ -385,7 +385,7 @@ fn serialize_sparse<'py>(py: Python<'py>, tensor: &'py PyAny, format: &str, _che
             bytes[cursor..cursor+4].copy_from_slice(&(size as u32).to_le_bytes());
             cursor += 4;
             let sub_slice = &mut bytes[cursor..cursor+size];
-            let _ = write_dense_to_slice(py, arr, sub_slice, false, false, alignment).unwrap();
+            write_dense_to_slice(py, arr, sub_slice, false, false, alignment)?;
             cursor += size;
         }
         Ok(())
@@ -422,7 +422,7 @@ fn serialize_bundle<'py>(
         bytes[4] = 3;
         bytes[5] = 16; // FLAG_BUNDLE = 16
         bytes[6] = 0;
-        bytes[7] = entries.len() as u8; // min(len, 255) in python, but here we just cast
+        bytes[7] = entries.len().min(255) as u8;
 
         let mut cursor = 8;
         for (key_bytes, val_bytes) in entries {
@@ -465,7 +465,7 @@ fn dumps_rs<'py>(py: Python<'py>, array: &'py PyAny, check_integrity: bool, comp
     let size = calc_dense_size(py, array, check_integrity, compress, alignment)?;
     
     PyBytes::new_with(py, size, |bytes: &mut [u8]| {
-         let _ = write_dense_to_slice(py, array, bytes, check_integrity, compress, alignment).unwrap();
+         write_dense_to_slice(py, array, bytes, check_integrity, compress, alignment)?;
          Ok(())
     })
 }
@@ -702,9 +702,9 @@ fn write_bundle_to_slice(
     // Write header
     target[0..4].copy_from_slice(b"TNSO");
     target[4] = 3;
-    target[5] = 16; // FLAG_BUNDLE
+    target[5] = 16;
     target[6] = 0;
-    target[7] = entries.len() as u8;
+    target[7] = entries.len().min(255) as u8;
 
     let mut cursor = 8;
     for (key_bytes, val_bytes) in &entries {
@@ -813,7 +813,7 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
     dict.set_item("dtype_code", dtype_code)?;
     dict.set_item("ndim", ndim)?;
     
-    let total_elements: usize = struct_prod(&shape);
+    let total_elements: usize = shape.iter().product();
     dict.set_item("total_elements", total_elements)?;
     dict.set_item("shape", PyTuple::new(py, shape))?;
     
@@ -821,10 +821,6 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
     dict.set_item("integrity_protected", (flags & 2) != 0)?;
 
     Ok(dict)
-}
-
-fn struct_prod(shape: &[usize]) -> usize {
-    shape.iter().product()
 }
 
 // -----------------------------------------------------------------------------
@@ -1090,7 +1086,7 @@ mod shm_mutex {
         // On Linux, enable robust mutex so we can recover from crashed holders
         #[cfg(target_os = "linux")]
         {
-            if pthread_mutexattr_setrobust(&mut attr, 1 /* PTHREAD_MUTEX_ROBUST */) != 0 {
+            if pthread_mutexattr_setrobust(&mut attr, libc::PTHREAD_MUTEX_ROBUST) != 0 {
                 pthread_mutexattr_destroy(&mut attr);
                 return Err("pthread_mutexattr_setrobust failed".into());
             }

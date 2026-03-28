@@ -147,17 +147,17 @@ class TensoFastAPIClient:
         return loads(b"".join(chunks))
 
     def close(self):
+        """Close sync client. For async client, use ``async with`` or ``await client.aclose()``."""
         if self._sync_client is not None:
             self._sync_client.close()
             self._sync_client = None
+
+    async def aclose(self):
+        """Close both sync and async clients."""
         if self._async_client is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._async_client.aclose())
-            except RuntimeError:
-                asyncio.run(self._async_client.aclose())
+            await self._async_client.aclose()
             self._async_client = None
+        self.close()
 
     def __enter__(self):
         return self
@@ -169,9 +169,4 @@ class TensoFastAPIClient:
         return self
 
     async def __aexit__(self, *args):
-        if self._async_client is not None:
-            await self._async_client.aclose()
-            self._async_client = None
-        if self._sync_client is not None:
-            self._sync_client.close()
-            self._sync_client = None
+        await self.aclose()

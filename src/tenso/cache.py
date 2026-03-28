@@ -109,25 +109,7 @@ _H_MUTEX_INIT = 92    # 1 byte (0=not initialized, 1=robust mutex initialized)
 _H_MUTEX = 128        # 64 bytes — POSIX pthread_mutex_t (process-shared, robust)
                       # Aligned to 64 bytes for portability
 
-# Entry slot field offsets (within each 256-byte slot)
-_E_STATUS = 0         # 1 byte  (0=free, 1=active)
-_E_KEY_LEN = 1        # 1 byte
-_E_KEY = 2            # 128 bytes (padded)
-_E_DATA_OFF = 130     # 8 bytes  (offset from start of SHM)
-_E_ALLOC_SIZE = 138   # 8 bytes  (allocated size including alignment padding)
-_E_PACKET_SIZE = 146  # 8 bytes  (actual tenso packet size)
-_E_DTYPE = 154        # 1 byte
-_E_NDIM = 155         # 1 byte
-_E_SHAPE = 156        # 32*4 = 128 bytes (up to 32 dims)
-_E_ACCESS_TIME = 284  # 8 bytes (double, seconds since epoch, actually fits: 156+128=284 but we have 256. Let me recalculate)
-# Recalculate: 0+1+1+128+8+8+8+1+1+128 = 284 > 256. Need to compress.
-# Let's use a more compact layout:
-# status(1) + key_len(1) + key(128) + data_off(8) + alloc_size(4) + packet_size(4)
-# + dtype(1) + ndim(1) + shape(8*4=32) + access_time(8) + create_time(8)
-# + ttl(8) + lru_prev(4) + lru_next(4) = 1+1+128+8+4+4+1+1+32+8+8+8+4+4 = 212
-# That fits in 256 with room to spare.
-
-# Revised compact entry layout:
+# Entry slot field offsets (within each 256-byte slot, 212 bytes used, 44 spare)
 _E_STATUS = 0         # 1 byte  (0=free, 1=active)
 _E_KEY_LEN = 1        # 1 byte
 _E_KEY = 2            # 128 bytes
@@ -413,11 +395,17 @@ class TensoCache:
         if self._use_robust_mutex:
             recovered = shm_mutex_lock(self._shm.buf, _H_MUTEX, timeout)
             if recovered:
-                print("TensoCache: recovered lock from crashed process",
-                      file=sys.stderr)
+                print("TensoCache: recovered lock from crashed process, "
+                      "resetting pool to safe state", file=sys.stderr)
+                self._recover_pool_state()
             return
 
         # --- Spinlock fallback ---
+        # WARNING: This path is NOT truly atomic. Two processes can both
+        # read lock_val==0 and both claim the lock. It exists only as a
+        # best-effort fallback when the Rust extension (which provides a
+        # real POSIX process-shared mutex) is not available. For production
+        # multi-process deployments, compile tenso with Rust support.
         buf = self._shm.buf
         deadline = time.monotonic() + timeout
 
@@ -465,6 +453,37 @@ class TensoCache:
             yield
         finally:
             self._shm_lock_release()
+
+    # -- Crash recovery --
+
+    def _recover_pool_state(self):
+        """
+        Reset the pool to a consistent state after recovering a mutex from
+        a crashed process. The crashed holder may have left the pool
+        partially written (e.g. mid-eviction, mid-put). Rather than
+        attempting complex repair of free-list/LRU invariants, we clear
+        the pool — safety over data preservation.
+        """
+        buf = self._shm.buf
+
+        for i in range(self._max_entries):
+            off = _POOL_HEADER_SIZE + i * _ENTRY_SIZE
+            buf[off + _E_STATUS] = _STATUS_FREE
+            struct.pack_into('<I', buf, off + _E_LRU_PREV, _SENTINEL)
+            struct.pack_into('<I', buf, off + _E_LRU_NEXT, _SENTINEL)
+
+        self._write_header_u32(_H_ACTIVE, 0)
+        self._write_header_u64(
+            _H_FREE_BYTES,
+            self._data_region_end - self._data_region_offset,
+        )
+        self._write_header_u64(_H_WATERMARK, self._data_region_offset)
+        self._write_header_u32(_H_LRU_HEAD, _SENTINEL)
+        self._write_header_u32(_H_LRU_TAIL, _SENTINEL)
+        self._write_header_u64(_H_FREE_LIST, 0)
+
+        self._key_to_slot.clear()
+        self._bump_generation()
 
     # -- Generation-based local index invalidation --
 
@@ -844,16 +863,12 @@ class TensoCache:
 
         if isinstance(tensor, np.ndarray):
             ndim = tensor.ndim
-            # Header(8) + shape(ndim*4) + alignment padding(up to 63) + data + safety margin
             header_size = 8 + ndim * 4
             padding = (_DATA_ALIGNMENT - (header_size % _DATA_ALIGNMENT)) % _DATA_ALIGNMENT
             return header_size + padding + tensor.nbytes + 256
-        elif _HAS_QUANTIZE and isinstance(tensor, QuantizedTensor):
-            packet = bytes(dumps(tensor))
-            return len(packet) + 64
-        else:
-            packet = bytes(dumps(tensor))
-            return len(packet) + 64
+
+        packet = bytes(dumps(tensor))
+        return len(packet) + 64
 
     # -- Public API --
 
@@ -1007,7 +1022,9 @@ class TensoCache:
             elif isinstance(dtype, int):
                 dtype_code = dtype
             return dtype_code, ndim, shape
-        except Exception:
+        except Exception as exc:
+            print(f"TensoCache: metadata extraction failed: {exc}",
+                  file=sys.stderr)
             return 0, 0, ()
 
     def get(self, key: str, copy: bool = False, device: str = None):
@@ -1033,59 +1050,59 @@ class TensoCache:
         """
         with self._lock:
             self._check_closed()
-            self._sync_index()
+            with self._shm_locked():
+                self._sync_index()
 
-            slot = self._key_to_slot.get(key)
-            if slot is None:
-                self._inc_misses()
-                return None
-
-            buf = self._shm.buf
-            off = self._slot_offset(slot)
-
-            if buf[off + _E_STATUS] != _STATUS_ACTIVE:
-                self._key_to_slot.pop(key, None)
-                self._inc_misses()
-                return None
-
-            # Check TTL
-            ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
-            if ttl > 0:
-                create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-                if time.monotonic() - create_time >= ttl:
-                    self._delete_slot(slot)
-                    self._bump_generation()
+                slot = self._key_to_slot.get(key)
+                if slot is None:
                     self._inc_misses()
                     return None
 
-            # Read data
-            data_off = struct.unpack_from('<Q', buf, off + _E_DATA_OFF)[0]
-            packet_size = struct.unpack_from('<I', buf, off + _E_PACKET_SIZE)[0]
-            packet_view = buf[data_off:data_off + packet_size]
+                buf = self._shm.buf
+                off = self._slot_offset(slot)
 
-            # Deserialize
+                if buf[off + _E_STATUS] != _STATUS_ACTIVE:
+                    self._key_to_slot.pop(key, None)
+                    self._inc_misses()
+                    return None
+
+                ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
+                if ttl > 0:
+                    create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
+                    if time.monotonic() - create_time >= ttl:
+                        self._delete_slot(slot)
+                        self._bump_generation()
+                        self._inc_misses()
+                        return None
+
+                data_off = struct.unpack_from('<Q', buf, off + _E_DATA_OFF)[0]
+                packet_size = struct.unpack_from('<I', buf, off + _E_PACKET_SIZE)[0]
+
+                # Snapshot the packet bytes while holding the lock so a
+                # concurrent put/delete cannot mutate the data under us.
+                packet_snapshot = bytes(buf[data_off:data_off + packet_size])
+
+                struct.pack_into('<d', buf, off + _E_ACCESS_TIME, time.monotonic())
+                self._lru_move_to_head(slot)
+                self._inc_hits()
+
+            # Deserialize outside the lock (can be expensive)
             result = None
             if _HAS_RUST and loads_rs is not None:
                 try:
-                    result = loads_rs(packet_view)
+                    result = loads_rs(packet_snapshot)
                 except (ValueError, TypeError):
                     pass
 
             if result is None:
-                result = loads(bytes(packet_view), copy=copy)
+                result = loads(packet_snapshot, copy=copy)
             elif copy:
                 if hasattr(result, 'copy'):
                     result = result.copy()
 
-            # Update access time and LRU
-            struct.pack_into('<d', buf, off + _E_ACCESS_TIME, time.monotonic())
-            self._lru_move_to_head(slot)
-            self._inc_hits()
-
-            # Convert to target device if requested
             if device is not None:
                 if not copy and isinstance(result, np.ndarray):
-                    result = result.copy()  # can't share SHM buffer with frameworks
+                    result = result.copy()
                 result = _numpy_to_device(result, device)
 
             return result

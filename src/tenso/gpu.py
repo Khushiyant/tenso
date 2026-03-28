@@ -251,7 +251,6 @@ class GPUDirectTransfer:
 
         with cp.cuda.Device(self.device_id):
             gpu_buf = cp.empty(int(np.prod(shape)), dtype=dtype)
-            gpu_ptr = gpu_buf.data.ptr
 
             f = self._kvikio.CuFile(os.fdopen(fd, 'rb', closefd=False))
             bytes_read = f.pread(gpu_buf, nbytes, file_offset=offset)

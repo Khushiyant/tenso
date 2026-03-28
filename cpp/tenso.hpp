@@ -129,7 +129,7 @@ struct Packet {
     std::vector<uint32_t>    shape_vec;
     const uint8_t*           body_ptr;    // points into the source buffer
     size_t                   body_bytes;
-    bool                     integrity_ok;
+    bool                     integrity_verified; // false if packet has FLAG_INTEGRITY but hash wasn't checked
 
     DType dtype() const { return dtype_val; }
 
@@ -219,7 +219,7 @@ inline Packet read(const uint8_t* buf, size_t len) {
 
     pkt.body_ptr = buf + body_start;
     pkt.body_bytes = body_len;
-    pkt.integrity_ok = true; // Integrity verification left to caller if needed
+    pkt.integrity_verified = (pkt.flags & FLAG_INTEGRITY) == 0; // true only if no check needed
 
     return pkt;
 }
@@ -278,12 +278,15 @@ inline void write(
         buf[cursor] = exponent;
     }
 
+    if (check_integrity)
+        throw std::runtime_error(
+            "Integrity footer requires XXH3 hashing which is not included in "
+            "this header-only library. Use check_integrity=false, or link "
+            "against xxHash and append the 8-byte footer yourself.");
+
     // Body
     size_t body_start = header_len + padding;
     std::memcpy(buf + body_start, data, body_len);
-
-    // Integrity footer (XXH3 not included — caller can append externally)
-    // For a fully self-contained implementation, integrate xxHash C header.
 }
 
 // ---------------------------------------------------------------------------

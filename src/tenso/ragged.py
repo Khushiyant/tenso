@@ -74,12 +74,10 @@ class StringTensor:
         return self._data[start:end].decode("utf-8")
 
     def to_list(self) -> List[str]:
-        result = []
-        for i in range(self._count):
-            start = int(self._offsets[i])
-            end = int(self._offsets[i + 1])
-            result.append(self._data[start:end].decode("utf-8"))
-        return result
+        return [
+            self._data[int(self._offsets[i]):int(self._offsets[i + 1])].decode("utf-8")
+            for i in range(self._count)
+        ]
 
     @property
     def nbytes(self) -> int:
@@ -132,7 +130,6 @@ class StringTensor:
         if magic != _MAGIC:
             raise ValueError("Invalid tenso packet")
 
-        flags_byte = mv[5]
         count = struct.unpack("<I", mv[8:12])[0]
 
         header_len = 12
@@ -225,12 +222,10 @@ class RaggedArray:
         return self._offsets
 
     def to_list(self) -> List[np.ndarray]:
-        result = []
-        for i in range(self._count):
-            start = int(self._offsets[i])
-            end = int(self._offsets[i + 1])
-            result.append(self._flat[start:end].copy())
-        return result
+        return [
+            self._flat[int(self._offsets[i]):int(self._offsets[i + 1])].copy()
+            for i in range(self._count)
+        ]
 
     def dumps(self, check_integrity: bool = False) -> memoryview:
         """Serialize to a Tenso packet using bundle format internally."""
@@ -250,12 +245,23 @@ class RaggedArray:
             from .core import loads as core_loads
             data = core_loads(data)
 
-        if not isinstance(data, dict) or "__ragged_offsets__" not in data:
+        if "__ragged_offsets__" not in data:
             raise ValueError("Not a valid RaggedArray packet")
 
         offsets = np.asarray(data["__ragged_offsets__"], dtype=np.uint64)
         flat = np.asarray(data["__ragged_flat__"])
         count = int(data["__ragged_count__"][0])
+
+        if len(offsets) != count + 1:
+            raise ValueError(
+                f"Offsets length {len(offsets)} != count+1 ({count + 1})"
+            )
+        if len(flat) > 0 and int(offsets[-1]) != len(flat):
+            raise ValueError(
+                f"Last offset {int(offsets[-1])} != flat length {len(flat)}"
+            )
+        if not np.all(np.diff(offsets.astype(np.int64)) >= 0):
+            raise ValueError("Offsets are not monotonically non-decreasing")
 
         obj = object.__new__(cls)
         obj._offsets = offsets

@@ -18,9 +18,13 @@ Example::
     run(app, workers=4)
 """
 
-import multiprocessing
+import asyncio
+import inspect
+import logging
 import os
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger("tenso.serve")
 
 
 def _detect_workers() -> int:
@@ -84,9 +88,15 @@ class TensoApp:
             from fastapi import Request
             from .fastapi import TensoResponse, get_tenso_data
 
+            is_async = asyncio.iscoroutinefunction(func)
+
             async def endpoint_handler(request: Request) -> TensoResponse:
                 tensor = await get_tenso_data(request)
-                result = func(tensor)
+                if is_async:
+                    result = await func(tensor)
+                else:
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(None, func, tensor)
                 return TensoResponse(
                     result,
                     check_integrity=integrity,
@@ -217,5 +227,5 @@ def run_grpc(
     )
     server.add_insecure_port(f"[::]:{port}")
     server.start()
-    print(f"Tenso gRPC server started on port {port} with {max_workers} workers")
+    logger.info("Tenso gRPC server started on port %d with %d workers", port, max_workers)
     server.wait_for_termination()
