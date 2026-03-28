@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.20.1 (2026-03-28)
+
+### Bug Fixes
+
+- Improve integrity checks and optimize data handling in various modules
+  ([`41468b3`](https://github.com/Khushiyant/tenso/commit/41468b38b989684311aef505a5a6face48e861be))
+
+
 ## v0.20.0 (2026-03-28)
 
 ### Documentation
