@@ -1,6 +1,30 @@
 # CHANGELOG
 
 
+## v0.20.0 (2026-03-28)
+
+### Documentation
+
+- Update README with Star History and installation
+  ([`d77783c`](https://github.com/Khushiyant/tenso/commit/d77783cc356e508a0be1631926ed0d850dd0bdbe))
+
+Added Star History section and installation instructions.
+
+### Features
+
+- Add StringTensor and RaggedArray support for efficient serialization
+  ([`0b466e8`](https://github.com/Khushiyant/tenso/commit/0b466e86d9a79b3d14de160539fe3e5e4f78db7d))
+
+- Introduced StringTensor for variable-length string batches, enabling compact serialization without
+  padding. - Added RaggedArray for storing jagged arrays, facilitating dynamic batching in LLM
+  inference. - Enhanced TensoCache with robust mutex support for improved cross-process safety. -
+  Implemented TensoFastAPIClient for seamless interaction with Tenso-powered FastAPI endpoints. -
+  Created TensoApp for easy server setup with FastAPI, including health check and optimized worker
+  detection. - Updated TensoShm to support fallback serialization methods and improved memory
+  estimation for shared memory. - Added GPU Direct Storage abstraction for efficient data transfer
+  to GPU memory.
+
+
 ## v0.19.4 (2026-02-14)
 
 ### Bug Fixes
