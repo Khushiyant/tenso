@@ -8,9 +8,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
@@ -30,21 +32,56 @@ jobs:
       run: uv pip install grpcio-tools --system
 
     - name: Generate gRPC code
+      shell: bash
       run: |
         python -m grpc_tools.protoc -Isrc/tenso/grpc \
               --python_out=src/tenso/grpc \
               --grpc_python_out=src/tenso/grpc \
               src/tenso/grpc/tenso_msg.proto
-        # Fix relative import for python 3
-        sed -i 's/^import tenso_msg_pb2/from . import tenso_msg_pb2/' src/tenso/grpc/tenso_msg_pb2_grpc.py
-              
+        # Fix relative import for python 3 (cross-platform sed)
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          sed -i '' 's/^import tenso_msg_pb2/from . import tenso_msg_pb2/' src/tenso/grpc/tenso_msg_pb2_grpc.py
+        else
+          sed -i 's/^import tenso_msg_pb2/from . import tenso_msg_pb2/' src/tenso/grpc/tenso_msg_pb2_grpc.py
+        fi
+
     - name: Install dependencies
-      # Installs the package in editable mode along with 'dev' dependencies
-      # defined in your pyproject.toml (pytest, pyarrow, safetensors, etc.)
       run: |
         uv pip install --system -e ".[dev]"
         uv pip install --system pytest
 
     - name: Run tests
-      run: |
-        pytest -v
+      run: pytest -v
+
+  rust-lints:
+    name: Rust fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  fuzz-smoke:
+    name: Fuzz smoke (parse_header, 30s)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run parse_header fuzz target (30s)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run parse_header -- -max_total_time=30

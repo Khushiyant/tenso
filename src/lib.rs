@@ -11,8 +11,23 @@ use std::os::windows::io::FromRawHandle;
 use std::mem::ManuallyDrop;
 use std::io::{self, Write, Read};
 use std::fs::File;
-use lz4_flex::{compress as lz4_compress, decompress as lz4_decompress};
+use lz4_flex::decompress as lz4_decompress;
 use lz4_flex::frame::{FrameEncoder, FrameDecoder};
+
+/// Compress `data` into an LZ4 *frame* (matching Python's `lz4.frame`).
+///
+/// The Tenso wire format mandates the LZ4 frame format (magic
+/// `04 22 4D 18`). An earlier version of this codepath used the raw
+/// LZ4 block format, which Python readers cannot decompress.
+fn lz4_compress_frame(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() / 2 + 32);
+    {
+        let mut encoder = FrameEncoder::new(&mut out);
+        encoder.write_all(data)?;
+        encoder.finish()?;
+    }
+    Ok(out)
+}
 
 // -----------------------------------------------------------------------------
 // DType Definition
@@ -129,20 +144,12 @@ impl DType {
 // -----------------------------------------------------------------------------
 
 fn compute_integrity_hash(data: &[u8]) -> u64 {
-    const PARALLEL_THRESHOLD: usize = 1024 * 1024; // 1MB
-    if data.len() < PARALLEL_THRESHOLD {
-        return xxh3_64(data);
-    }
-    
-    // Parallel Merkle-ish hash
-    let hashes: Vec<u8> = data.par_chunks(PARALLEL_THRESHOLD)
-        .map(|chunk| xxh3_64(chunk))
-        .collect::<Vec<u64>>()
-        .into_iter()
-        .flat_map(|h| h.to_le_bytes())
-        .collect();
-        
-    xxh3_64(&hashes)
+    // Single-pass XXH3-64 over the whole body. Must match Python's
+    // `xxhash.xxh3_64_intdigest` byte-for-byte regardless of size — a
+    // previous version of this function switched to a parallel Merkle
+    // hash above 1 MiB, which silently broke cross-implementation
+    // integrity verification for any tensor larger than that.
+    xxh3_64(data)
 }
 
 struct WrapperWriter<W> {
@@ -323,7 +330,8 @@ fn write_dense_to_slice(
     let uncompressed_len = u8_slice.len();
 
     let (compressed_data, body_len, flags_compression) = if compress {
-         let data = lz4_compress(u8_slice);
+         let data = lz4_compress_frame(u8_slice)
+             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("LZ4 frame encode failed: {}", e)))?;
          let len = data.len();
          (Some(data), len, 4u16)
     } else {
@@ -1293,6 +1301,72 @@ fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(shm_mutex_size, m)?)?;
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Fuzzing shims (only compiled when `--cfg fuzzing` is set, e.g. by cargo-fuzz)
+//
+// These expose a minimal byte-in / Result-out API for the otherwise-private
+// header parser so that fuzz targets in `fuzz/` can drive it without pulling
+// in PyO3. They MUST NOT be used by production code or tests.
+// -----------------------------------------------------------------------------
+
+#[cfg(fuzzing)]
+pub mod fuzz_api {
+    use super::{parse_packet_header_raw, HeaderError, HEADER_BASE_V4};
+
+    /// Result of a successful header + shape parse.
+    #[derive(Debug)]
+    pub struct ParsedShape {
+        pub version: u8,
+        pub flags: u16,
+        pub dtype_code: u8,
+        pub ndim: usize,
+        pub base_size: usize,
+        pub shape: Vec<usize>,
+    }
+
+    /// Pure-Rust wrapper around `parse_packet_header_raw` for fuzzing.
+    pub fn fuzz_parse_header(bytes: &[u8]) -> Result<(u16, u8, usize, usize), HeaderError> {
+        let h = parse_packet_header_raw(bytes)?;
+        Ok((h.flags, h.dtype_code, h.ndim, h.base_size))
+    }
+
+    /// Parse header + per-dim shape entries (the dense pre-body decode that
+    /// `get_packet_info_rs` and `deserialize_impl` both share). Mirrors the
+    /// Python-free portion of the dense decode path.
+    ///
+    /// TODO(fuzz): the rest of `deserialize_impl` (LZ4 decode, integrity check,
+    /// numpy buffer hand-off) is locked behind PyO3 and cannot run without an
+    /// initialized Python interpreter. A future iteration could split the
+    /// pre-Python validation logic into a pure-Rust helper and fuzz that too.
+    pub fn fuzz_parse_header_and_shape(bytes: &[u8]) -> Result<ParsedShape, HeaderError> {
+        let h = parse_packet_header_raw(bytes)?;
+        let shape_end = h.base_size + (h.ndim * 4);
+        if bytes.len() < shape_end {
+            return Err(HeaderError::TooShort);
+        }
+        let mut shape = Vec::with_capacity(h.ndim);
+        let mut cursor = h.base_size;
+        for _ in 0..h.ndim {
+            let dim_bytes: [u8; 4] = bytes[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| HeaderError::TooShort)?;
+            shape.push(u32::from_le_bytes(dim_bytes) as usize);
+            cursor += 4;
+        }
+        Ok(ParsedShape {
+            version: bytes[4],
+            flags: h.flags,
+            dtype_code: h.dtype_code,
+            ndim: h.ndim,
+            base_size: h.base_size,
+            shape,
+        })
+    }
+
+    /// Re-export the header base size so fuzz targets can sanity-check offsets.
+    pub const HEADER_BASE_V4_PUB: usize = HEADER_BASE_V4;
 }
 
 #[cfg(test)]

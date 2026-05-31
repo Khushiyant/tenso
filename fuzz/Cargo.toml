@@ -1,0 +1,40 @@
+[package]
+name = "tenso-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Pull in the tenso-rs rlib *without* the `extension-module` feature so we
+# don't try to link against a Python interpreter at fuzz time. The path
+# dependency is intentionally local; this crate is not published.
+[dependencies.tenso-rs]
+path = ".."
+default-features = false
+
+# cargo-fuzz sets `--cfg fuzzing` when it invokes rustc, which gates the
+# `fuzz_api` module in `src/lib.rs`. No extra flags are required here.
+
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "loads_dense"
+path = "fuzz_targets/loads_dense.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz default profile: ship debug-assertions ON so panics surface,
+# but keep optimizations for throughput.
+[profile.release]
+debug = 1
