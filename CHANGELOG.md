@@ -1,6 +1,34 @@
 # CHANGELOG
 
 
+## v0.22.0 (2026-05-31)
+
+### Features
+
+- Cross-impl correctness fixes, conformance/property/fuzz harness, CI hardening
+  ([`0971e3f`](https://github.com/Khushiyant/tenso/commit/0971e3f1830e4d310f7c6af909edf693568ae24c))
+
+Protocol correctness - Rust integrity hash: switched compute_integrity_hash to always use
+  single-pass XXH3_64. The earlier parallel Merkle-of-XXH3 above 1 MiB silently disagreed with
+  Python's xxhash, breaking cross-language verification on large tensors. - LZ4 framing: in-memory
+  Rust writer now emits LZ4 frame format (matching Python's lz4.frame). The block-format path is
+  gone; the reader keeps an auto-detect for backward compatibility.
+
+Testing - tests/fixtures/: seven binary .tenso fixtures locking the wire format. -
+  tests/test_conformance.py: round-trip + SHA-256-pinned drift detection. - tests/test_property.py:
+  Hypothesis round-trip across dtypes, integrity, bundles, and StringTensor.
+
+Fuzzing - fuzz/ (cargo-fuzz): parse_header and loads_dense targets behind a #[cfg(fuzzing)] shim —
+  production surface unchanged. - pyfuzz/ (atheris): fuzz_loads and fuzz_get_packet_info with 5 seed
+  packets.
+
+CI / build - macOS added to the test matrix. - Dedicated rust-lints job: cargo fmt --check and
+  clippy -D warnings. - 30s parse_header fuzz smoke on nightly Rust per PR. - Cargo: check-cfg gate
+  for cfg(fuzzing) so the shim doesn't warn. - pyproject: hypothesis added to dev extras.
+
+Docs - SECURITY.md (vulnerability reporting) and CONTRIBUTING.md (build/test).
+
+
 ## v0.21.0 (2026-05-31)
 
 ### Features
