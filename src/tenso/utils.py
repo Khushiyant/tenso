@@ -1,7 +1,8 @@
 import ctypes
 import struct
 import numpy as np
-from .config import _MAGIC, _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_INTEGRITY
+from .config import _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_INTEGRITY
+from .core import _parse_header
 
 # --- RUST INTEGRATION ---
 try:
@@ -97,16 +98,13 @@ def get_packet_info(data: bytes) -> dict:
             raise e
 
     # 2. Slow Path (Python Fallback)
-    if len(data) < 8:
-        raise ValueError("Packet too short")
-    magic, ver, flags, dtype_code, ndim = struct.unpack("<4sBBBB", data[:8])
-    if magic != _MAGIC:
-        raise ValueError("Invalid tenso packet")
+    mv = memoryview(data)
+    ver, flags, dtype_code, ndim, header_base = _parse_header(mv)
 
-    shape_end = 8 + (ndim * 4)
-    if len(data) < shape_end:
+    shape_end = header_base + (ndim * 4)
+    if len(mv) < shape_end:
         raise ValueError("Packet too short to contain shape")
-    shape = struct.unpack(f"<{ndim}I", data[8:shape_end])
+    shape = struct.unpack(f"<{ndim}I", mv[header_base:shape_end])
     dtype = _REV_DTYPE_MAP.get(dtype_code, None)
 
     info = {

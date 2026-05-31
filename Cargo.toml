@@ -5,11 +5,15 @@ edition = "2021"
 
 [lib]
 name = "tenso_rs"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 # PyO3 is the bridge between Rust and Python
-pyo3 = { version = "0.22", features = ["extension-module", "gil-refs", "abi3-py311"] }
+pyo3 = { version = "0.22", features = ["gil-refs", "abi3-py311"] }
 xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
 rayon = "1.8"
 lz4_flex = "0.11"

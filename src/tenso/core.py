@@ -17,6 +17,8 @@ import xxhash
 from .config import (
     _ALIGNMENT,
     _DTYPE_MAP,
+    _HEADER_BASE_V3,
+    _HEADER_BASE_V4,
     _MAGIC,
     _REV_DTYPE_MAP,
     _VERSION,
@@ -91,7 +93,7 @@ def _serialize_quantized(
     num_scales = len(qt.scales)
     quant_meta_len = 1 + 4 + 4 + num_scales * 4 + num_scales * 4
 
-    header_len = 8 + ndim * 4 + quant_meta_len
+    header_len = _HEADER_BASE_V4 + ndim * 4 + quant_meta_len
     if use_custom_align:
         header_len += 1
 
@@ -104,11 +106,11 @@ def _serialize_quantized(
 
     buffer = bytearray(total_len)
 
-    # Header
-    struct.pack_into("<4sBBBB", buffer, 0, _MAGIC, _VERSION, flags, qt.dtype_code, ndim)
-    struct.pack_into(f"<{ndim}I", buffer, 8, *shape)
+    # v4 Header: magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1)
+    struct.pack_into("<4sBHBBB", buffer, 0, _MAGIC, _VERSION, flags, qt.dtype_code, ndim, 0)
+    struct.pack_into(f"<{ndim}I", buffer, _HEADER_BASE_V4, *shape)
 
-    cursor = 8 + ndim * 4
+    cursor = _HEADER_BASE_V4 + ndim * 4
 
     # Quant metadata
     buffer[cursor] = qt.quant_scheme
@@ -148,8 +150,9 @@ def _deserialize_quantized(
     mv: memoryview, flags: int, dtype_code: int, ndim: int, copy: bool
 ) -> "QuantizedTensor":
     """Deserialize a QuantizedTensor from a Tenso packet memoryview."""
-    shape_end = 8 + ndim * 4
-    shape = struct.unpack(f"<{ndim}I", mv[8:shape_end])
+    base = _HEADER_BASE_V4 if mv[4] >= 4 else _HEADER_BASE_V3
+    shape_end = base + ndim * 4
+    shape = struct.unpack(f"<{ndim}I", mv[base:shape_end])
     num_elements = int(np.prod(shape))
 
     cursor = shape_end
@@ -216,7 +219,7 @@ def _deserialize_quantized(
 
 
 def _read_stream_quantized(
-    source, flags: int, dtype_code: int, ndim: int
+    source, flags: int, dtype_code: int, ndim: int, header_size: int = _HEADER_BASE_V4
 ) -> "QuantizedTensor":
     """Read a quantized tensor from a stream."""
     # Read shape
@@ -255,7 +258,7 @@ def _read_stream_quantized(
     zero_points = np.frombuffer(sz_bytes[num_scales * 4 :], dtype=np.float32).copy()
 
     # Current position for alignment calculation
-    current_pos = 8 + shape_len + 9 + sz_len
+    current_pos = header_size + shape_len + 9 + sz_len
 
     # Alignment
     use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
@@ -376,6 +379,96 @@ def _read_into_buffer(
     return True
 
 
+def _parse_header(mv: memoryview) -> "tuple[int, int, int, int, int]":
+    """
+    Parse a Tenso packet header from a memoryview.
+
+    Returns ``(version, flags, dtype_code, ndim, header_size)``. Supports
+    v3 (8-byte header, ``flags_u8``) and v4 (10-byte header, ``flags_u16``).
+
+    Raises
+    ------
+    ValueError
+        If the buffer is too short, the magic is wrong, or the version is
+        unsupported.
+    """
+    if len(mv) < _HEADER_BASE_V3:
+        raise ValueError("Packet too short")
+    if bytes(mv[:4]) != _MAGIC:
+        raise ValueError("Invalid tenso packet")
+
+    ver = mv[4]
+    if ver == 4:
+        if len(mv) < _HEADER_BASE_V4:
+            raise ValueError("Packet too short for v4 header")
+        flags = struct.unpack_from("<H", mv, 5)[0]
+        return ver, flags, mv[7], mv[8], _HEADER_BASE_V4
+    if ver == 3:
+        return ver, mv[5], mv[6], mv[7], _HEADER_BASE_V3
+    raise ValueError(f"Unsupported protocol version: {ver}")
+
+
+def _read_packet_header(source: Any) -> Optional["tuple[int, int, int, int, int]"]:
+    """
+    Read a Tenso packet header from a synchronous stream.
+
+    Returns ``(version, flags, dtype_code, ndim, header_size)``, or ``None``
+    if the stream is at EOF before any byte is read. Reads the additional
+    2 bytes for v4 packets transparently.
+    """
+    header = bytearray(_HEADER_BASE_V3)
+    try:
+        if not _read_into_buffer(source, header):
+            return None
+    except EOFError as e:
+        raise EOFError(f"Stream ended during header read. {e}") from None
+
+    if header[:4] != _MAGIC:
+        raise ValueError("Invalid tenso packet")
+
+    ver = header[4]
+    if ver == 4:
+        extra = bytearray(_HEADER_BASE_V4 - _HEADER_BASE_V3)
+        try:
+            if not _read_into_buffer(source, extra):
+                raise EOFError("Stream ended during v4 header read")
+        except EOFError as e:
+            raise EOFError(f"Stream ended during v4 header read. {e}") from None
+        full = bytes(header) + bytes(extra)
+        return ver, struct.unpack_from("<H", full, 5)[0], full[7], full[8], _HEADER_BASE_V4
+    if ver == 3:
+        return ver, header[5], header[6], header[7], _HEADER_BASE_V3
+    raise ValueError(f"Unsupported protocol version: {ver}")
+
+
+async def _aread_packet_header(reader) -> Optional["tuple[int, int, int, int, int]"]:
+    """
+    Async counterpart to :func:`_read_packet_header`.
+
+    Returns ``None`` on clean stream end (no bytes available); otherwise
+    returns ``(version, flags, dtype_code, ndim, header_size)``.
+    """
+    import asyncio
+    try:
+        header = await reader.readexactly(_HEADER_BASE_V3)
+    except asyncio.IncompleteReadError as e:
+        if len(e.partial) == 0:
+            return None
+        raise
+
+    if header[:4] != _MAGIC:
+        raise ValueError("Invalid tenso packet")
+
+    ver = header[4]
+    if ver == 4:
+        extra = await reader.readexactly(_HEADER_BASE_V4 - _HEADER_BASE_V3)
+        full = header + extra
+        return ver, struct.unpack_from("<H", full, 5)[0], full[7], full[8], _HEADER_BASE_V4
+    if ver == 3:
+        return ver, header[5], header[6], header[7], _HEADER_BASE_V3
+    raise ValueError(f"Unsupported protocol version: {ver}")
+
+
 def read_stream(source: Any) -> Optional[Any]:
     """
     Read and deserialize an object from a stream source with DoS protection.
@@ -405,17 +498,10 @@ def read_stream(source: Any) -> Optional[Any]:
     ImportError
         If scipy is missing during sparse matrix deserialization.
     """
-    # 1. Read Header
-    header = bytearray(8)
-    try:
-        if not _read_into_buffer(source, header):
-            return None
-    except EOFError as e:
-        raise EOFError(f"Stream ended during header read. {e}") from None
-
-    magic, ver, flags, dtype_code, ndim = struct.unpack("<4sBBBB", header)
-    if magic != _MAGIC:
-        raise ValueError("Invalid tenso packet")
+    parsed = _read_packet_header(source)
+    if parsed is None:
+        return None
+    _ver, flags, dtype_code, ndim, header_size = parsed
 
     # 2. Handle Bundle (Dictionaries)
     if flags & FLAG_BUNDLE:
@@ -495,7 +581,7 @@ def read_stream(source: Any) -> Optional[Any]:
 
     # 3.5 Handle Quantized Types
     if dtype_code in _QUANTIZED_CODES:
-        return _read_stream_quantized(source, flags, dtype_code, ndim)
+        return _read_stream_quantized(source, flags, dtype_code, ndim, header_size)
 
     # 4. Dense Array Logic (DoS Protection & Buffer Allocation)
     if ndim > MAX_NDIM:
@@ -521,7 +607,7 @@ def read_stream(source: Any) -> Optional[Any]:
         raise ValueError(f"Unsupported dtype code: {dtype_code}")
 
     # Read Body & Padding
-    current_pos = 8 + shape_len
+    current_pos = header_size + shape_len
     alignment = _ALIGNMENT
     use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
 
@@ -605,12 +691,12 @@ def iter_dumps(
     ndim = len(shape)
 
     flags = FLAG_ALIGNED | (FLAG_INTEGRITY if check_integrity else 0)
-    header = struct.pack("<4sBBBB", _MAGIC, _VERSION, flags, dtype_code, ndim)
+    header = struct.pack("<4sBHBBB", _MAGIC, _VERSION, flags, dtype_code, ndim, 0)
     shape_block = struct.pack(f"<{ndim}I", *shape)
     yield header
     yield shape_block
 
-    current_len = 8 + (ndim * 4)
+    current_len = _HEADER_BASE_V4 + (ndim * 4)
     padding_len = (_ALIGNMENT - (current_len % _ALIGNMENT)) % _ALIGNMENT
     if padding_len > 0:
         yield b"\x00" * padding_len
@@ -722,7 +808,7 @@ def dumps(
     if isinstance(tensor, dict):
         parts = []
         header = struct.pack(
-            "<4sBBBB", _MAGIC, _VERSION, FLAG_BUNDLE, 0, min(len(tensor), 255)
+            "<4sBHBBB", _MAGIC, _VERSION, FLAG_BUNDLE, 0, min(len(tensor), 255), 0
         )
         parts.append(header)
         for key, value in tensor.items():
@@ -746,7 +832,7 @@ def dumps(
             if fmt == "coo"
             else [tensor.data, tensor.indices, tensor.indptr]
         )
-        header = struct.pack("<4sBBBB", _MAGIC, _VERSION, flag, 0, len(tensor.shape))
+        header = struct.pack("<4sBHBBB", _MAGIC, _VERSION, flag, 0, len(tensor.shape), 0)
         shape_block = struct.pack(f"<{len(tensor.shape)}I", *tensor.shape)
 
         sub_pkts = []
@@ -788,22 +874,22 @@ def dumps(
         body = lz4.frame.compress(body)
         flags |= FLAG_COMPRESSION
 
-    current_len = 8 + (ndim * 4)
+    current_len = _HEADER_BASE_V4 + (ndim * 4)
     if use_custom_align:
         current_len += 1
-        
+
     padding_len = 0
     remainder = current_len % alignment
     if remainder != 0:
         padding_len = alignment - remainder
-        
+
     total_len = current_len + padding_len + len(body) + (8 if check_integrity else 0)
 
     buffer = bytearray(total_len)
-    struct.pack_into("<4sBBBB", buffer, 0, _MAGIC, _VERSION, flags, dtype_code, ndim)
-    struct.pack_into(f"<{ndim}I", buffer, 8, *shape)
-    
-    cursor = 8 + (ndim * 4)
+    struct.pack_into("<4sBHBBB", buffer, 0, _MAGIC, _VERSION, flags, dtype_code, ndim, 0)
+    struct.pack_into(f"<{ndim}I", buffer, _HEADER_BASE_V4, *shape)
+
+    cursor = _HEADER_BASE_V4 + (ndim * 4)
     if use_custom_align:
         buffer[cursor] = alignment.bit_length() - 1
         cursor += 1
@@ -850,16 +936,12 @@ def loads(
              pass
 
     mv = memoryview(data)
-    if len(mv) < 8:
-        raise ValueError("Packet too short")
-    magic, ver, flags, dtype_code, ndim = struct.unpack("<4sBBBB", mv[:8])
-    if magic != _MAGIC:
-        raise ValueError("Invalid tenso packet")
+    _ver, flags, dtype_code, ndim, header_base = _parse_header(mv)
 
     # 1. Bundle Deserialization
     if flags & FLAG_BUNDLE:
         res = {}
-        offset = 8
+        offset = header_base
         for _ in range(ndim):
             k_len = struct.unpack("<I", mv[offset : offset + 4])[0]
             offset += 4
@@ -878,8 +960,8 @@ def loads(
         except ImportError:
             raise ImportError("scipy is required for sparse deserialization.")
 
-        shape_end = 8 + (ndim * 4)
-        shape = struct.unpack(f"<{ndim}I", mv[8:shape_end])
+        shape_end = header_base + (ndim * 4)
+        shape = struct.unpack(f"<{ndim}I", mv[header_base:shape_end])
         offset = shape_end
         sub_objs = []
         for _ in range(3):
@@ -903,8 +985,8 @@ def loads(
     if ndim > MAX_NDIM:
         raise ValueError(f"Packet exceeds maximum dimensions ({ndim} > {MAX_NDIM})")
 
-    shape_end = 8 + (ndim * 4)
-    shape = struct.unpack(f"<{ndim}I", mv[8:shape_end])
+    shape_end = header_base + (ndim * 4)
+    shape = struct.unpack(f"<{ndim}I", mv[header_base:shape_end])
     num_elements = int(np.prod(shape))
     if num_elements > MAX_ELEMENTS:
         raise ValueError("Packet exceeds maximum elements")

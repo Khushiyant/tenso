@@ -5,31 +5,32 @@ Provides efficient serialization of variable-length string batches
 and ragged/jagged arrays without padding, suitable for NLP pipelines
 and dynamic batching in LLM inference.
 
-String Tensor Format:
-    Header (8 bytes) + offsets array (n+1 uint64) + packed UTF-8 data
+String Tensor Format (v4 protocol):
+    Header (10 bytes) + shape[count] (4 bytes) + padding to 64
+    + offsets array (count+1 uint64) + packed UTF-8 data
+    + optional 8-byte XXH3 integrity footer
 
 Ragged Array Format:
-    Header (8 bytes) + shape_0 (4 bytes) + offsets (shape_0+1 uint64)
-    + flat values as dense Tenso packet
+    Uses the standard bundle packet (header + dict of offsets/flat/count).
 """
 
 import struct
-from typing import List, Optional, Sequence, Union
+from typing import List, Sequence, Union
 
 import numpy as np
 import xxhash
 
 from .config import (
     _ALIGNMENT,
+    _HEADER_BASE_V4,
     _MAGIC,
     _VERSION,
-    DTYPE_BYTES,
     DTYPE_STRING,
     FLAG_ALIGNED,
     FLAG_INTEGRITY,
-    FLAG_RAGGED,
     FLAG_STRING,
 )
+from .core import _parse_header
 
 
 class StringTensor:
@@ -88,7 +89,7 @@ class StringTensor:
         return (self._count,)
 
     def dumps(self, check_integrity: bool = False) -> memoryview:
-        """Serialize to a Tenso packet."""
+        """Serialize to a Tenso v4 packet."""
         offsets_bytes = self._offsets.tobytes()
         data_bytes = self._data
 
@@ -96,19 +97,20 @@ class StringTensor:
         if check_integrity:
             flags |= FLAG_INTEGRITY
 
-        # Header(8) + ndim=1 shape(4) + offsets + data
-        header_len = 8 + 4  # 8-byte header + 1 dim (4 bytes)
+        # v4 header(10) + shape[1 dim](4) + padding + body
+        header_len = _HEADER_BASE_V4 + 4
         padding_len = (_ALIGNMENT - (header_len % _ALIGNMENT)) % _ALIGNMENT
         body = offsets_bytes + data_bytes
         footer_len = 8 if check_integrity else 0
         total = header_len + padding_len + len(body) + footer_len
 
         buf = bytearray(total)
-        # Encode flags as two bytes if >255, using high byte in dtype_code position
-        flags_lo = flags & 0xFF
-        flags_hi = (flags >> 8) & 0xFF
-        struct.pack_into("<4sBBBB", buf, 0, _MAGIC, _VERSION, flags_lo, DTYPE_STRING | (flags_hi << 4), 1)
-        struct.pack_into("<I", buf, 8, self._count)
+        # magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1)
+        struct.pack_into(
+            "<4sBHBBB", buf, 0,
+            _MAGIC, _VERSION, flags, DTYPE_STRING, 1, 0,
+        )
+        struct.pack_into("<I", buf, _HEADER_BASE_V4, self._count)
 
         body_start = header_len + padding_len
         buf[body_start:body_start + len(body)] = body
@@ -121,26 +123,41 @@ class StringTensor:
 
     @classmethod
     def loads(cls, data: Union[bytes, bytearray, memoryview]) -> "StringTensor":
-        """Deserialize from a Tenso packet."""
+        """Deserialize a StringTensor packet."""
         mv = memoryview(data)
-        if len(mv) < 12:
-            raise ValueError("StringTensor packet too short")
+        _ver, flags, dtype_code, ndim, header_base = _parse_header(mv)
 
-        magic = bytes(mv[0:4])
-        if magic != _MAGIC:
-            raise ValueError("Invalid tenso packet")
+        if not (flags & FLAG_STRING) or dtype_code != DTYPE_STRING or ndim != 1:
+            raise ValueError("Not a StringTensor packet")
 
-        count = struct.unpack("<I", mv[8:12])[0]
+        shape_end = header_base + 4
+        if len(mv) < shape_end:
+            raise ValueError("StringTensor packet truncated (shape)")
+        count = struct.unpack_from("<I", mv, header_base)[0]
 
-        header_len = 12
-        padding_len = (_ALIGNMENT - (header_len % _ALIGNMENT)) % _ALIGNMENT
-        body_start = header_len + padding_len
+        padding_len = (_ALIGNMENT - (shape_end % _ALIGNMENT)) % _ALIGNMENT
+        body_start = shape_end + padding_len
 
         offsets_size = (count + 1) * 8
-        offsets = np.frombuffer(mv[body_start:body_start + offsets_size], dtype=np.uint64).copy()
+        if len(mv) < body_start + offsets_size:
+            raise ValueError("StringTensor packet truncated (offsets)")
+        offsets = np.frombuffer(
+            mv[body_start:body_start + offsets_size], dtype=np.uint64
+        ).copy()
         data_start = body_start + offsets_size
         total_str_bytes = int(offsets[-1])
+        if len(mv) < data_start + total_str_bytes:
+            raise ValueError("StringTensor packet truncated (data)")
         raw_data = bytes(mv[data_start:data_start + total_str_bytes])
+
+        if flags & FLAG_INTEGRITY:
+            body_end = data_start + total_str_bytes
+            if len(mv) < body_end + 8:
+                raise ValueError("StringTensor packet truncated (integrity footer)")
+            expected = struct.unpack_from("<Q", mv, body_end)[0]
+            body_view = mv[body_start:body_end]
+            if xxhash.xxh3_64_intdigest(body_view) != expected:
+                raise ValueError("Integrity check failed: XXH3 mismatch")
 
         obj = object.__new__(cls)
         obj._offsets = offsets

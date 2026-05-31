@@ -111,10 +111,10 @@ class TestGPU:
         data = np.random.rand(10, 10).astype(np.float32)
         stream = self._create_stream(data)
 
-        # Calculate expected read size: Total Packet - Header(8) - Shape(8)
-        # Note: Shape is 2 dims * 4 bytes = 8 bytes.
+        # Calculate expected read size: Total Packet - Header - Shape
+        # v4 header is 10 bytes, shape is 2 dims * 4 bytes = 8 bytes.
         packet_size = stream.getbuffer().nbytes
-        expected_body_size = packet_size - 16
+        expected_body_size = packet_size - 18
 
         # We mock 'tenso.gpu.torch' to capture calls
         with (

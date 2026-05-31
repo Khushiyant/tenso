@@ -81,6 +81,59 @@ def test_rust_sparse_dispatch_check():
         return
 
     sp = sparse.csr_matrix([[1]], dtype=np.float32)
-    
+
     with pytest.raises(ValueError, match="Alignment must be a power of two"):
         tenso.dumps(sp, alignment=3)
+
+
+def test_string_tensor_roundtrip():
+    """StringTensor packets use the v4 layout — round-trip via the dedicated API."""
+    from tenso import StringTensor
+
+    st = StringTensor(["hello", "world", "", "ñçÅ"])
+    packet = st.dumps()
+    restored = StringTensor.loads(packet)
+    assert restored.to_list() == ["hello", "world", "", "ñçÅ"]
+
+
+def test_string_tensor_packet_is_v4():
+    """The on-the-wire packet declares v4 with FLAG_STRING and dtype_code=DTYPE_STRING."""
+    from tenso import StringTensor
+    from tenso.config import DTYPE_STRING, FLAG_STRING
+
+    st = StringTensor(["a", "bb"])
+    packet = bytes(st.dumps())
+
+    assert packet[:4] == b"TNSO"
+    assert packet[4] == 4  # version
+    flags = struct.unpack_from("<H", packet, 5)[0]
+    assert flags & FLAG_STRING
+    assert packet[7] == DTYPE_STRING
+    assert packet[8] == 1  # ndim
+    assert packet[9] == 0  # reserved
+    # shape[0] == count
+    assert struct.unpack_from("<I", packet, 10)[0] == 2
+
+
+def test_string_tensor_integrity():
+    """The integrity footer is verified on read."""
+    from tenso import StringTensor
+
+    st = StringTensor(["alpha", "beta", "gamma"])
+    packet = bytearray(st.dumps(check_integrity=True))
+    restored = StringTensor.loads(bytes(packet))
+    assert restored.to_list() == ["alpha", "beta", "gamma"]
+
+    # Flip a byte inside the body to force a checksum mismatch.
+    packet[-9] ^= 0x01
+    with pytest.raises(ValueError, match="Integrity check failed"):
+        StringTensor.loads(bytes(packet))
+
+
+def test_string_tensor_rejects_non_string_packet():
+    """Passing a regular array packet to StringTensor.loads raises cleanly."""
+    from tenso import StringTensor
+
+    packet = tenso.dumps(np.zeros(4, dtype=np.float32))
+    with pytest.raises(ValueError, match="Not a StringTensor packet"):
+        StringTensor.loads(packet)

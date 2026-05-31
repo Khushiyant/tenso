@@ -48,6 +48,18 @@ def cache():
 
 
 @pytest.fixture
+def file_lock_cache(monkeypatch):
+    """TensoCache forced onto the fcntl file-lock fallback path."""
+    import tenso.cache as cache_mod
+    monkeypatch.setattr(cache_mod, "_HAS_ROBUST_MUTEX", False)
+    c = TensoCache("4MB")
+    assert not c._use_robust_mutex, "fixture failed to disable robust mutex"
+    yield c
+    c.close()
+    c.unlink()
+
+
+@pytest.fixture
 def small_cache():
     """Provide a very small cache for eviction tests."""
     c = TensoCache("64KB")
@@ -660,50 +672,40 @@ class TestFrameworkSupport:
 
 
 # ---------------------------------------------------------------------------
-# Spinlock
+# Locking
 # ---------------------------------------------------------------------------
 
-class TestSpinlock:
+class TestLocking:
     def test_acquire_release(self, cache):
-        """Basic spinlock cycle: acquire, verify lock word, release."""
-        buf = cache._shm.buf
-        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 0
-
+        """Basic lock cycle: acquire and release without error."""
         cache._shm_lock_acquire()
-        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 1
-        assert struct.unpack_from('<d', buf, _H_LOCK_TIME)[0] > 0
-
         cache._shm_lock_release()
-        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 0
-        assert struct.unpack_from('<d', buf, _H_LOCK_TIME)[0] == 0.0
 
-    def test_timeout(self, cache):
-        """Manually set lock word, verify TimeoutError."""
-        buf = cache._shm.buf
-        # Simulate a held lock with a recent timestamp
-        struct.pack_into('<I', buf, _H_LOCK, 1)
-        struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic())
+    def test_reentrant_via_context_manager(self, cache):
+        """Context manager properly acquires and releases."""
+        with cache._shm_locked():
+            pass  # Should not deadlock or error
 
-        with pytest.raises(TimeoutError, match="timed out"):
-            cache._shm_lock_acquire(timeout=0.2)
+    def test_file_lock_created(self, file_lock_cache):
+        """File-lock path creates a lock file alongside the SHM segment."""
+        import os
+        assert os.path.exists(file_lock_cache._lock_file_path)
 
-        # Cleanup
-        struct.pack_into('<I', buf, _H_LOCK, 0)
-        struct.pack_into('<d', buf, _H_LOCK_TIME, 0.0)
-
-    def test_stale_recovery(self, cache):
-        """Set lock with old timestamp, verify force-acquire."""
-        buf = cache._shm.buf
-        # Simulate a stale lock from a crashed process (very old timestamp)
-        struct.pack_into('<I', buf, _H_LOCK, 1)
-        struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic() - 60.0)
-
-        # Should force-acquire without timing out
-        cache._shm_lock_acquire(timeout=1.0)
-        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 1
-
-        cache._shm_lock_release()
-        assert struct.unpack_from('<I', buf, _H_LOCK)[0] == 0
+    def test_file_lock_timeout(self, file_lock_cache):
+        """A second handle on the same SHM times out when the first holds the lock."""
+        other = TensoCache(name=file_lock_cache.name, create=False)
+        # The second handle must also use the file lock to share the lock file.
+        other._init_file_lock()
+        other._use_robust_mutex = False
+        try:
+            file_lock_cache._shm_lock_acquire()
+            try:
+                with pytest.raises(TimeoutError, match="timed out"):
+                    other._shm_lock_acquire(timeout=0.2)
+            finally:
+                file_lock_cache._shm_lock_release()
+        finally:
+            other.close()
 
 
 # ---------------------------------------------------------------------------

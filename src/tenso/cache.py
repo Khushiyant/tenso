@@ -20,13 +20,22 @@ Memory Layout (single SHM segment):
     └──────────────────────────────────────────┘
 """
 
+import errno
+import os
 import struct
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from multiprocessing import shared_memory
 from typing import Optional
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
 
 import numpy as np
 
@@ -308,7 +317,11 @@ class TensoCache:
             self._max_entries = max_entries
             self._data_region_offset = data_region_offset
             self._data_region_end = pool_size
+            self._lock_fd = None
+            self._lock_file_path = None
             self._use_robust_mutex = self._init_robust_mutex()
+            if not self._use_robust_mutex:
+                self._init_file_lock()
 
         else:
             if name is None:
@@ -334,10 +347,14 @@ class TensoCache:
                 _POOL_HEADER_SIZE + entry_table_size, _DATA_ALIGNMENT
             )
             self._data_region_end = self._pool_size
+            self._lock_fd = None
+            self._lock_file_path = None
             # Attach to existing robust mutex if creator initialized one
             self._use_robust_mutex = (
                 _HAS_ROBUST_MUTEX and buf[_H_MUTEX_INIT] == 1
             )
+            if not self._use_robust_mutex:
+                self._init_file_lock()
 
     @property
     def name(self) -> str:
@@ -356,6 +373,46 @@ class TensoCache:
 
     def _write_header_u64(self, offset: int, value: int):
         struct.pack_into('<Q', self._shm.buf, offset, value)
+
+    # -- File-lock helpers (fallback when Rust mutex unavailable) --
+
+    def _init_file_lock(self):
+        """Open/create a lock file scoped to the current user."""
+        if not _HAS_FCNTL:
+            # No kernel locking available (Windows). Rely on the per-process
+            # threading.RLock — multi-process cache sharing is unsupported
+            # on this platform without the Rust robust mutex.
+            return
+        # Namespace by UID so users on a shared host can't collide on (or
+        # squat) each other's lock files.
+        uid = os.getuid()
+        filename = f".tenso_cache_{uid}_{self._name}.lock"
+        self._lock_file_path = os.path.join(tempfile.gettempdir(), filename)
+        self._lock_fd = os.open(self._lock_file_path, os.O_CREAT | os.O_RDWR, 0o600)
+
+    def _file_lock_acquire(self, timeout: float = 5.0):
+        """Acquire the file lock with a timeout (uses fcntl.flock on Unix)."""
+        if self._lock_fd is None:
+            return  # Single-process fallback: threading.RLock only
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError as e:
+                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"TensoCache: file lock acquisition timed out after {timeout}s"
+                    )
+                time.sleep(0.0001)
+
+    def _file_lock_release(self):
+        """Release the file lock."""
+        if self._lock_fd is None:
+            return
+        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
 
     # -- SHM locking (cross-process safety) --
     #
@@ -400,40 +457,10 @@ class TensoCache:
                 self._recover_pool_state()
             return
 
-        # --- Spinlock fallback ---
-        # WARNING: This path is NOT truly atomic. Two processes can both
-        # read lock_val==0 and both claim the lock. It exists only as a
-        # best-effort fallback when the Rust extension (which provides a
-        # real POSIX process-shared mutex) is not available. For production
-        # multi-process deployments, compile tenso with Rust support.
-        buf = self._shm.buf
-        deadline = time.monotonic() + timeout
-
-        while True:
-            lock_val = struct.unpack_from('<I', buf, _H_LOCK)[0]
-            if lock_val == 0:
-                struct.pack_into('<I', buf, _H_LOCK, 1)
-                struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic())
-                return
-
-            lock_time = struct.unpack_from('<d', buf, _H_LOCK_TIME)[0]
-            if lock_time != 0.0 and (lock_time < 0 or (time.monotonic() - lock_time) > self._STALE_LOCK_THRESHOLD):
-                print(
-                    f"TensoCache: force-acquiring stale SHM lock "
-                    f"(held for {time.monotonic() - lock_time:.1f}s, "
-                    f"likely crashed process)",
-                    file=sys.stderr,
-                )
-                struct.pack_into('<I', buf, _H_LOCK, 1)
-                struct.pack_into('<d', buf, _H_LOCK_TIME, time.monotonic())
-                return
-
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"TensoCache: SHM lock acquisition timed out after {timeout}s"
-                )
-
-            time.sleep(0.0001)  # 100μs spin
+        # --- File-lock fallback ---
+        # Uses OS-level file locking (fcntl.flock on Unix) which is
+        # kernel-guaranteed atomic and auto-released on process crash.
+        self._file_lock_acquire(timeout)
 
     def _shm_lock_release(self):
         """Release the SHM lock."""
@@ -441,9 +468,7 @@ class TensoCache:
             shm_mutex_unlock(self._shm.buf, _H_MUTEX)
             return
 
-        buf = self._shm.buf
-        struct.pack_into('<d', buf, _H_LOCK_TIME, 0.0)
-        struct.pack_into('<I', buf, _H_LOCK, 0)
+        self._file_lock_release()
 
     @contextmanager
     def _shm_locked(self):
@@ -1326,13 +1351,6 @@ class TensoCache:
         if not self._closed:
             self._closed = True
             try:
-                if not self._use_robust_mutex:
-                    lock_val = struct.unpack_from('<I', self._shm.buf, _H_LOCK)[0]
-                    if lock_val == 1:
-                        self._shm_lock_release()
-            except Exception:
-                pass
-            try:
                 self._shm.close()
             except BufferError:
                 # Zero-copy numpy views still reference the mmap.
@@ -1341,6 +1359,12 @@ class TensoCache:
                 self._shm._mmap = None
             except Exception:
                 pass
+            if self._lock_fd is not None:
+                try:
+                    os.close(self._lock_fd)
+                except OSError:
+                    pass
+                self._lock_fd = None
 
     def unlink(self):
         """Request destruction of the shared memory segment."""
@@ -1348,6 +1372,11 @@ class TensoCache:
             self._shm.unlink()
         except Exception:
             pass
+        if self._lock_file_path is not None:
+            try:
+                os.unlink(self._lock_file_path)
+            except OSError:
+                pass
 
     def __enter__(self):
         return self

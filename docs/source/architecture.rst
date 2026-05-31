@@ -60,6 +60,48 @@ Tenso automatically selects the optimal implementation:
     # Falls back to Python for compression
     packet_compressed = tenso.dumps(data, compress=True)
 
+Wire Protocol
+-------------
+
+Every Tenso packet starts with a fixed-size header followed by a shape block,
+optional padding, the body, and an optional 8-byte XXH3 footer.
+
+**v4 header (current, 10 bytes):**
+
+.. code-block:: text
+
+    offset  size  field
+    ------  ----  ----------------------------------------
+       0     4    magic  = b"TNSO"
+       4     1    version = 4
+       5     2    flags (u16, little-endian)
+       7     1    dtype_code
+       8     1    ndim
+       9     1    reserved (must be 0; ignored on read)
+
+**v3 header (legacy, 8 bytes):**
+
+.. code-block:: text
+
+    offset  size  field
+    ------  ----  ----------------------------------------
+       0     4    magic  = b"TNSO"
+       4     1    version = 3
+       5     1    flags (u8)
+       6     1    dtype_code
+       7     1    ndim
+
+The version bump from 3 to 4 widens ``flags`` from 8 to 16 bits to leave room
+for future feature flags. All other field semantics are unchanged.
+
+**Compatibility:**
+
+- Tenso ≥ 0.21 emits v4 packets and reads both v3 and v4.
+- Tenso ≤ 0.20 emits v3 packets and only reads v3 — it cannot read v4.
+- Older clients reading a v4 packet will fail at the magic+version check or
+  parse the wrong fields. If you need to interop with old clients across the
+  upgrade, hold readers ahead of writers.
+
 Rust Components
 ---------------
 

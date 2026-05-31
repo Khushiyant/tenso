@@ -94,8 +94,9 @@ def test_large_dimensions():
 def test_dos_max_ndim():
     """Verify that exceeding MAX_NDIM raises a ValueError."""
     malicious_ndim = MAX_NDIM + 1
-    header = struct.pack("<4sBBBB", _MAGIC, _VERSION, FLAG_ALIGNED, 1, malicious_ndim)
-    packet = header + b"\x00" * 100
+    # v4 header: magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1) = 10
+    header = struct.pack("<4sBHBBB", _MAGIC, _VERSION, FLAG_ALIGNED, 1, malicious_ndim, 0)
+    packet = header + b"\x00" * 200
 
     with pytest.raises(ValueError, match="Packet exceeds maximum dimensions"):
         tenso.loads(packet)
@@ -104,9 +105,10 @@ def test_dos_max_ndim():
 def test_dos_max_elements():
     """Verify that exceeding MAX_ELEMENTS raises a ValueError."""
     ndim = 1
-    header = struct.pack("<4sBBBB", _MAGIC, _VERSION, FLAG_ALIGNED, 1, ndim)
+    # v4 header: magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1) = 10
+    header = struct.pack("<4sBHBBB", _MAGIC, _VERSION, FLAG_ALIGNED, 1, ndim, 0)
     malicious_shape = struct.pack("<I", MAX_ELEMENTS + 1)
-    packet = header + malicious_shape + b"\x00" * 100
+    packet = header + malicious_shape + b"\x00" * 200
 
     with pytest.raises(ValueError, match="Packet exceeds maximum elements"):
         tenso.loads(packet)

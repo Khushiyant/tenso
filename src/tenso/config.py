@@ -8,7 +8,9 @@ memory alignment requirements, and feature flags used across the library.
 import numpy as np
 
 _MAGIC = b"TNSO"  #: Magic number for Tenso packet header (bytes)
-_VERSION = 3  #: Protocol version (int)
+_VERSION = 4  #: Protocol version (int)
+_HEADER_BASE_V3 = 8   #: v3 header: magic(4) + ver(1) + flags_u8(1) + dtype(1) + ndim(1)
+_HEADER_BASE_V4 = 10  #: v4 header: magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1)
 _ALIGNMENT = 64  #: Align body to 64-byte boundaries for AVX-512/SIMD (int)
 
 # --- Security Limits (DoS Protection) ---

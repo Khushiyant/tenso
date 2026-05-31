@@ -9,8 +9,8 @@ import struct
 import numpy as np
 import xxhash
 from typing import Any, Tuple
-from .config import _MAGIC, _ALIGNMENT, _REV_DTYPE_MAP, FLAG_INTEGRITY
-from .core import _read_into_buffer, dumps
+from .config import _ALIGNMENT, _REV_DTYPE_MAP, FLAG_INTEGRITY
+from .core import _read_into_buffer, _read_packet_header, dumps
 
 # --- BACKEND DETECTION ---
 BACKEND = None
@@ -119,12 +119,10 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
     EOFError
         If stream ends prematurely.
     """
-    header = bytearray(8)
-    if not _read_into_buffer(source, header):
+    parsed = _read_packet_header(source)
+    if parsed is None:
         return None
-    magic, _, flags, dtype_code, ndim = struct.unpack("<4sBBBB", header)
-    if magic != _MAGIC:
-        raise ValueError("Invalid tenso packet")
+    _ver, flags, dtype_code, ndim, header_size = parsed
 
     shape_bytes = bytearray(ndim * 4)
     if not _read_into_buffer(source, shape_bytes):
@@ -133,7 +131,7 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
     dtype_np = _REV_DTYPE_MAP.get(dtype_code)
     num_elements = int(np.prod(shape))
 
-    current_pos = 8 + (ndim * 4)
+    current_pos = header_size + (ndim * 4)
     padding_len = (_ALIGNMENT - (current_pos % _ALIGNMENT)) % _ALIGNMENT
     body_len = num_elements * dtype_np.itemsize
     has_integrity = (flags & FLAG_INTEGRITY) != 0

@@ -10,7 +10,13 @@ import numpy as np
 import struct
 import xxhash
 from typing import Optional
-from .core import _REV_DTYPE_MAP, _ALIGNMENT, FLAG_INTEGRITY, iter_dumps
+from .core import (
+    _REV_DTYPE_MAP,
+    _ALIGNMENT,
+    FLAG_INTEGRITY,
+    _aread_packet_header,
+    iter_dumps,
+)
 from .config import MAX_NDIM, MAX_ELEMENTS
 
 
@@ -28,13 +34,11 @@ async def aread_stream(reader: asyncio.StreamReader) -> Optional[np.ndarray]:
     Optional[np.ndarray]
         The deserialized array.
     """
-    try:
-        header = await reader.readexactly(8)
-    except asyncio.IncompleteReadError as e:
-        if len(e.partial) == 0:
-            return None
-        raise
-    magic, _, flags, dtype_code, ndim = struct.unpack("<4sBBBB", header)
+    parsed = await _aread_packet_header(reader)
+    if parsed is None:
+        return None
+    _ver, flags, dtype_code, ndim, header_size = parsed
+
     if ndim > MAX_NDIM:
         raise ValueError(f"Packet exceeds maximum dimensions ({ndim} > {MAX_NDIM})")
 
@@ -44,7 +48,7 @@ async def aread_stream(reader: asyncio.StreamReader) -> Optional[np.ndarray]:
     if num_elements > MAX_ELEMENTS:
         raise ValueError(f"Packet exceeds maximum elements ({num_elements})")
 
-    pad_len = (_ALIGNMENT - ((8 + (ndim * 4)) % _ALIGNMENT)) % _ALIGNMENT
+    pad_len = (_ALIGNMENT - ((header_size + (ndim * 4)) % _ALIGNMENT)) % _ALIGNMENT
     if pad_len > 0:
         await reader.readexactly(pad_len)
 

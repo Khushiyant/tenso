@@ -182,6 +182,87 @@ impl<W: Write> Write for WrapperWriter<W> {
 }
 
 // -----------------------------------------------------------------------------
+// Protocol Version & Header Helpers
+// -----------------------------------------------------------------------------
+
+const CURRENT_VERSION: u8 = 4;
+const HEADER_BASE_V4: usize = 10; // magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1)
+
+/// Write a v4 header into `target[0..10]`.
+fn write_v4_header(target: &mut [u8], flags: u16, dtype_code: u8, ndim: u8) {
+    target[0..4].copy_from_slice(b"TNSO");
+    target[4] = CURRENT_VERSION;
+    target[5..7].copy_from_slice(&flags.to_le_bytes());
+    target[7] = dtype_code;
+    target[8] = ndim;
+    target[9] = 0; // reserved
+}
+
+/// Parsed packet header (version-aware).
+#[derive(Debug, PartialEq)]
+struct ParsedHeader {
+    flags: u16,
+    dtype_code: u8,
+    ndim: usize,
+    base_size: usize, // 8 for v3, 10 for v4
+}
+
+#[derive(Debug, PartialEq)]
+enum HeaderError {
+    TooShort,
+    BadMagic,
+    TruncatedV4,
+    UnsupportedVersion(u8),
+}
+
+impl HeaderError {
+    fn message(&self) -> String {
+        match self {
+            HeaderError::TooShort => "Packet too short".to_string(),
+            HeaderError::BadMagic => "Invalid tenso packet".to_string(),
+            HeaderError::TruncatedV4 => "Packet too short for v4 header".to_string(),
+            HeaderError::UnsupportedVersion(v) => format!("Unsupported protocol version: {}", v),
+        }
+    }
+}
+
+/// Pure-Rust header parser, handling both v3 (1-byte flags) and v4 (2-byte flags).
+fn parse_packet_header_raw(bytes: &[u8]) -> Result<ParsedHeader, HeaderError> {
+    if bytes.len() < 8 {
+        return Err(HeaderError::TooShort);
+    }
+    if &bytes[0..4] != b"TNSO" {
+        return Err(HeaderError::BadMagic);
+    }
+    let ver = bytes[4];
+    match ver {
+        3 => Ok(ParsedHeader {
+            flags: bytes[5] as u16,
+            dtype_code: bytes[6],
+            ndim: bytes[7] as usize,
+            base_size: 8,
+        }),
+        4 => {
+            if bytes.len() < 10 {
+                return Err(HeaderError::TruncatedV4);
+            }
+            Ok(ParsedHeader {
+                flags: u16::from_le_bytes([bytes[5], bytes[6]]),
+                dtype_code: bytes[7],
+                ndim: bytes[8] as usize,
+                base_size: 10,
+            })
+        }
+        _ => Err(HeaderError::UnsupportedVersion(ver)),
+    }
+}
+
+fn parse_packet_header(bytes: &[u8]) -> PyResult<ParsedHeader> {
+    parse_packet_header_raw(bytes)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.message()))
+}
+
+// -----------------------------------------------------------------------------
 // Serialization Implementation (In-Memory)
 // -----------------------------------------------------------------------------
 
@@ -231,7 +312,7 @@ fn write_dense_to_slice(
     };
 
     let use_custom_align = alignment != 64;
-    let mut header_len = 8 + (ndim * 4);
+    let mut header_len = HEADER_BASE_V4 + (ndim * 4);
     if use_custom_align {
         header_len += 1;
     }
@@ -240,15 +321,15 @@ fn write_dense_to_slice(
     let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
 
     let uncompressed_len = u8_slice.len();
-    
+
     let (compressed_data, body_len, flags_compression) = if compress {
          let data = lz4_compress(u8_slice);
          let len = data.len();
-         (Some(data), len, 4u8)
+         (Some(data), len, 4u16)
     } else {
-         (None, uncompressed_len, 0u8)
+         (None, uncompressed_len, 0u16)
     };
-    
+
     let footer_len = if check_integrity { 8 } else { 0 };
     let total_len = header_len + padding_len + body_len + footer_len;
 
@@ -256,20 +337,14 @@ fn write_dense_to_slice(
         return Err(pyo3::exceptions::PyValueError::new_err(format!("Buffer too small: {} < {}", target.len(), total_len)));
     }
 
-    // Write Header
-    target[0..4].copy_from_slice(b"TNSO");
-    target[4] = 3; 
-    
-    let mut flags = 0;
+    // Write v4 Header
+    let mut flags: u16 = 0;
     if use_custom_align { flags |= 128; } else { flags |= 1; }
     if check_integrity { flags |= 2; }
     flags |= flags_compression;
-    target[5] = flags;
+    write_v4_header(target, flags, dtype_enum.code(), ndim as u8);
 
-    target[6] = dtype_enum.code();
-    target[7] = ndim as u8;
-
-    let mut cursor = 8;
+    let mut cursor = HEADER_BASE_V4;
     for &dim in &shape {
         target[cursor..cursor + 4].copy_from_slice(&(dim as u32).to_le_bytes());
         cursor += 4;
@@ -315,7 +390,7 @@ fn calc_dense_size(_py: Python, array: &PyAny, check_integrity: bool, compress: 
     let nbytes: usize = array.getattr("nbytes")?.extract()?;
 
     let use_custom_align = alignment != 64;
-    let mut header_len = 8 + (ndim * 4);
+    let mut header_len = HEADER_BASE_V4 + (ndim * 4);
     if use_custom_align { header_len += 1; }
 
     let remainder = header_len % alignment;
@@ -335,10 +410,10 @@ fn calc_dense_size(_py: Python, array: &PyAny, check_integrity: bool, compress: 
 }
 
 fn serialize_sparse<'py>(py: Python<'py>, tensor: &'py PyAny, format: &str, _check_integrity: bool, alignment: usize) -> PyResult<&'py PyBytes> {
-    let (flag_code, comps) = match format {
-        "coo" => (8, vec!["data", "row", "col"]), // FLAG_SPARSE = 8
-        "csr" => (32, vec!["data", "indices", "indptr"]), // FLAG_SPARSE_CSR = 32
-        "csc" => (64, vec!["data", "indices", "indptr"]), // FLAG_SPARSE_CSC = 64
+    let (flag_code, comps): (u16, Vec<&str>) = match format {
+        "coo" => (8, vec!["data", "row", "col"]),
+        "csr" => (32, vec!["data", "indices", "indptr"]),
+        "csc" => (64, vec!["data", "indices", "indptr"]),
         _ => return Err(pyo3::exceptions::PyValueError::new_err("Unknown sparse format")),
     };
 
@@ -357,24 +432,20 @@ fn serialize_sparse<'py>(py: Python<'py>, tensor: &'py PyAny, format: &str, _che
         component_arrays.push(contig);
     }
 
-    let main_header_len = 8 + (ndim * 4);
+    let main_header_len = HEADER_BASE_V4 + (ndim * 4);
     let mut total_len = main_header_len;
     let mut comp_sizes = Vec::with_capacity(3);
 
     for arr in &component_arrays {
         let size = calc_dense_size(py, arr, false, false, alignment)?;
         comp_sizes.push(size);
-        total_len += 4 + size; 
+        total_len += 4 + size;
     }
 
     PyBytes::new_with(py, total_len, |bytes: &mut [u8]| {
-        bytes[0..4].copy_from_slice(b"TNSO");
-        bytes[4] = 3;
-        bytes[5] = flag_code; 
-        bytes[6] = 0; 
-        bytes[7] = ndim as u8;
+        write_v4_header(bytes, flag_code, 0, ndim as u8);
 
-        let mut cursor = 8;
+        let mut cursor = HEADER_BASE_V4;
         for &dim in &shape_tuple {
             bytes[cursor..cursor+4].copy_from_slice(&(dim).to_le_bytes());
             cursor += 4;
@@ -399,7 +470,7 @@ fn serialize_bundle<'py>(
     compress: bool,
     alignment: usize,
 ) -> PyResult<&'py PyBytes> {
-    let mut total_len = 8; // Header
+    let mut total_len = HEADER_BASE_V4; // Header
     let mut entries = Vec::with_capacity(dict.len());
 
     for (key, value) in dict.iter() {
@@ -418,13 +489,9 @@ fn serialize_bundle<'py>(
     }
 
     PyBytes::new_with(py, total_len, |bytes: &mut [u8]| {
-        bytes[0..4].copy_from_slice(b"TNSO");
-        bytes[4] = 3;
-        bytes[5] = 16; // FLAG_BUNDLE = 16
-        bytes[6] = 0;
-        bytes[7] = entries.len().min(255) as u8;
+        write_v4_header(bytes, 16, 0, entries.len().min(255) as u8); // FLAG_BUNDLE = 16
 
-        let mut cursor = 8;
+        let mut cursor = HEADER_BASE_V4;
         for (key_bytes, val_bytes) in entries {
             let k_len = key_bytes.len() as u32;
             bytes[cursor..cursor + 4].copy_from_slice(&k_len.to_le_bytes());
@@ -504,24 +571,24 @@ fn dump_to_fd_impl(
         };
 
         let use_custom_align = alignment != 64;
-        let mut header_len = 8 + (ndim * 4);
+        let mut header_len = HEADER_BASE_V4 + (ndim * 4);
         if use_custom_align { header_len += 1; }
-        
+
         let remainder = header_len % alignment;
         let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
-        
-        let mut header_buf = Vec::with_capacity(header_len + padding_len);
-        header_buf.extend_from_slice(b"TNSO");
-        header_buf.push(3); 
-        
-        let mut flags = 0;
+
+        let mut flags: u16 = 0;
         if use_custom_align { flags |= 128; } else { flags |= 1; }
         if check_integrity { flags |= 2; }
         if compress { flags |= 4; }
-        
-        header_buf.push(flags);
+
+        let mut header_buf = Vec::with_capacity(header_len + padding_len);
+        header_buf.extend_from_slice(b"TNSO");
+        header_buf.push(CURRENT_VERSION);
+        header_buf.extend_from_slice(&flags.to_le_bytes());
         header_buf.push(dtype_enum.code());
         header_buf.push(ndim as u8);
+        header_buf.push(0); // reserved
         
         for &dim in &shape {
             header_buf.extend_from_slice(&(dim as u32).to_le_bytes());
@@ -605,10 +672,10 @@ fn write_sparse_to_slice(
     _check_integrity: bool,
     alignment: usize,
 ) -> PyResult<usize> {
-    let (flag_code, comps) = match format {
-        "coo" => (8u8, vec!["data", "row", "col"]),
-        "csr" => (32u8, vec!["data", "indices", "indptr"]),
-        "csc" => (64u8, vec!["data", "indices", "indptr"]),
+    let (flag_code, comps): (u16, Vec<&str>) = match format {
+        "coo" => (8, vec!["data", "row", "col"]),
+        "csr" => (32, vec!["data", "indices", "indptr"]),
+        "csc" => (64, vec!["data", "indices", "indptr"]),
         _ => return Err(pyo3::exceptions::PyValueError::new_err("Unknown sparse format")),
     };
 
@@ -627,7 +694,7 @@ fn write_sparse_to_slice(
         component_arrays.push(contig);
     }
 
-    let main_header_len = 8 + (ndim * 4);
+    let main_header_len = HEADER_BASE_V4 + (ndim * 4);
     let mut total_len = main_header_len;
     let mut comp_sizes = Vec::with_capacity(3);
 
@@ -643,14 +710,10 @@ fn write_sparse_to_slice(
         ));
     }
 
-    // Write main header
-    target[0..4].copy_from_slice(b"TNSO");
-    target[4] = 3;
-    target[5] = flag_code;
-    target[6] = 0;
-    target[7] = ndim as u8;
+    // Write v4 header
+    write_v4_header(target, flag_code, 0, ndim as u8);
 
-    let mut cursor = 8;
+    let mut cursor = HEADER_BASE_V4;
     for &dim in &shape_tuple {
         target[cursor..cursor + 4].copy_from_slice(&dim.to_le_bytes());
         cursor += 4;
@@ -680,7 +743,7 @@ fn write_bundle_to_slice(
 ) -> PyResult<usize> {
     // First pass: serialize all entries to collect their bytes
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(dict.len());
-    let mut total_len = 8usize; // header
+    let mut total_len = HEADER_BASE_V4; // header
 
     for (key, value) in dict.iter() {
         let key_str: String = key.extract()?;
@@ -699,14 +762,10 @@ fn write_bundle_to_slice(
         ));
     }
 
-    // Write header
-    target[0..4].copy_from_slice(b"TNSO");
-    target[4] = 3;
-    target[5] = 16;
-    target[6] = 0;
-    target[7] = entries.len().min(255) as u8;
+    // Write v4 header
+    write_v4_header(target, 16, 0, entries.len().min(255) as u8); // FLAG_BUNDLE = 16
 
-    let mut cursor = 8;
+    let mut cursor = HEADER_BASE_V4;
     for (key_bytes, val_bytes) in &entries {
         let k_len = key_bytes.len() as u32;
         target[cursor..cursor + 4].copy_from_slice(&k_len.to_le_bytes());
@@ -778,27 +837,16 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
         std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
     };
 
-    if bytes.len() < 8 {
-        return Err(pyo3::exceptions::PyValueError::new_err("Packet too short"));
-    }
+    let hdr = parse_packet_header(bytes)?;
 
-    if &bytes[0..4] != b"TNSO" {
-        return Err(pyo3::exceptions::PyValueError::new_err("Invalid tenso packet"));
-    }
-
-    let ver = bytes[4];
-    let flags = bytes[5];
-    let dtype_code = bytes[6];
-    let ndim = bytes[7] as usize;
-
-    let shape_end = 8 + (ndim * 4);
+    let shape_end = hdr.base_size + (hdr.ndim * 4);
     if bytes.len() < shape_end {
         return Err(pyo3::exceptions::PyValueError::new_err("Packet too short to contain shape"));
     }
 
-    let mut shape = Vec::with_capacity(ndim);
-    let mut cursor = 8;
-    for _ in 0..ndim {
+    let mut shape = Vec::with_capacity(hdr.ndim);
+    let mut cursor = hdr.base_size;
+    for _ in 0..hdr.ndim {
         let dim_bytes: [u8; 4] = bytes[cursor..cursor+4].try_into().map_err(|_| {
              pyo3::exceptions::PyValueError::new_err("Failed to read shape")
         })?;
@@ -808,17 +856,17 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
     }
 
     let dict = PyDict::new(py);
-    dict.set_item("version", ver)?;
-    dict.set_item("flags", flags)?;
-    dict.set_item("dtype_code", dtype_code)?;
-    dict.set_item("ndim", ndim)?;
-    
+    dict.set_item("version", bytes[4])?;
+    dict.set_item("flags", hdr.flags)?;
+    dict.set_item("dtype_code", hdr.dtype_code)?;
+    dict.set_item("ndim", hdr.ndim)?;
+
     let total_elements: usize = shape.iter().product();
     dict.set_item("total_elements", total_elements)?;
     dict.set_item("shape", PyTuple::new(py, shape))?;
-    
-    dict.set_item("aligned", (flags & 1) != 0)?;
-    dict.set_item("integrity_protected", (flags & 2) != 0)?;
+
+    dict.set_item("aligned", (hdr.flags & 1) != 0)?;
+    dict.set_item("integrity_protected", (hdr.flags & 2) != 0)?;
 
     Ok(dict)
 }
@@ -828,37 +876,31 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
 // -----------------------------------------------------------------------------
 
 fn deserialize_impl<'py>(
-    py: Python<'py>, 
-    root_data: &'py PyAny, 
-    bytes: &[u8], 
+    py: Python<'py>,
+    root_data: &'py PyAny,
+    bytes: &[u8],
     absolute_offset: usize
 ) -> PyResult<Option<PyObject>> {
     const MAX_NDIM: usize = 32;
     const MAX_ELEMENTS: usize = 1_000_000_000;
-    const FLAG_BUNDLE: u8 = 16;
+    const FLAG_BUNDLE: u16 = 16;
 
-    if bytes.len() < 8 {
-        return Err(pyo3::exceptions::PyValueError::new_err("Packet too short"));
-    }
-
-    if &bytes[0..4] != b"TNSO" {
-        return Err(pyo3::exceptions::PyValueError::new_err("Invalid tenso packet"));
-    }
-
+    let hdr = parse_packet_header(bytes)?;
     let ver = bytes[4];
-    let flags = bytes[5];
-    let dtype_code = bytes[6];
-    let ndim = bytes[7] as usize;
+    let flags = hdr.flags;
+    let dtype_code = hdr.dtype_code;
+    let ndim = hdr.ndim;
+    let base_size = hdr.base_size;
 
-    let supported_mask = 1 | 2 | 4 | 16 | 128;
+    let supported_mask: u16 = 1 | 2 | 4 | 16 | 128;
     if (flags & !supported_mask) != 0 {
         return Ok(None);
     }
 
     if (flags & FLAG_BUNDLE) != 0 {
         let res = PyDict::new(py);
-        let count = ndim; 
-        let mut cursor = 8;
+        let count = ndim;
+        let mut cursor = base_size;
 
         for _ in 0..count {
             if cursor + 4 > bytes.len() {
@@ -903,7 +945,7 @@ fn deserialize_impl<'py>(
         return Err(pyo3::exceptions::PyValueError::new_err(format!("Packet exceeds maximum dimensions ({} > {})", ndim, MAX_NDIM)));
     }
 
-    let mut header_len = 8 + (ndim * 4);
+    let mut header_len = base_size + (ndim * 4);
     let mut alignment = 1;
     let use_custom_align = (flags & 128) != 0;
 
@@ -923,7 +965,7 @@ fn deserialize_impl<'py>(
     }
 
     let mut shape = Vec::with_capacity(ndim);
-    let mut cursor = 8;
+    let mut cursor = base_size;
     for _ in 0..ndim {
         let dim_bytes: [u8; 4] = bytes[cursor..cursor+4].try_into().map_err(|_| {
              pyo3::exceptions::PyValueError::new_err("Failed to read shape")
@@ -1251,5 +1293,83 @@ fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(shm_mutex_size, m)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    fn v3_header(flags: u8, dtype: u8, ndim: u8) -> [u8; 8] {
+        [b'T', b'N', b'S', b'O', 3, flags, dtype, ndim]
+    }
+
+    fn v4_header_bytes(flags: u16, dtype: u8, ndim: u8) -> [u8; 10] {
+        let mut buf = [0u8; 10];
+        write_v4_header(&mut buf, flags, dtype, ndim);
+        buf
+    }
+
+    #[test]
+    fn rejects_packet_too_short() {
+        assert_eq!(parse_packet_header_raw(&[b'T', b'N', b'S', b'O']), Err(HeaderError::TooShort));
+        assert_eq!(parse_packet_header_raw(&[]), Err(HeaderError::TooShort));
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let bytes = [b'X', b'X', b'X', b'X', 4, 0, 0, 0];
+        assert_eq!(parse_packet_header_raw(&bytes), Err(HeaderError::BadMagic));
+    }
+
+    #[test]
+    fn rejects_unsupported_versions() {
+        for ver in [0u8, 1, 2, 5, 99, 255] {
+            let bytes = [b'T', b'N', b'S', b'O', ver, 0, 0, 0];
+            assert_eq!(
+                parse_packet_header_raw(&bytes),
+                Err(HeaderError::UnsupportedVersion(ver)),
+                "version {} should be rejected",
+                ver,
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_v4_with_truncated_header() {
+        let bytes = [b'T', b'N', b'S', b'O', 4, 0, 0, 0];
+        assert_eq!(parse_packet_header_raw(&bytes), Err(HeaderError::TruncatedV4));
+    }
+
+    #[test]
+    fn parses_v3_round_trip() {
+        let bytes = v3_header(0b1010_0011, 7, 4);
+        let hdr = parse_packet_header_raw(&bytes).unwrap();
+        assert_eq!(hdr.flags, 0b1010_0011);
+        assert_eq!(hdr.dtype_code, 7);
+        assert_eq!(hdr.ndim, 4);
+        assert_eq!(hdr.base_size, 8);
+    }
+
+    #[test]
+    fn parses_v4_round_trip() {
+        let bytes = v4_header_bytes(0xBEEF, 9, 3);
+        let hdr = parse_packet_header_raw(&bytes).unwrap();
+        assert_eq!(hdr.flags, 0xBEEF);
+        assert_eq!(hdr.dtype_code, 9);
+        assert_eq!(hdr.ndim, 3);
+        assert_eq!(hdr.base_size, 10);
+    }
+
+    #[test]
+    fn write_v4_header_layout() {
+        let mut buf = [0xAAu8; 10];
+        write_v4_header(&mut buf, 0x1234, 5, 2);
+        assert_eq!(&buf[0..4], b"TNSO");
+        assert_eq!(buf[4], 4);
+        assert_eq!(u16::from_le_bytes([buf[5], buf[6]]), 0x1234);
+        assert_eq!(buf[7], 5);
+        assert_eq!(buf[8], 2);
+        assert_eq!(buf[9], 0);
+    }
 }
 
