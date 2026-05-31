@@ -1,6 +1,6 @@
 [project]
 name = "tenso"
-version = "0.20.1"
+version = "0.21.0"
 description = "High-performance zero-copy tensor protocol"
 readme = "README.md"
 dependencies = [
@@ -9,19 +9,6 @@ dependencies = [
     "xxhash>=3.6.0",
 ]
 requires-python = ">=3.11"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[build-system]
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
-
-
-[tool.maturin]
-python-source = "src"          # Your python code is in src/
-module-name = "tenso.tenso_rs" # This compiles the rust binary as a submodule
-features = ["pyo3/extension-module"]
 
 [project.optional-dependencies]
 api = [
@@ -56,9 +43,25 @@ gpu = [
     "jax; sys_platform == 'darwin'"
 ]
 
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[tool.maturin]
+python-source = "src"          # Your python code is in src/
+module-name = "tenso.tenso_rs" # This compiles the rust binary as a submodule
+features = ["pyo3/extension-module"]
+
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 branch = "main"
 upload_to_pypi = false
 upload_to_release = true
 build_command = "echo 'Skipping build in semantic-release, handled by CI'"
+
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+

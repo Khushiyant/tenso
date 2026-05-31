@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v0.21.0 (2026-05-31)
+
+### Features
+
+- V4 protocol migration with cleanup and ragged fix
+  ([`ccfcc4d`](https://github.com/Khushiyant/tenso/commit/ccfcc4ddde2b3a35880523c83cf324195b422891))
+
+Migrate readers to a single _parse_header/_read_packet_header helper so the v3 (flags_u8) vs v4
+  (flags_u16) dispatch lives in one place instead of being duplicated across core, async_core, gpu,
+  and utils. Fix StringTensor packets to use the proper v4 layout (they were claiming v4 in the
+  version byte but laid out as v3, and the integrity footer was never verified). Replace the
+  TensoCache spinlock fallback with a UID-scoped fcntl flock, close and unlink the lock file on
+  cache teardown, and drop the dead _H_LOCK read in close(). Cargo: expose tenso_rs as both cdylib
+  and rlib behind an extension-module
+
+feature gate.
+
+
 ## v0.20.1 (2026-03-28)
 
 ### Bug Fixes
