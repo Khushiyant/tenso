@@ -62,6 +62,76 @@ IS_LITTLE_ENDIAN = sys.byteorder == "little"
 _QUANTIZED_CODES = (QDTYPE_QINT8, QDTYPE_QUINT8, QDTYPE_QINT4, QDTYPE_QUINT4)
 _4BIT_CODES = (QDTYPE_QINT4, QDTYPE_QUINT4)
 
+# The wire format encodes each dimension as a 32-bit integer.
+_MAX_DIM = 0xFFFFFFFF
+
+
+def _validate_dims(shape) -> None:
+    """Reject shapes whose dimensions overflow the wire format's u32 dim slots.
+
+    Without this guard each dim was silently truncated to 32 bits, corrupting
+    the array on reserialization (issue #4).
+    """
+    for d in shape:
+        if d > _MAX_DIM:
+            raise ValueError(
+                f"Dimension {d} exceeds the wire-format limit of {_MAX_DIM} "
+                "(each dimension is stored as a 32-bit integer)"
+            )
+
+
+def _aligned_empty(shape, dtype, alignment: int) -> np.ndarray:
+    """Allocate an array whose data pointer is a multiple of ``alignment``.
+
+    NumPy gives no alignment guarantee stronger than the element size, so we
+    over-allocate a raw byte buffer and carve out an aligned, correctly typed
+    view of it.
+    """
+    count = int(np.prod(shape)) if len(shape) else 1
+    nbytes = count * dtype.itemsize
+    buf = np.empty(nbytes + alignment, dtype=np.uint8)
+    offset = (-buf.ctypes.data) % alignment
+    return buf[offset : offset + nbytes].view(dtype).reshape(shape)
+
+
+def _ensure_aligned(obj, alignment: int, copy: bool):
+    """Guarantee ``obj``'s arrays are ``alignment``-aligned in memory.
+
+    A zero-copy ``np.frombuffer`` view inherits the alignment of the caller's
+    transport buffer, which Tenso does not control, so the "aligned" promise did
+    not hold for the returned array (issue #5). Here we keep the zero-copy view
+    whenever it already happens to be aligned and only fall back to an aligned
+    copy otherwise. ``copy=True`` always yields a writeable aligned copy.
+    """
+    if isinstance(obj, dict):
+        return {k: _ensure_aligned(v, alignment, copy) for k, v in obj.items()}
+    if isinstance(obj, np.ndarray):
+        if alignment <= 1 or obj.nbytes == 0:
+            return obj.copy() if copy else obj
+        if not copy and obj.ctypes.data % alignment == 0:
+            return obj
+        out = _aligned_empty(obj.shape, obj.dtype, alignment)
+        out[...] = obj
+        out.flags.writeable = copy
+        return out
+    # sparse matrices, QuantizedTensor, etc. handle their own copy semantics.
+    return obj
+
+
+def _target_alignment(mv, flags: int, header_base: int, ndim: int) -> int:
+    """Resolve the alignment a packet's arrays should be guaranteed to have."""
+    if flags & FLAG_CUST_ALIGN:
+        pos = header_base + ndim * 4
+        if len(mv) > pos:
+            return 1 << mv[pos]
+        return _ALIGNMENT
+    if flags & FLAG_ALIGNED:
+        return _ALIGNMENT
+    # Bundle sub-packets carry their own alignment; default dumps uses 64.
+    if flags & FLAG_BUNDLE:
+        return _ALIGNMENT
+    return 1
+
 
 def _quantized_body_size(dtype_code: int, num_elements: int) -> int:
     if dtype_code in _4BIT_CODES:
@@ -675,6 +745,7 @@ def read_stream(source: Any) -> Optional[Any]:
     arr = np.frombuffer(
         data_buffer, dtype=dtype, offset=padding_len, count=num_elements
     ).reshape(shape)
+    arr = _ensure_aligned(arr, alignment, copy=False)
     arr.flags.writeable = False
     return arr
 
@@ -841,6 +912,13 @@ def dumps(
     if not (alignment > 0 and (alignment & (alignment - 1) == 0)):
         raise ValueError("Alignment must be a power of two")
 
+    # Reject oversized dims up front so the error is a clean ValueError on both
+    # the Rust and Python paths instead of a silent truncation (issue #4).
+    if isinstance(tensor, np.ndarray):
+        _validate_dims(tensor.shape)
+    elif hasattr(tensor, "shape") and not isinstance(tensor, dict):
+        _validate_dims(tensor.shape)
+
     # 1. FAST PATH: RUST ACCELERATION
     if HAS_RUST and not compress:
         try:
@@ -1006,6 +1084,19 @@ def loads(
     Any
         The reconstructed NumPy array, Dictionary, or Sparse Matrix.
     """
+    mv = memoryview(data)
+
+    # Resolve the alignment the packet promises so it can be guaranteed on the
+    # returned arrays regardless of which decode path runs (issue #5). A
+    # zero-copy view only inherits the transport buffer's alignment, which Tenso
+    # does not control, so the guarantee is enforced after decoding.
+    try:
+        _hdr = _parse_header(mv)
+        alignment = _target_alignment(mv, _hdr[1], _hdr[4], _hdr[3])
+    except Exception:
+        _hdr = None
+        alignment = _ALIGNMENT
+
     # 0. FAST PATH: RUST ACCELERATION
     if HAS_RUST and (hasattr(data, "__buffer__") or isinstance(data, (bytes, bytearray, memoryview, np.ndarray, mmap.mmap))):
         # loads_rs returns None if flags are unsupported (e.g. Bundle/Sparse/Compression)
@@ -1013,15 +1104,14 @@ def loads(
         try:
             res = loads_rs(data)
             if res is not None:
-                if copy:
-                    return res.copy()
-                return res
+                return _ensure_aligned(res, alignment, copy)
         except (ValueError, TypeError):
              # Fallback to Python if Rust fails for any reason
              pass
 
-    mv = memoryview(data)
-    _ver, flags, dtype_code, ndim, header_base = _parse_header(mv)
+    _ver, flags, dtype_code, ndim, header_base = (
+        _hdr if _hdr is not None else _parse_header(mv)
+    )
 
     # 1. Bundle Deserialization
     if flags & FLAG_BUNDLE:
@@ -1116,9 +1206,9 @@ def loads(
         body_data = lz4.frame.decompress(body_data)
 
     arr = np.frombuffer(body_data, dtype=dtype, count=num_elements).reshape(shape)
-    if copy:
-        return arr.copy()
-    arr.flags.writeable = False
+    arr = _ensure_aligned(arr, alignment, copy)
+    if not copy:
+        arr.flags.writeable = False
     return arr
 
 
