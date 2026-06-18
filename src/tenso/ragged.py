@@ -144,6 +144,15 @@ class StringTensor:
         offsets = np.frombuffer(
             mv[body_start:body_start + offsets_size], dtype=np.uint64
         ).copy()
+
+        # Validate offsets before trusting them for slicing: they must start at
+        # 0 and be monotonically non-decreasing, otherwise __getitem__ would
+        # produce garbage slices from untrusted input.
+        if offsets[0] != 0:
+            raise ValueError("StringTensor offsets must start at 0")
+        if not np.all(np.diff(offsets.astype(np.int64)) >= 0):
+            raise ValueError("StringTensor offsets are not monotonically non-decreasing")
+
         data_start = body_start + offsets_size
         total_str_bytes = int(offsets[-1])
         if len(mv) < data_start + total_str_bytes:

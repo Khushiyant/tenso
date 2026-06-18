@@ -88,10 +88,11 @@ def _serialize_quantized(
     if check_integrity:
         flags |= FLAG_INTEGRITY
 
-    # Quant metadata: 1 byte scheme + 4 bytes group_size + 4 bytes num_scales
-    #                  + num_scales*4 scales + num_scales*4 zero_points
+    # Quant metadata: 1 byte scheme + 1 byte axis + 4 bytes group_size
+    #                  + 4 bytes num_scales + num_scales*4 scales
+    #                  + num_scales*4 zero_points
     num_scales = len(qt.scales)
-    quant_meta_len = 1 + 4 + 4 + num_scales * 4 + num_scales * 4
+    quant_meta_len = 1 + 1 + 4 + 4 + num_scales * 4 + num_scales * 4
 
     header_len = _HEADER_BASE_V4 + ndim * 4 + quant_meta_len
     if use_custom_align:
@@ -111,9 +112,12 @@ def _serialize_quantized(
     struct.pack_into(f"<{ndim}I", buffer, _HEADER_BASE_V4, *shape)
 
     cursor = _HEADER_BASE_V4 + ndim * 4
+    meta_start = cursor
 
     # Quant metadata
     buffer[cursor] = qt.quant_scheme
+    cursor += 1
+    buffer[cursor] = qt.axis & 0xFF
     cursor += 1
     struct.pack_into("<I", buffer, cursor, qt.group_size)
     cursor += 4
@@ -137,10 +141,14 @@ def _serialize_quantized(
     body_start = header_len + padding_len
     buffer[body_start : body_start + body_len] = bytes(qt.data[:body_len])
 
-    # Integrity footer
+    # Integrity footer — covers the quant metadata (scheme/axis/group_size/
+    # scales/zero_points) as well as the packed body, so corruption of the
+    # scales or zero points is also detected.
     if check_integrity:
-        body_data = buffer[body_start : body_start + body_len]
-        digest = xxhash.xxh3_64_intdigest(body_data)
+        protected = bytes(buffer[meta_start : meta_start + quant_meta_len]) + bytes(
+            buffer[body_start : body_start + body_len]
+        )
+        digest = xxhash.xxh3_64_intdigest(protected)
         struct.pack_into("<Q", buffer, body_start + body_len, digest)
 
     return memoryview(buffer)
@@ -156,9 +164,12 @@ def _deserialize_quantized(
     num_elements = int(np.prod(shape))
 
     cursor = shape_end
+    meta_start = cursor
 
     # Quant metadata
     quant_scheme = mv[cursor]
+    cursor += 1
+    axis = mv[cursor]
     cursor += 1
     group_size = struct.unpack("<I", mv[cursor : cursor + 4])[0]
     cursor += 4
@@ -172,6 +183,7 @@ def _deserialize_quantized(
         mv[cursor : cursor + num_scales * 4], dtype=np.float32
     ).copy()
     cursor += num_scales * 4
+    meta_len = cursor - meta_start
 
     # Alignment
     use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
@@ -192,13 +204,15 @@ def _deserialize_quantized(
     body_len = _quantized_body_size(dtype_code, num_elements)
     footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
 
-    # Integrity check
+    # Integrity check — covers quant metadata + packed body.
     if flags & FLAG_INTEGRITY:
-        body_data = mv[body_start : body_start + body_len]
+        protected = bytes(mv[meta_start : meta_start + meta_len]) + bytes(
+            mv[body_start : body_start + body_len]
+        )
         expected = struct.unpack(
             "<Q", mv[body_start + body_len : body_start + body_len + 8]
         )[0]
-        if xxhash.xxh3_64_intdigest(body_data) != expected:
+        if xxhash.xxh3_64_intdigest(protected) != expected:
             raise ValueError("Integrity check failed: XXH3 mismatch")
 
     data = np.frombuffer(mv[body_start : body_start + body_len], dtype=np.uint8)
@@ -215,6 +229,7 @@ def _deserialize_quantized(
         dtype_code=dtype_code,
         quant_scheme=quant_scheme,
         group_size=group_size,
+        axis=axis,
     )
 
 
@@ -233,8 +248,8 @@ def _read_stream_quantized(
     shape = struct.unpack(f"<{ndim}I", shape_bytes)
     num_elements = int(np.prod(shape))
 
-    # Read quant metadata header (1 + 4 + 4 = 9 bytes)
-    meta_header = bytearray(9)
+    # Read quant metadata header (scheme 1 + axis 1 + group_size 4 + num_scales 4 = 10 bytes)
+    meta_header = bytearray(10)
     try:
         if not _read_into_buffer(source, meta_header):
             raise EOFError("Stream ended during quant metadata read")
@@ -242,8 +257,9 @@ def _read_stream_quantized(
         raise EOFError(f"Stream ended during quant metadata read. {e}") from None
 
     quant_scheme = meta_header[0]
-    group_size = struct.unpack("<I", meta_header[1:5])[0]
-    num_scales = struct.unpack("<I", meta_header[5:9])[0]
+    axis = meta_header[1]
+    group_size = struct.unpack("<I", meta_header[2:6])[0]
+    num_scales = struct.unpack("<I", meta_header[6:10])[0]
 
     # Read scales and zero_points
     sz_len = num_scales * 4 * 2  # scales + zero_points
@@ -258,7 +274,7 @@ def _read_stream_quantized(
     zero_points = np.frombuffer(sz_bytes[num_scales * 4 :], dtype=np.float32).copy()
 
     # Current position for alignment calculation
-    current_pos = header_size + shape_len + 9 + sz_len
+    current_pos = header_size + shape_len + 10 + sz_len
 
     # Alignment
     use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
@@ -290,10 +306,12 @@ def _read_stream_quantized(
     except EOFError as e:
         raise EOFError(f"Stream ended during quantized body read. {e}") from None
 
-    # Verify integrity
+    # Verify integrity — covers quant metadata + packed body (must match the
+    # in-memory serializer's coverage).
     if footer_len > 0:
         body_slice = data_buffer[padding_len : padding_len + body_len]
-        actual_hash = xxhash.xxh3_64_intdigest(body_slice)
+        protected = bytes(meta_header) + bytes(sz_bytes) + bytes(body_slice)
+        actual_hash = xxhash.xxh3_64_intdigest(protected)
         expected_hash = struct.unpack(
             "<Q", data_buffer[padding_len + body_len : padding_len + body_len + 8]
         )[0]
@@ -312,6 +330,7 @@ def _read_stream_quantized(
         dtype_code=dtype_code,
         quant_scheme=quant_scheme,
         group_size=group_size,
+        axis=axis,
     )
 
 
@@ -606,6 +625,16 @@ def read_stream(source: Any) -> Optional[Any]:
     if dtype is None:
         raise ValueError(f"Unsupported dtype code: {dtype_code}")
 
+    if flags & FLAG_COMPRESSION:
+        # The streaming dense path computes body_len from the UNCOMPRESSED element
+        # count and has no length prefix for a compressed body, so it would over-
+        # read / mis-hash. Reject explicitly, matching the async and GPU readers.
+        raise ValueError(
+            "Cannot stream a compressed dense packet: the streaming format "
+            "carries no length prefix for compressed bodies. Read the full "
+            "packet and use loads() instead."
+        )
+
     # Read Body & Padding
     current_pos = header_size + shape_len
     alignment = _ALIGNMENT
@@ -744,6 +773,43 @@ def write_stream(
         written += len(chunk)
     return written
 
+
+def _bundle_contains_quantized(d: dict) -> bool:
+    """True if a bundle dict holds a QuantizedTensor at any nesting depth.
+
+    The Rust bundle encoder recurses into nested dicts, so a QuantizedTensor below
+    the top level is just as unsupported there as one at the top level.
+    """
+    for v in d.values():
+        if isinstance(v, QuantizedTensor):
+            return True
+        if isinstance(v, dict) and _bundle_contains_quantized(v):
+            return True
+    return False
+
+
+def _bundle_make_contiguous(d: dict, strict: bool) -> dict:
+    """Return a copy of a bundle dict with every nested numpy array made
+    C-contiguous, recursing into nested dicts.
+
+    The Rust dense path reads each array's bytes at ``ctypes.data`` for ``nbytes``
+    assuming C-order; a non-contiguous value (transpose/slice/Fortran-order) would
+    otherwise be serialized as corrupt data. Sparse and other values pass through
+    unchanged (the Rust sparse path coerces its own components).
+    """
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, np.ndarray):
+            if not v.flags["C_CONTIGUOUS"]:
+                if strict:
+                    raise ValueError("Tensor is not C-Contiguous")
+                v = np.ascontiguousarray(v)
+        elif isinstance(v, dict):
+            v = _bundle_make_contiguous(v, strict)
+        out[k] = v
+    return out
+
+
 def dumps(
     tensor: Any,
     strict: bool = False,
@@ -783,8 +849,12 @@ def dumps(
             is_sparse = hasattr(tensor, "format")
             is_dict = isinstance(tensor, dict)
 
-            # Skip Rust for dicts containing QuantizedTensor values
-            if is_dict and any(isinstance(v, QuantizedTensor) for v in tensor.values()):
+            # Skip Rust for any bundle that holds a QuantizedTensor at ANY depth:
+            # the Rust dense path cannot introspect a QuantizedTensor (it has no
+            # `dtype`/`ctypes` surface) and would raise; only the Python path
+            # serializes quantized values. A top-level-only check missed nested
+            # dicts like {"a": {"b": qt}}.
+            if is_dict and _bundle_contains_quantized(tensor):
                 is_dict = False
                 is_numpy = False
                 is_sparse = False
@@ -795,9 +865,19 @@ def dumps(
                         raise ValueError("Tensor is not C-Contiguous")
                     tensor = np.ascontiguousarray(tensor)
 
+                # For a bundle, the Rust path reads each numpy value's raw bytes at
+                # ctypes.data assuming C-contiguity; a non-contiguous nested value
+                # (transposed/sliced/Fortran-order) would otherwise be serialized as
+                # corrupt data. Normalize every nested array to C-order first.
+                if is_dict:
+                    tensor = _bundle_make_contiguous(tensor, strict)
+
                 # dumps_rs handles Dense, Sparse, and Bundles
                 return memoryview(dumps_rs(tensor, check_integrity=check_integrity, alignment=alignment))
-        except (TypeError, ValueError):
+        # AttributeError: the Rust path tried to introspect a value it does not
+        # support (e.g. a nested custom type) — fall back to the Python path
+        # rather than crashing.
+        except (TypeError, ValueError, AttributeError):
             pass
 
     # 1.5. Quantized Tensor (always Python path)
@@ -806,9 +886,14 @@ def dumps(
 
     # 2. Multi-tensor Bundle (Dictionaries) - Python Fallback
     if isinstance(tensor, dict):
+        if len(tensor) > 255:
+            raise ValueError(
+                f"Bundle has {len(tensor)} entries; the wire format encodes the "
+                "entry count in a single byte, so at most 255 entries are supported"
+            )
         parts = []
         header = struct.pack(
-            "<4sBHBBB", _MAGIC, _VERSION, FLAG_BUNDLE, 0, min(len(tensor), 255), 0
+            "<4sBHBBB", _MAGIC, _VERSION, FLAG_BUNDLE, 0, len(tensor), 0
         )
         parts.append(header)
         for key, value in tensor.items():

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>tenso_ros</name>
+  <version>0.1.0</version>
+  <description>
+    ROS2 integration for the Tenso tensor wire format: an
+    rclcpp::TypeAdapter mapping a TensorView application type to the
+    tenso_msgs/TensoBlob message for zero-copy intra-process tensor transport,
+    plus publisher/subscriber skeletons and a "hello tensor" A/B demo vs
+    sensor_msgs/Image. Linux-only (ROS2 Humble or newer).
+  </description>
+  <maintainer email="khushiyant@airmason.com">Khushiyant</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tenso_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

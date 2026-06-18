@@ -22,14 +22,21 @@ from .config import (
 
 
 def _compute_scale_zp(data: np.ndarray, qmin: int, qmax: int):
-    """Compute min-max affine quantization scale and zero point."""
+    """Compute min-max affine quantization scale and zero point.
+
+    The zero point is kept as an exact float32 and is deliberately NOT
+    clamped into ``[qmin, qmax]``. ``zero_point`` is stored as float32 on
+    the wire, so it need not be a representable quantized value; clamping it
+    (as an earlier version did) destroys the affine mapping for data whose
+    range does not straddle zero (e.g. all-positive activations), saturating
+    every value to a single quantization level.
+    """
     dmin = float(data.min())
     dmax = float(data.max())
     if dmin == dmax:
         return np.float32(1.0), np.float32(0.0)
     scale = np.float32((dmax - dmin) / (qmax - qmin))
     zero_point = np.float32(qmin - dmin / scale)
-    zero_point = np.float32(np.clip(zero_point, qmin, qmax))
     return scale, zero_point
 
 
@@ -82,6 +89,7 @@ class QuantizedTensor:
         dtype_code: int,
         quant_scheme: int = QUANT_PER_TENSOR,
         group_size: int = 0,
+        axis: int = 0,
     ):
         self.data = data
         self.scales = np.asarray(scales, dtype=np.float32).ravel()
@@ -90,6 +98,10 @@ class QuantizedTensor:
         self.dtype_code = dtype_code
         self.quant_scheme = quant_scheme
         self.group_size = group_size
+        # Channel axis for per_channel quantization; ignored otherwise. Stored
+        # on the wire so per_channel tensors quantized along axis != 0 can be
+        # dequantized correctly.
+        self.axis = int(axis)
 
     @property
     def dtype_name(self) -> str:
@@ -219,6 +231,7 @@ class QuantizedTensor:
             dtype_code=dtype_code,
             quant_scheme=quant_scheme,
             group_size=group_size,
+            axis=axis if quant_scheme == QUANT_PER_CHANNEL else 0,
         )
 
     def dequantize(self) -> np.ndarray:
@@ -238,15 +251,20 @@ class QuantizedTensor:
             result = (values - self.zero_points[0]) * self.scales[0]
 
         elif self.quant_scheme == QUANT_PER_CHANNEL:
-            # Need to figure out which axis was used — we use axis=0 convention
-            # since shape is preserved
+            # Values are flat in the original C-order layout. Move the channel
+            # axis to the front (matching how quantize() computed per-channel
+            # scales), apply the affine map per channel, then move it back.
             num_channels = len(self.scales)
-            result = np.empty_like(values)
-            channel_size = num_elements // num_channels
-            reshaped = values.reshape(num_channels, channel_size)
+            v = values.reshape(self.shape)
+            moved = np.moveaxis(v, self.axis, 0)
+            moved_flat = moved.reshape(num_channels, -1)
             for ch in range(num_channels):
-                reshaped[ch] = (reshaped[ch] - self.zero_points[ch]) * self.scales[ch]
-            result = reshaped.ravel()
+                moved_flat[ch] = (
+                    moved_flat[ch] - self.zero_points[ch]
+                ) * self.scales[ch]
+            result = np.ascontiguousarray(
+                np.moveaxis(moved_flat.reshape(moved.shape), 0, self.axis)
+            ).ravel()
 
         elif self.quant_scheme == QUANT_PER_GROUP:
             result = np.empty_like(values)

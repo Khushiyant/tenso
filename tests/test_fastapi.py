@@ -27,7 +27,8 @@ def test_tenso_response():
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/octet-stream"
-    assert response.headers["x-tenso-version"] == "2"
+    # Header advertises the wire protocol version (v4), matching what's emitted.
+    assert response.headers["x-tenso-version"] == "4"
     assert "test.tenso" in response.headers["content-disposition"]
 
     # Verify content

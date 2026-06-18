@@ -30,7 +30,7 @@ def get_project_metadata():
     copyright_year = re.search(r"\\d{4}", project.get("version", ""))
     copyright_str = f"{copyright_year.group(0) if copyright_year else ''}, {author}"
     return {
-        "project": project.get("name", "SheetWise"),
+        "project": project.get("name", "Tenso"),
         "author": author,
         "release": project.get("version", "0.0.0"),
         "copyright": copyright_str,
@@ -42,7 +42,7 @@ meta = get_project_metadata()
 project = "Tenso"
 copyright = meta.get("copyright", "2025, Khushiyant")
 author = meta.get("author", "Khushiyant")
-release = meta.get("release", "0.6.0")
+release = meta.get("release", "0.22.0")
 
 # Mock heavy dependencies so docs can build without installing CUDA/Torch
 autodoc_mock_imports = [

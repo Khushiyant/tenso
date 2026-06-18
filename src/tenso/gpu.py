@@ -9,8 +9,21 @@ import struct
 import numpy as np
 import xxhash
 from typing import Any, Tuple
-from .config import _ALIGNMENT, _REV_DTYPE_MAP, FLAG_INTEGRITY
-from .core import _read_into_buffer, _read_packet_header, dumps
+from .config import (
+    _ALIGNMENT,
+    _REV_DTYPE_MAP,
+    FLAG_ALIGNED,
+    FLAG_BUNDLE,
+    FLAG_COMPRESSION,
+    FLAG_CUST_ALIGN,
+    FLAG_INTEGRITY,
+    FLAG_SPARSE,
+    FLAG_SPARSE_CSC,
+    FLAG_SPARSE_CSR,
+    MAX_ELEMENTS,
+    MAX_NDIM,
+)
+from .core import _QUANTIZED_CODES, _read_into_buffer, _read_packet_header, dumps
 
 # --- BACKEND DETECTION ---
 BACKEND = None
@@ -124,20 +137,57 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
         return None
     _ver, flags, dtype_code, ndim, header_size = parsed
 
+    # GPU-direct transfer targets a single dense, uncompressed tensor. Bundles,
+    # sparse, compressed, and quantized payloads must go through loads().
+    if flags & (FLAG_BUNDLE | FLAG_SPARSE | FLAG_SPARSE_CSR | FLAG_SPARSE_CSC):
+        raise ValueError(
+            "read_to_device supports only dense tensors; read bundles/sparse via loads()"
+        )
+    if flags & FLAG_COMPRESSION:
+        raise ValueError(
+            "read_to_device does not support compressed packets; use loads()"
+        )
+    if dtype_code in _QUANTIZED_CODES:
+        raise ValueError(
+            "read_to_device does not support quantized packets; use loads()"
+        )
+
+    if ndim > MAX_NDIM:
+        raise ValueError(f"Packet exceeds maximum dimensions ({ndim} > {MAX_NDIM})")
+
     shape_bytes = bytearray(ndim * 4)
     if not _read_into_buffer(source, shape_bytes):
         raise EOFError("Stream ended during shape read")
     shape = struct.unpack(f"<{ndim}I", shape_bytes)
-    dtype_np = _REV_DTYPE_MAP.get(dtype_code)
+    # np.prod(()) == 1, so a 0-dim scalar counts as one element (matching loads).
     num_elements = int(np.prod(shape))
+    if num_elements > MAX_ELEMENTS:
+        raise ValueError(f"Packet exceeds maximum elements ({num_elements})")
 
+    dtype_np = _REV_DTYPE_MAP.get(dtype_code)
+    if dtype_np is None:
+        raise ValueError(f"Unsupported dtype code: {dtype_code}")
+
+    # Resolve alignment from flags (custom-align exponent byte, 64-byte default,
+    # or unaligned) instead of assuming 64.
     current_pos = header_size + (ndim * 4)
-    padding_len = (_ALIGNMENT - (current_pos % _ALIGNMENT)) % _ALIGNMENT
+    if flags & FLAG_CUST_ALIGN:
+        exp_buf = bytearray(1)
+        if not _read_into_buffer(source, exp_buf):
+            raise EOFError("Stream ended during alignment byte read")
+        alignment = 1 << exp_buf[0]
+        current_pos += 1
+    elif flags & FLAG_ALIGNED:
+        alignment = _ALIGNMENT
+    else:
+        alignment = 1
+
+    padding_len = (alignment - (current_pos % alignment)) % alignment
     body_len = num_elements * dtype_np.itemsize
     has_integrity = (flags & FLAG_INTEGRITY) != 0
     footer_len = 8 if has_integrity else 0
 
-    host_view, _ = _get_allocator(padding_len + body_len + footer_len)
+    host_view, _owner = _get_allocator(padding_len + body_len + footer_len)
     try:
         if not _read_into_buffer(source, host_view):
             raise EOFError("Stream ended during body read")
@@ -148,7 +198,9 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
     if has_integrity:
         body_data = host_view[padding_len : padding_len + body_len]
         actual_hash = xxhash.xxh3_64_intdigest(body_data)
-        expected_hash = struct.unpack("<Q", host_view[padding_len + body_len :])[0]
+        expected_hash = struct.unpack(
+            "<Q", host_view[padding_len + body_len : padding_len + body_len + 8]
+        )[0]
         if actual_hash != expected_hash:
             raise ValueError("Integrity check failed: XXH3 mismatch")
 
@@ -156,11 +208,15 @@ def read_to_device(source: Any, device_id: int = 0) -> Any:
 
     if BACKEND == "cupy":
         with cp.cuda.Device(device_id):
-            return cp.array(body_view)
+            return cp.array(body_view)  # synchronous H2D copy
     elif BACKEND == "torch":
-        return torch.from_numpy(body_view).to(
+        result = torch.from_numpy(body_view).to(
             device=f"cuda:{device_id}", non_blocking=True
         )
+        # The pinned staging buffer (_owner) backs the async copy; block until
+        # it completes so the buffer can be released without a use-after-free.
+        torch.cuda.synchronize(device_id)
+        return result
     elif BACKEND == "jax":
         return jax.device_put(body_view, device=jax.devices()[device_id])
     return body_view
@@ -250,9 +306,15 @@ class GPUDirectTransfer:
         with cp.cuda.Device(self.device_id):
             gpu_buf = cp.empty(int(np.prod(shape)), dtype=dtype)
 
-            f = self._kvikio.CuFile(os.fdopen(fd, 'rb', closefd=False))
-            bytes_read = f.pread(gpu_buf, nbytes, file_offset=offset)
-            f.close()
+            fobj = os.fdopen(fd, 'rb', closefd=False)
+            try:
+                f = self._kvikio.CuFile(fobj)
+                try:
+                    bytes_read = f.pread(gpu_buf, nbytes, file_offset=offset)
+                finally:
+                    f.close()
+            finally:
+                fobj.close()
 
             if bytes_read != nbytes:
                 raise IOError(
@@ -282,11 +344,15 @@ class GPUDirectTransfer:
 
         if self._backend == "cupy":
             with cp.cuda.Device(self.device_id):
-                return cp.array(arr)
+                return cp.array(arr)  # synchronous H2D copy
         elif self._backend == "torch":
-            return torch.from_numpy(arr).to(
+            result = torch.from_numpy(arr).to(
                 device=f"cuda:{self.device_id}", non_blocking=True
             )
+            # Block until the async copy finishes so the pinned staging buffer
+            # can be freed without a use-after-free.
+            torch.cuda.synchronize(self.device_id)
+            return result
         elif self._backend == "jax":
             return jax.device_put(arr, device=jax.devices()[self.device_id])
         return arr

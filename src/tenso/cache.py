@@ -39,6 +39,7 @@ except ImportError:
 
 import numpy as np
 
+from .config import _HEADER_BASE_V4
 from .core import dumps, loads
 from .utils import get_packet_info
 
@@ -58,6 +59,13 @@ try:
     _HAS_ROBUST_MUTEX = True
 except ImportError:
     _HAS_ROBUST_MUTEX = False
+
+# The POSIX mutex is only *robust* (auto-recoverable after a holder crash) on
+# Linux via PTHREAD_MUTEX_ROBUST/EOWNERDEAD. On macOS the process-shared mutex
+# has no such recovery, so a crash while holding it would deadlock every later
+# acquirer forever. There we fall back to fcntl.flock, which the kernel releases
+# automatically when the holder dies.
+_ROBUST_MUTEX_OK = _HAS_ROBUST_MUTEX and sys.platform.startswith("linux")
 
 try:
     from .quantize import QuantizedTensor
@@ -351,7 +359,7 @@ class TensoCache:
             self._lock_file_path = None
             # Attach to existing robust mutex if creator initialized one
             self._use_robust_mutex = (
-                _HAS_ROBUST_MUTEX and buf[_H_MUTEX_INIT] == 1
+                _ROBUST_MUTEX_OK and buf[_H_MUTEX_INIT] == 1
             )
             if not self._use_robust_mutex:
                 self._init_file_lock()
@@ -428,7 +436,7 @@ class TensoCache:
 
     def _init_robust_mutex(self):
         """Initialize the POSIX robust mutex in the pool header (once)."""
-        if not _HAS_ROBUST_MUTEX:
+        if not _ROBUST_MUTEX_OK:
             return False
         buf = self._shm.buf
         if buf[_H_MUTEX_INIT] == 1:
@@ -555,7 +563,14 @@ class TensoCache:
         packet_size = struct.unpack_from('<I', buf, off + _E_PACKET_SIZE)[0]
         dtype_code = buf[off + _E_DTYPE]
         ndim = buf[off + _E_NDIM]
-        shape = struct.unpack_from(f'<{ndim}I', buf, off + _E_SHAPE) if ndim > 0 else ()
+        # Only up to 8 dims are stored in _E_SHAPE (32 bytes); never read past
+        # that, or we'd run into the adjacent metadata / next slot for ndim > 8.
+        stored_dims = min(ndim, 8)
+        shape = (
+            struct.unpack_from(f'<{stored_dims}I', buf, off + _E_SHAPE)
+            if stored_dims > 0
+            else ()
+        )
         access_time = struct.unpack_from('<d', buf, off + _E_ACCESS_TIME)[0]
         create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
         ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
@@ -782,7 +797,7 @@ class TensoCache:
     def _evict_expired(self) -> int:
         """Evict all TTL-expired entries. Returns bytes freed."""
         freed = 0
-        now = time.monotonic()
+        now = time.time()  # wall clock: create/access times are compared cross-process
         buf = self._shm.buf
 
         for i in range(self._max_entries):
@@ -888,7 +903,7 @@ class TensoCache:
 
         if isinstance(tensor, np.ndarray):
             ndim = tensor.ndim
-            header_size = 8 + ndim * 4
+            header_size = _HEADER_BASE_V4 + ndim * 4
             padding = (_DATA_ALIGNMENT - (header_size % _DATA_ALIGNMENT)) % _DATA_ALIGNMENT
             return header_size + padding + tensor.nbytes + 256
 
@@ -964,7 +979,7 @@ class TensoCache:
                             self._shm.buf[data_off:data_off + packet_size]
                         )
 
-                        now = time.monotonic()
+                        now = time.time()  # wall clock: create/access times are compared cross-process
                         self._write_entry(
                             existing_slot, key, data_off, actual_alloc, packet_size,
                             dtype_code, ndim, shape, ttl or 0.0, now
@@ -1015,7 +1030,7 @@ class TensoCache:
                     self._shm.buf[data_off:data_off + packet_size]
                 )
 
-                now = time.monotonic()
+                now = time.time()  # wall clock: create/access times are compared cross-process
                 self._write_entry(
                     slot, key, data_off, alloc_size, packet_size,
                     dtype_code, ndim, shape, ttl or 0.0, now
@@ -1094,7 +1109,11 @@ class TensoCache:
                 ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
                 if ttl > 0:
                     create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-                    if time.monotonic() - create_time >= ttl:
+                    # TTL bookkeeping uses the wall clock (time.time), NOT
+                    # time.monotonic: create_time lives in shared memory and is
+                    # compared by other processes, whose monotonic epoch differs,
+                    # so a monotonic timestamp would be meaningless cross-process.
+                    if time.time() - create_time >= ttl:
                         self._delete_slot(slot)
                         self._bump_generation()
                         self._inc_misses()
@@ -1107,7 +1126,7 @@ class TensoCache:
                 # concurrent put/delete cannot mutate the data under us.
                 packet_snapshot = bytes(buf[data_off:data_off + packet_size])
 
-                struct.pack_into('<d', buf, off + _E_ACCESS_TIME, time.monotonic())
+                struct.pack_into('<d', buf, off + _E_ACCESS_TIME, time.time())
                 self._lru_move_to_head(slot)
                 self._inc_hits()
 
@@ -1191,7 +1210,7 @@ class TensoCache:
             # Check TTL
             ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
             create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-            now = time.monotonic()
+            now = time.time()  # wall clock: create/access times are compared cross-process
 
             if ttl > 0 and now - create_time >= ttl:
                 self._delete_slot(slot)
@@ -1230,7 +1249,7 @@ class TensoCache:
         with self._lock:
             self._check_closed()
             self._sync_index()
-            now = time.monotonic()
+            now = time.time()  # wall clock: create/access times are compared cross-process
             result = []
             buf = self._shm.buf
 
@@ -1291,11 +1310,11 @@ class TensoCache:
             if buf[off + _E_STATUS] != _STATUS_ACTIVE:
                 return False
 
-            # Check TTL
+            # Check TTL (wall clock: create_time is compared cross-process)
             ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
             if ttl > 0:
                 create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-                if time.monotonic() - create_time >= ttl:
+                if time.time() - create_time >= ttl:
                     return False
             return True
 

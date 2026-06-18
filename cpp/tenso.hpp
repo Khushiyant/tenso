@@ -1,22 +1,31 @@
 /*
- * tenso.hpp — Header-only C++ client for the Tenso binary protocol.
+ * tenso.hpp — Thin RAII C++17 client for the Tenso binary protocol.
  *
- * Enables C++ inference engines (TensorRT, ONNXRuntime, LibTorch) to
- * read and write Tenso packets without any Python dependency.
+ * This header is a *shim* over the stable C ABI declared in <tenso.h>
+ * (cbindgen-generated from crates/tenso-ffi). It deliberately does NOT
+ * reimplement the wire-format parser/encoder: every read/write call below
+ * delegates to the native `tenso_*` functions, so C++ clients always agree
+ * byte-for-byte with the Rust core and with Python.
+ *
+ * Build/link:
+ *   - #include "tenso.hpp"  (this header)
+ *   - ensure <tenso.h> is on the include path (../include/tenso.h)
+ *   - link against the tenso-ffi cdylib/staticlib (e.g. libtenso_ffi)
  *
  * Usage:
  *   #include "tenso.hpp"
  *
- *   // Reading a packet from a buffer
+ *   // Reading: decode a packet into an owning Packet (frees in dtor).
  *   tenso::Packet pkt = tenso::read(buffer, buffer_size);
- *   float* data = pkt.data_as<float>();
- *   // shape: pkt.shape(), dtype: pkt.dtype()
+ *   const float* data = pkt.data_as<float>();
+ *   auto shape        = pkt.shape();   // std::vector<uint32_t>
+ *   tenso::DType dt   = pkt.dtype();
  *
- *   // Writing a packet to a buffer
- *   std::vector<uint8_t> out;
- *   tenso::write(out, data_ptr, shape, tenso::DType::Float32);
+ *   // Writing: Mode A (caller-allocates) dense encode via the C ABI.
+ *   std::vector<uint8_t> out =
+ *       tenso::write(data_ptr, data_bytes, shape, tenso::DType::Float32);
  *
- * Requirements: C++17 or later. No external dependencies.
+ * Requirements: C++17 or later. Depends only on <tenso.h> + the FFI library.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -24,36 +33,42 @@
 #ifndef TENSO_HPP
 #define TENSO_HPP
 
-#include <algorithm>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+// The C ABI. Adjust the include path in your build if <tenso.h> is not on the
+// default search path (the workspace ships it at ../include/tenso.h).
+#include "tenso.h"
+
 namespace tenso {
 
 // ---------------------------------------------------------------------------
-// Protocol constants
+// Protocol constants (mirrors src/tenso/config.py / crates/tenso-core).
+// Kept here for client convenience; parsing itself lives in the C core.
 // ---------------------------------------------------------------------------
 
 static constexpr uint8_t MAGIC[4] = {'T', 'N', 'S', 'O'};
-static constexpr uint8_t VERSION = 3;
-static constexpr size_t DEFAULT_ALIGNMENT = 64;
+static constexpr uint8_t VERSION = 4;
+static constexpr size_t  DEFAULT_ALIGNMENT = 64;
 
-// Flag bits
-static constexpr uint8_t FLAG_ALIGNED     = 1;
-static constexpr uint8_t FLAG_INTEGRITY   = 2;
-static constexpr uint8_t FLAG_COMPRESSION = 4;
-static constexpr uint8_t FLAG_SPARSE      = 8;
-static constexpr uint8_t FLAG_BUNDLE      = 16;
-static constexpr uint8_t FLAG_SPARSE_CSR  = 32;
-static constexpr uint8_t FLAG_SPARSE_CSC  = 64;
-static constexpr uint8_t FLAG_CUST_ALIGN  = 128;
+// Flag bits (u16 in v4).
+static constexpr uint16_t FLAG_ALIGNED     = 1;
+static constexpr uint16_t FLAG_INTEGRITY   = 2;
+static constexpr uint16_t FLAG_COMPRESSION = 4;
+static constexpr uint16_t FLAG_SPARSE      = 8;     // SPARSE_COO
+static constexpr uint16_t FLAG_BUNDLE      = 16;
+static constexpr uint16_t FLAG_SPARSE_CSR  = 32;
+static constexpr uint16_t FLAG_SPARSE_CSC  = 64;
+static constexpr uint16_t FLAG_CUST_ALIGN  = 128;
+static constexpr uint16_t FLAG_STRING      = 256;
+static constexpr uint16_t FLAG_RAGGED      = 512;
+static constexpr uint16_t FLAG_GPU_IPC_REF = 1024;  // bit 10 (v4 GPU IpcRef)
 
 // ---------------------------------------------------------------------------
-// DType enumeration
+// DType enumeration (codes match the wire format).
 // ---------------------------------------------------------------------------
 
 enum class DType : uint8_t {
@@ -72,8 +87,18 @@ enum class DType : uint8_t {
     Complex64  = 13,
     Complex128 = 14,
     BFloat16   = 15,
+    // Quantized / variable-length codes are decode-only through the C core;
+    // they have no fixed item size and are not valid inputs to write().
+    QInt8      = 16,
+    QUInt8     = 17,
+    QInt4      = 18,
+    QUInt4     = 19,
+    Str        = 20,
+    Bytes      = 21,
 };
 
+// Item size in bytes for fixed-width dtypes. Returns 0 for variable-width /
+// quantized codes (qint4/quint4/str/bytes have no fixed item size).
 inline size_t dtype_size(DType dt) {
     switch (dt) {
         case DType::Float32:    return 4;
@@ -91,9 +116,9 @@ inline size_t dtype_size(DType dt) {
         case DType::Complex64:  return 8;
         case DType::Complex128: return 16;
         case DType::BFloat16:   return 2;
-        default:
-            throw std::runtime_error("Unknown dtype code: " +
-                                     std::to_string(static_cast<int>(dt)));
+        case DType::QInt8:      return 1;
+        case DType::QUInt8:     return 1;
+        default:                return 0;  // qint4/quint4/str/bytes: no fixed size
     }
 }
 
@@ -114,189 +139,245 @@ inline const char* dtype_name(DType dt) {
         case DType::Complex64:  return "complex64";
         case DType::Complex128: return "complex128";
         case DType::BFloat16:   return "bfloat16";
+        case DType::QInt8:      return "qint8";
+        case DType::QUInt8:     return "quint8";
+        case DType::QInt4:      return "qint4";
+        case DType::QUInt4:     return "quint4";
+        case DType::Str:        return "string";
+        case DType::Bytes:      return "bytes";
         default:                return "unknown";
     }
 }
 
 // ---------------------------------------------------------------------------
-// Packet — a parsed view into a Tenso buffer (zero-copy for dense)
+// Error type — carries the thread-local message from tenso_last_error().
 // ---------------------------------------------------------------------------
 
-struct Packet {
-    DType                    dtype_val;
-    uint8_t                  flags;
-    uint8_t                  version;
-    std::vector<uint32_t>    shape_vec;
-    const uint8_t*           body_ptr;    // points into the source buffer
-    size_t                   body_bytes;
-    bool                     integrity_verified; // false if packet has FLAG_INTEGRITY but hash wasn't checked
+class Error : public std::runtime_error {
+public:
+    explicit Error(const std::string& what) : std::runtime_error(what) {}
+};
 
-    DType dtype() const { return dtype_val; }
+namespace detail {
 
-    const std::vector<uint32_t>& shape() const { return shape_vec; }
+// Pull the most recent error string from the C core (thread-local), falling
+// back to a generic message when the core reported nothing.
+inline std::string last_error(const char* fallback) {
+    const char* msg = tenso_last_error();
+    if (msg != nullptr && msg[0] != '\0') return std::string(msg);
+    return std::string(fallback);
+}
 
-    size_t ndim() const { return shape_vec.size(); }
+}  // namespace detail
+
+// ---------------------------------------------------------------------------
+// Packet — an owning RAII wrapper around an opaque TensoView*.
+//
+// Decoding is performed by the C core (`tenso_decode`); this class only owns
+// the resulting handle and exposes typed, zero-copy accessors over it. The
+// destructor calls `tenso_view_free` exactly once. Move-only (no copy) so the
+// underlying handle has a single owner.
+//
+// IMPORTANT: the body bytes are borrowed from the source buffer passed to
+// read()/decode(). That buffer must outlive the Packet.
+// ---------------------------------------------------------------------------
+
+class Packet {
+public:
+    Packet() = default;
+
+    explicit Packet(::TensoView* view) : view_(view) {}
+
+    // Move-only.
+    Packet(const Packet&)            = delete;
+    Packet& operator=(const Packet&) = delete;
+
+    Packet(Packet&& other) noexcept : view_(other.view_) {
+        other.view_ = nullptr;
+    }
+    Packet& operator=(Packet&& other) noexcept {
+        if (this != &other) {
+            reset();
+            view_       = other.view_;
+            other.view_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~Packet() { reset(); }
+
+    bool valid() const { return view_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+
+    // Raw opaque handle (for advanced interop). Ownership stays with Packet.
+    const ::TensoView* handle() const { return view_; }
+
+    DType dtype() const {
+        ensure();
+        return static_cast<DType>(tenso_view_dtype(view_));
+    }
+
+    size_t ndim() const {
+        ensure();
+        return static_cast<size_t>(tenso_view_ndim(view_));
+    }
+
+    std::vector<uint32_t> shape() const {
+        ensure();
+        const uint32_t* s = tenso_view_shape(view_);
+        size_t n          = static_cast<size_t>(tenso_view_ndim(view_));
+        if (s == nullptr) return {};
+        return std::vector<uint32_t>(s, s + n);
+    }
 
     size_t num_elements() const {
-        if (shape_vec.empty()) return 0;
-        size_t n = 1;
-        for (auto d : shape_vec) n *= d;
-        return n;
+        ensure();
+        const uint32_t* s = tenso_view_shape(view_);
+        size_t n          = static_cast<size_t>(tenso_view_ndim(view_));
+        if (s == nullptr || n == 0) return 0;
+        size_t prod = 1;
+        for (size_t i = 0; i < n; ++i) prod *= static_cast<size_t>(s[i]);
+        return prod;
     }
 
-    /// Return a typed pointer to the body data.
+    // Pointer to the body bytes (borrowed from the source buffer).
+    const uint8_t* body_ptr() const {
+        ensure();
+        return tenso_view_body_ptr(view_);
+    }
+
+    size_t body_bytes() const {
+        ensure();
+        return static_cast<size_t>(tenso_view_body_len(view_));
+    }
+
+    // Typed, zero-copy view of the body. No alignment/dtype validation beyond
+    // what the core already performed; caller must request the right T.
     template <typename T>
     const T* data_as() const {
-        return reinterpret_cast<const T*>(body_ptr);
+        return reinterpret_cast<const T*>(body_ptr());
     }
 
-    /// Copy the body into a caller-provided buffer.
+    // Copy the body into a caller-provided buffer.
     void copy_to(void* dest, size_t dest_size) const {
-        if (dest_size < body_bytes)
-            throw std::runtime_error("Destination buffer too small");
-        std::memcpy(dest, body_ptr, body_bytes);
+        size_t n = body_bytes();
+        if (dest_size < n) throw Error("tenso: destination buffer too small");
+        const uint8_t* src = body_ptr();
+        for (size_t i = 0; i < n; ++i)
+            static_cast<uint8_t*>(dest)[i] = src[i];
     }
+
+    // Explicitly free the underlying view early.
+    void reset() {
+        if (view_ != nullptr) {
+            tenso_view_free(view_);
+            view_ = nullptr;
+        }
+    }
+
+private:
+    void ensure() const {
+        if (view_ == nullptr) throw Error("tenso: operation on an empty Packet");
+    }
+
+    ::TensoView* view_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
-// read() — parse a Tenso dense packet from a byte buffer
+// read()/decode() — decode a packet via the C core into an owning Packet.
+//
+// The body is borrowed from `buf`; keep `buf` alive while the Packet is used.
+// Throws tenso::Error on any decode failure (NULL view), surfacing the
+// core's thread-local error message.
 // ---------------------------------------------------------------------------
 
-inline Packet read(const uint8_t* buf, size_t len) {
-    if (len < 8)
-        throw std::runtime_error("Tenso packet too short");
-
-    if (std::memcmp(buf, MAGIC, 4) != 0)
-        throw std::runtime_error("Invalid Tenso magic");
-
-    Packet pkt{};
-    pkt.version   = buf[4];
-    pkt.flags     = buf[5];
-    pkt.dtype_val = static_cast<DType>(buf[6]);
-    uint8_t ndim  = buf[7];
-
-    // Bundles, sparse, and compressed packets need special handling
-    if (pkt.flags & (FLAG_BUNDLE | FLAG_SPARSE | FLAG_SPARSE_CSR |
-                     FLAG_SPARSE_CSC | FLAG_COMPRESSION))
-        throw std::runtime_error(
-            "tenso.hpp read() only supports dense uncompressed packets. "
-            "Use the Python library for bundles, sparse, or compressed data.");
-
-    size_t cursor = 8;
-    if (cursor + ndim * 4 > len)
-        throw std::runtime_error("Packet too short for shape");
-
-    pkt.shape_vec.resize(ndim);
-    for (uint8_t i = 0; i < ndim; ++i) {
-        uint32_t dim;
-        std::memcpy(&dim, buf + cursor, 4);
-        pkt.shape_vec[i] = dim;
-        cursor += 4;
-    }
-
-    // Alignment
-    size_t alignment = 1;
-    if (pkt.flags & FLAG_CUST_ALIGN) {
-        if (cursor >= len)
-            throw std::runtime_error("Missing alignment byte");
-        alignment = size_t(1) << buf[cursor];
-        cursor += 1;
-    } else if (pkt.flags & FLAG_ALIGNED) {
-        alignment = DEFAULT_ALIGNMENT;
-    }
-
-    size_t header_len = cursor;
-    size_t remainder = header_len % alignment;
-    size_t padding = (remainder == 0) ? 0 : (alignment - remainder);
-    size_t body_start = header_len + padding;
-
-    size_t item_sz = dtype_size(pkt.dtype_val);
-    size_t body_len = pkt.num_elements() * item_sz;
-    size_t footer_len = (pkt.flags & FLAG_INTEGRITY) ? 8 : 0;
-
-    if (body_start + body_len + footer_len > len)
-        throw std::runtime_error("Packet too short for body");
-
-    pkt.body_ptr = buf + body_start;
-    pkt.body_bytes = body_len;
-    pkt.integrity_verified = (pkt.flags & FLAG_INTEGRITY) == 0; // true only if no check needed
-
-    return pkt;
+inline Packet decode(const uint8_t* buf, size_t len) {
+    ::TensoView* v = tenso_decode(buf, static_cast<uintptr_t>(len));
+    if (v == nullptr) throw Error(detail::last_error("tenso: decode failed"));
+    return Packet(v);
 }
 
-// ---------------------------------------------------------------------------
-// write() — serialize a dense array into a Tenso packet
-// ---------------------------------------------------------------------------
-
-inline void write(
-    std::vector<uint8_t>& out,
-    const void* data,
-    const std::vector<uint32_t>& shape,
-    DType dtype,
-    size_t alignment = DEFAULT_ALIGNMENT,
-    bool check_integrity = false
-) {
-    uint8_t ndim = static_cast<uint8_t>(shape.size());
-    size_t num_elements = 1;
-    for (auto d : shape) num_elements *= d;
-    size_t body_len = num_elements * dtype_size(dtype);
-
-    bool custom_align = (alignment != 64);
-    size_t header_len = 8 + ndim * 4 + (custom_align ? 1 : 0);
-    size_t remainder = header_len % alignment;
-    size_t padding = (remainder == 0) ? 0 : (alignment - remainder);
-    size_t footer_len = check_integrity ? 8 : 0;
-    size_t total = header_len + padding + body_len + footer_len;
-
-    out.resize(total, 0);
-    uint8_t* buf = out.data();
-
-    // Header
-    std::memcpy(buf, MAGIC, 4);
-    buf[4] = VERSION;
-
-    uint8_t flags = 0;
-    if (custom_align) flags |= FLAG_CUST_ALIGN;
-    else              flags |= FLAG_ALIGNED;
-    if (check_integrity) flags |= FLAG_INTEGRITY;
-    buf[5] = flags;
-
-    buf[6] = static_cast<uint8_t>(dtype);
-    buf[7] = ndim;
-
-    size_t cursor = 8;
-    for (uint8_t i = 0; i < ndim; ++i) {
-        std::memcpy(buf + cursor, &shape[i], 4);
-        cursor += 4;
-    }
-
-    if (custom_align) {
-        // trailing_zeros equivalent
-        uint8_t exponent = 0;
-        size_t a = alignment;
-        while (a > 1) { a >>= 1; exponent++; }
-        buf[cursor] = exponent;
-    }
-
-    if (check_integrity)
-        throw std::runtime_error(
-            "Integrity footer requires XXH3 hashing which is not included in "
-            "this header-only library. Use check_integrity=false, or link "
-            "against xxHash and append the 8-byte footer yourself.");
-
-    // Body
-    size_t body_start = header_len + padding;
-    std::memcpy(buf + body_start, data, body_len);
-}
-
-// ---------------------------------------------------------------------------
-// Convenience: read from a std::vector
-// ---------------------------------------------------------------------------
+inline Packet read(const uint8_t* buf, size_t len) { return decode(buf, len); }
 
 inline Packet read(const std::vector<uint8_t>& buf) {
-    return read(buf.data(), buf.size());
+    return decode(buf.data(), buf.size());
 }
 
-} // namespace tenso
+// ---------------------------------------------------------------------------
+// parse_header() — thin wrapper over tenso_parse_header (no body copy).
+// ---------------------------------------------------------------------------
 
-#endif // TENSO_HPP
+inline ::TensoHeader parse_header(const uint8_t* buf, size_t len) {
+    ::TensoHeader h{};
+    int rc = tenso_parse_header(buf, static_cast<uintptr_t>(len), &h);
+    if (rc != TENSO_OK)
+        throw Error(detail::last_error("tenso: parse_header failed"));
+    return h;
+}
+
+// ---------------------------------------------------------------------------
+// write() — serialize a dense array via the C core (Mode A: caller-allocates).
+//
+// Two-call protocol: query required size, then encode into a sized buffer.
+// All wire-format work happens in the native core; this only marshals args.
+// ---------------------------------------------------------------------------
+
+inline std::vector<uint8_t> write(const void*                  data,
+                                  size_t                       data_bytes,
+                                  const std::vector<uint32_t>& shape,
+                                  DType                        dtype,
+                                  size_t                       alignment = DEFAULT_ALIGNMENT,
+                                  bool                         check_integrity = false,
+                                  bool                         compress = false) {
+    const uint8_t* data_ptr = static_cast<const uint8_t*>(data);
+    const uint32_t* shape_ptr = shape.empty() ? nullptr : shape.data();
+    uintptr_t       ndim      = static_cast<uintptr_t>(shape.size());
+
+    uintptr_t needed = 0;
+    int rc = tenso_dense_required_size(data_ptr,
+                                       static_cast<uintptr_t>(data_bytes),
+                                       static_cast<uint8_t>(dtype),
+                                       shape_ptr,
+                                       ndim,
+                                       check_integrity,
+                                       compress,
+                                       static_cast<uintptr_t>(alignment),
+                                       &needed);
+    if (rc != TENSO_OK)
+        throw Error(detail::last_error("tenso: dense_required_size failed"));
+
+    std::vector<uint8_t> out(static_cast<size_t>(needed));
+    uintptr_t written = 0;
+    rc = tenso_encode_dense_into(data_ptr,
+                                 static_cast<uintptr_t>(data_bytes),
+                                 static_cast<uint8_t>(dtype),
+                                 shape_ptr,
+                                 ndim,
+                                 check_integrity,
+                                 compress,
+                                 static_cast<uintptr_t>(alignment),
+                                 out.data(),
+                                 static_cast<uintptr_t>(out.size()),
+                                 &written);
+    if (rc != TENSO_OK)
+        throw Error(detail::last_error("tenso: encode_dense_into failed"));
+
+    out.resize(static_cast<size_t>(written));
+    return out;
+}
+
+// Convenience overload: append into a caller-owned vector (clears it first).
+inline void write(std::vector<uint8_t>&        out,
+                  const void*                  data,
+                  size_t                       data_bytes,
+                  const std::vector<uint32_t>& shape,
+                  DType                        dtype,
+                  size_t                       alignment = DEFAULT_ALIGNMENT,
+                  bool                         check_integrity = false,
+                  bool                         compress = false) {
+    out = write(data, data_bytes, shape, dtype, alignment, check_integrity, compress);
+}
+
+}  // namespace tenso
+
+#endif  // TENSO_HPP

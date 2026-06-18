@@ -1,4 +1,3 @@
-import ctypes
 import struct
 import numpy as np
 from .config import _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_INTEGRITY
@@ -29,9 +28,14 @@ def is_aligned(data: bytes, alignment: int = 64) -> bool:
     bool
         True if the data is aligned, False otherwise.
     """
-    return (
-        ctypes.addressof(ctypes.c_char.from_buffer(bytearray(data))) % alignment
-    ) == 0
+    mv = memoryview(data)
+    if mv.nbytes == 0:
+        return True
+    # np.frombuffer is zero-copy, so .ctypes.data is the address of the caller's
+    # own buffer — not a throwaway copy (which is what the previous
+    # ctypes.from_buffer(bytearray(data)) check inadvertently measured).
+    addr = np.frombuffer(mv, dtype=np.uint8).ctypes.data
+    return (addr % alignment) == 0
 
 
 def get_packet_info(data: bytes) -> dict:

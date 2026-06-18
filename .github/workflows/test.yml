@@ -71,7 +71,7 @@ jobs:
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   fuzz-smoke:
-    name: Fuzz smoke (parse_header, 30s)
+    name: Fuzz smoke (parse_header + loads_dense, 30s each)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,3 +85,226 @@ jobs:
       - name: Run parse_header fuzz target (30s)
         working-directory: fuzz
         run: cargo +nightly fuzz run parse_header -- -max_total_time=30
+
+      - name: Run loads_dense fuzz target (30s)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run loads_dense -- -max_total_time=30
+
+  pyfuzz-smoke:
+    name: Python fuzz smoke (atheris)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # scipy is installed so the real sparse deserialization path runs under
+      # the fuzzer (rather than short-circuiting on a missing-scipy ImportError);
+      # the pure-Python path runs via PYTHONPATH=src so we do not need maturin
+      # or the Rust extension to build.
+      - name: Install runtime deps + atheris
+        run: pip install atheris numpy lz4 xxhash scipy
+
+      # atheris wheels are not available on every platform/Python combo, so
+      # tolerate install/run failures here without failing the whole CI run.
+      - name: Run pyfuzz targets (short)
+        continue-on-error: true
+        env:
+          PYTHONPATH: src
+        run: |
+          python pyfuzz/fuzz_loads.py -atheris_runs=20000
+          python pyfuzz/fuzz_get_packet_info.py -atheris_runs=20000
+
+  # ---------------------------------------------------------------------------
+  # Native workspace (crates/tenso-*). These jobs exercise the pure-Rust engine
+  # built ALONGSIDE the PyO3 module; the root tenso-rs crate is untouched.
+  # ---------------------------------------------------------------------------
+
+  cargo-core-test:
+    name: cargo test tenso-core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # tenso-core is the pure-Rust codec (no pyo3/numpy/libc). Test it on its
+      # own so a failure points at the engine rather than the Python bridge.
+      - name: cargo test -p tenso-core (default features)
+        run: cargo test -p tenso-core --verbose
+
+      # Exercise the optional codec features so their cfg-gated paths are built
+      # and tested too (integrity = XXH3, compression = LZ4 frame). These are
+      # additive on top of the default std feature.
+      - name: cargo test -p tenso-core (all features)
+        run: cargo test -p tenso-core --features "integrity,compression" --verbose
+
+      # Run the host-only unit tests for the device/bus/ffi crates too. These need
+      # no GPU (MockBackend + CpuBackend, POSIX shm seqlock/ring, C ABI) and were
+      # previously only build-checked, so a logic regression in MockBackend, the
+      # IPC frame, or the shm/ring/seqlock code could pass CI unnoticed.
+      - name: cargo test -p tenso-device -p tenso-bus -p tenso-ffi
+        run: cargo test -p tenso-device -p tenso-bus -p tenso-ffi --verbose
+
+  core-no-std:
+    name: tenso-core no_std + alloc build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # The contract requires tenso-core to stay no_std + alloc friendly. With
+      # --no-default-features the std-only dep (lz4_flex, behind `compression`) is
+      # dropped, so this build proves the crate compiles without std. integrity
+      # (xxhash-rust) is no_std friendly and is allowed on top.
+      - name: cargo build -p tenso-core --no-default-features
+        run: cargo build -p tenso-core --no-default-features --verbose
+
+      - name: cargo build -p tenso-core --no-default-features --features integrity
+        run: cargo build -p tenso-core --no-default-features --features integrity --verbose
+
+  ffi-header:
+    name: tenso-ffi build + cbindgen header up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --version 0.27.0 --locked
+
+      # Build the cdylib/staticlib so the C ABI surface is verified to compile.
+      - name: cargo build -p tenso-ffi
+        run: cargo build -p tenso-ffi --verbose
+
+      # Regenerate the header into a temp file and diff against the committed
+      # include/tenso.h. If they differ the committed header is stale: run
+      # `cargo build -p tenso-ffi` (or `cbindgen`) locally and commit the result.
+      - name: Verify include/tenso.h is up to date (cbindgen --output diff)
+        run: |
+          cbindgen --config crates/tenso-ffi/cbindgen.toml \
+                   --crate tenso-ffi \
+                   --output /tmp/tenso.generated.h \
+                   crates/tenso-ffi
+          diff -u include/tenso.h /tmp/tenso.generated.h
+
+  cpp-header-compile:
+    name: C++ compile cpp/tenso.hpp + include/tenso.h
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compile a tiny translation unit that includes both the cbindgen C ABI
+      # header and the RAII C++ shim. This catches header rot (missing includes,
+      # bad guards, C/C++ incompatibilities) without needing the Rust libs.
+      - name: Compile header smoke test (C++17)
+        shell: bash
+        run: |
+          mkdir -p /tmp/tenso-cpp
+          cat > /tmp/tenso-cpp/smoke.cpp <<'EOF'
+          // Header compile smoke test: both headers must parse cleanly under C++17
+          // and coexist in a single translation unit.
+          #include "tenso.h"
+          #include "tenso.hpp"
+
+          #include <cstdint>
+          #include <vector>
+
+          int main() {
+              // Exercise the C ABI declarations (link not required; -c only).
+              TensoHeader hdr{};
+              (void)hdr;
+              (void)&tenso_parse_header;
+              (void)&tenso_decode;
+              (void)&tenso_view_free;
+
+              // Exercise the C++ shim types.
+              tenso::DType dt = tenso::DType::Float32;
+              (void)tenso::dtype_size(dt);
+              (void)tenso::dtype_name(dt);
+              return 0;
+          }
+          EOF
+          g++ -std=c++17 -Wall -Wextra -c \
+              -Iinclude -Icpp \
+              /tmp/tenso-cpp/smoke.cpp -o /tmp/tenso-cpp/smoke.o
+
+  cross-aarch64:
+    name: Cross build aarch64-unknown-linux-gnu (Jetson placeholder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # `cross` runs the build inside a target-matched container so we get the
+      # aarch64 C toolchain/linker without configuring it by hand. This is a
+      # build-only check: it proves the native workspace cross-compiles for
+      # Jetson-class targets. tenso-cuda is dlopen-only, so no CUDA toolkit is
+      # needed at build time.
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: cross build native crates for aarch64 (build-only)
+        run: |
+          cross build --target aarch64-unknown-linux-gnu \
+            -p tenso-core \
+            -p tenso-device \
+            -p tenso-cuda \
+            -p tenso-bus \
+            -p tenso-ffi \
+            --verbose
+
+  # ---------------------------------------------------------------------------
+  # GPU placeholder (NON-REQUIRED). CUDA IPC / unified-memory paths in
+  # tenso-cuda need a real GPU, which GitHub-hosted runners do not provide. The
+  # job below is intentionally commented out: enable it once a self-hosted
+  # runner with the `gpu` label and the CUDA toolkit is attached. Until then the
+  # MockBackend in tenso-device covers the GPU-direct code paths on CI.
+  # ---------------------------------------------------------------------------
+  #
+  # gpu-cuda:
+  #   name: CUDA backend (self-hosted GPU)
+  #   runs-on: [self-hosted, linux, gpu]
+  #   # Do not block PRs on GPU hardware availability.
+  #   continue-on-error: true
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Set up Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #
+  #     # Builds and tests the real dlopen'd CUDA driver path behind the `cuda`
+  #     # feature. Requires libcuda.so + a visible device on the runner.
+  #     - name: cargo test -p tenso-cuda --features cuda
+  #       run: cargo test -p tenso-cuda --features cuda --verbose
+  #
+  #     - name: cargo test -p tenso-device (GPU-backed)
+  #       run: cargo test -p tenso-device --verbose

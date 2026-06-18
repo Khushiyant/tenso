@@ -52,6 +52,9 @@ def file_lock_cache(monkeypatch):
     """TensoCache forced onto the fcntl file-lock fallback path."""
     import tenso.cache as cache_mod
     monkeypatch.setattr(cache_mod, "_HAS_ROBUST_MUTEX", False)
+    # The robust mutex is gated by _ROBUST_MUTEX_OK (Linux-only); patch it too,
+    # otherwise this only forces the file-lock path on non-Linux platforms.
+    monkeypatch.setattr(cache_mod, "_ROBUST_MUTEX_OK", False)
     c = TensoCache("4MB")
     assert not c._use_robust_mutex, "fixture failed to disable robust mutex"
     yield c
