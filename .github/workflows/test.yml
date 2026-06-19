@@ -124,7 +124,7 @@ jobs:
   # ---------------------------------------------------------------------------
 
   cargo-core-test:
-    name: cargo test tenso-core (${{ matrix.os }})
+    name: cargo test tenso (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -139,16 +139,16 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
-      # tenso-core is the pure-Rust codec (no pyo3/numpy/libc). Test it on its
+      # tenso is the pure-Rust codec (no pyo3/numpy/libc). Test it on its
       # own so a failure points at the engine rather than the Python bridge.
-      - name: cargo test -p tenso-core (default features)
-        run: cargo test -p tenso-core --verbose
+      - name: cargo test -p tenso (default features)
+        run: cargo test -p tenso --verbose
 
       # Exercise the optional codec features so their cfg-gated paths are built
       # and tested too (integrity = XXH3, compression = LZ4 frame). These are
       # additive on top of the default std feature.
-      - name: cargo test -p tenso-core (all features)
-        run: cargo test -p tenso-core --features "integrity,compression" --verbose
+      - name: cargo test -p tenso (all features)
+        run: cargo test -p tenso --features "integrity,compression" --verbose
 
       # Run the host-only unit tests for the device/bus/ffi crates too. These need
       # no GPU (MockBackend + CpuBackend, POSIX shm seqlock/ring, C ABI) and were
@@ -158,7 +158,7 @@ jobs:
         run: cargo test -p tenso-device -p tenso-bus -p tenso-ffi --verbose
 
   core-no-std:
-    name: tenso-core no_std + alloc build
+    name: tenso no_std + alloc build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -169,15 +169,15 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
-      # The contract requires tenso-core to stay no_std + alloc friendly. With
+      # The contract requires tenso to stay no_std + alloc friendly. With
       # --no-default-features the std-only dep (lz4_flex, behind `compression`) is
       # dropped, so this build proves the crate compiles without std. integrity
       # (xxhash-rust) is no_std friendly and is allowed on top.
-      - name: cargo build -p tenso-core --no-default-features
-        run: cargo build -p tenso-core --no-default-features --verbose
+      - name: cargo build -p tenso --no-default-features
+        run: cargo build -p tenso --no-default-features --verbose
 
-      - name: cargo build -p tenso-core --no-default-features --features integrity
-        run: cargo build -p tenso-core --no-default-features --features integrity --verbose
+      - name: cargo build -p tenso --no-default-features --features integrity
+        run: cargo build -p tenso --no-default-features --features integrity --verbose
 
   ffi-header:
     name: tenso-ffi build + cbindgen header up to date
@@ -275,7 +275,7 @@ jobs:
       - name: cross build native crates for aarch64 (build-only)
         run: |
           cross build --target aarch64-unknown-linux-gnu \
-            -p tenso-core \
+            -p tenso \
             -p tenso-device \
             -p tenso-cuda \
             -p tenso-bus \

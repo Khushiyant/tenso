@@ -7,7 +7,7 @@ into `.github/workflows/release.yml` and fires on the **same release** that
 | Audience | Artifact | Channel | Automation |
 | --- | --- | --- | --- |
 | Python | `tenso` wheel + sdist | **PyPI** | fully automated (`publish`) |
-| Rust | `tenso-core` / `-device` / `-cuda` / `-ffi` / `-bus` | **crates.io** | automated once the token is set (`publish-crates`) |
+| Rust | `tenso` / `-device` / `-cuda` / `-ffi` / `-bus` | **crates.io** | automated once the token is set (`publish-crates`) |
 | C / C++ | per-OS `.so`/`.a`/`.dylib`/`.dll` + `tenso.h`/`tenso.hpp` | **GitHub Release assets** | fully automated (`release-binaries`) |
 | ROS 2 | `tenso_ros`, `tenso_msgs` | **rosdistro / `bloom`** | manual (your ROS account) |
 
@@ -28,14 +28,14 @@ never fails a release before you're ready.
 2. Add it as a repo secret named **`CARGO_REGISTRY_TOKEN`**
    (Settings → Secrets and variables → Actions → New repository secret).
 3. The next release publishes all five crates **in dependency order**
-   (`tenso-core` → `tenso-device` → `tenso-cuda` / `-ffi` / `-bus`); `cargo`
+   (`tenso` → `tenso-device` → `tenso-cuda` / `-ffi` / `-bus`); `cargo`
    waits for each to index before the dependents resolve it.
 
 First publish only: crates.io requires each crate name to be available — if any
 name is taken, rename in `Cargo.toml` before the first release. To verify
-locally without publishing: `cargo publish --dry-run -p tenso-core`.
+locally without publishing: `cargo publish --dry-run -p tenso`.
 
-Consumers then use: `cargo add tenso-core` (and `tenso-ffi` for the C ABI, etc.).
+Consumers then use: `cargo add tenso` (and `tenso-ffi` for the C ABI, etc.).
 
 ## 3. C / C++ — prebuilt binaries (automatic)
 `release-binaries` builds `tenso-ffi --release` on Linux / macOS / Windows and

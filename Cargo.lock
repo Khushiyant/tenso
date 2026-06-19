@@ -522,15 +522,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tenso-bus"
-version = "0.22.0"
-dependencies = [
- "libc",
- "tenso-core",
-]
-
-[[package]]
-name = "tenso-core"
+name = "tenso"
 version = "0.22.0"
 dependencies = [
  "lz4_flex",
@@ -538,11 +530,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tenso-bus"
+version = "0.22.0"
+dependencies = [
+ "libc",
+ "tenso",
+]
+
+[[package]]
 name = "tenso-cuda"
 version = "0.22.0"
 dependencies = [
  "libloading",
- "tenso-core",
+ "tenso",
  "tenso-device",
 ]
 
@@ -550,7 +550,7 @@ dependencies = [
 name = "tenso-device"
 version = "0.22.0"
 dependencies = [
- "tenso-core",
+ "tenso",
 ]
 
 [[package]]
@@ -558,7 +558,7 @@ name = "tenso-ffi"
 version = "0.22.0"
 dependencies = [
  "cbindgen",
- "tenso-core",
+ "tenso",
 ]
 
 [[package]]
@@ -567,7 +567,7 @@ version = "0.22.0"
 dependencies = [
  "libc",
  "pyo3",
- "tenso-core",
+ "tenso",
 ]
 
 [[package]]

@@ -504,7 +504,7 @@ Registers Tenso as a custom serializer for Ray, replacing pickle-based serializa
 - Remove IS_LITTLE_ENDIAN variable from config
   ([`9c77814`](https://github.com/Khushiyant/tenso/commit/9c77814031891db68ba319bbd1234c5f2453c7c6))
 
-- Update package name from tenso-core to tenso in installation instructions
+- Update package name from tenso to tenso in installation instructions
   ([`ebdf752`](https://github.com/Khushiyant/tenso/commit/ebdf7522c40e5d99890e7514be1352e63f943d04))
 
 - Update project description in pyproject.toml

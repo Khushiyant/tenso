@@ -2,7 +2,7 @@
 //!
 //! `DeviceBackend` trait, `CpuBackend` (host mem as device mem, IPC via a
 //! process-local registry), `MockBackend` (Vec<u8> VRAM + op log + fault
-//! injection), and `GpuCodec` (tenso-core encode/decode + IPC framing).
+//! injection), and `GpuCodec` (tenso encode/decode + IPC framing).
 
 #![allow(dead_code, unused)]
 
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use tenso_core::{
+use tenso::{
     Decoded, Dtype, EncodeOpts, IpcRef, TensoError, FLAG_GPU_IPC_REF, FLAG_INTEGRITY,
     HEADER_BASE_V4, IPC_REF_DEVICE_UUID_LEN, IPC_REF_DISCRIMINATOR, IPC_REF_HANDLE_LEN,
     IPC_REF_PACKET_LEN, MAGIC, VERSION,
@@ -265,7 +265,7 @@ impl MockBackend {
                 in_use: 0,
             }),
             unified,
-            alignment: tenso_core::ALIGNMENT,
+            alignment: tenso::ALIGNMENT,
             uuid,
         }
     }
@@ -454,10 +454,10 @@ impl DeviceBackend for MockBackend {
     }
 }
 
-// ---- IpcRef packet framing (mirror of tenso-core's wire layout) ----
+// ---- IpcRef packet framing (mirror of tenso's wire layout) ----
 //
-// Builds/parses the 106-byte IpcRef packet from tenso-core's framing constants,
-// byte-identical to tenso-core so packets round-trip through its parse/decode.
+// Builds/parses the 106-byte IpcRef packet from tenso's framing constants,
+// byte-identical to tenso so packets round-trip through its parse/decode.
 // Layout (LE): header[0..10] = magic, ver=4, flags=FLAG_GPU_IPC_REF, dtype=0,
 // ndim=0, IPC_REF_DISCRIMINATOR; body[10..106] = handle[64], byte_offset:u64,
 // nbytes:u64, device_uuid[16].
@@ -468,7 +468,7 @@ fn build_ipc_packet(ipc: &IpcRef) -> Vec<u8> {
     out[0..4].copy_from_slice(&MAGIC);
     out[4] = VERSION;
     out[5..7].copy_from_slice(&FLAG_GPU_IPC_REF.to_le_bytes());
-    // dtype_code (offset 7) = 0: matches tenso-core's write_ipc_ref; an IpcRef
+    // dtype_code (offset 7) = 0: matches tenso's write_ipc_ref; an IpcRef
     // has no element dtype.
     out[7] = 0;
     out[8] = 0; // ndim: no inline shape
@@ -520,7 +520,7 @@ fn parse_ipc_packet(bytes: &[u8]) -> Result<IpcRef, TensoError> {
     })
 }
 
-// ---- GpuCodec (orchestration over tenso-core) ----
+// ---- GpuCodec (orchestration over tenso) ----
 
 /// Result of decoding into device memory.
 pub struct DecodeResult {
@@ -530,7 +530,7 @@ pub struct DecodeResult {
     pub zero_copy: bool,
 }
 
-/// Drives tenso-core encode/decode against a `DeviceBackend`, incl. IPC framing.
+/// Drives tenso encode/decode against a `DeviceBackend`, incl. IPC framing.
 pub struct GpuCodec<'b, B: DeviceBackend> {
     pub backend: &'b B,
 }
@@ -541,7 +541,7 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
     }
 
     /// Encode a tensor whose body lives in device memory (stages D2H, then
-    /// runs tenso-core's dense encoder; D2H may be a no-cost view if unified).
+    /// runs tenso's dense encoder; D2H may be a no-cost view if unified).
     pub fn encode_from_device(
         &self,
         ptr: DevPtr,
@@ -554,14 +554,14 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
         let mut host = vec![0u8; nbytes];
         self.backend.copy_d2h(&mut host, ptr);
 
-        let spec = tenso_core::ArraySpec {
+        let spec = tenso::ArraySpec {
             data: &host,
             dtype,
             shape,
         };
-        let need = tenso_core::dense_required_size(&spec, opts).map_err(DevErr::Core)?;
+        let need = tenso::dense_required_size(&spec, opts).map_err(DevErr::Core)?;
         let mut out = vec![0u8; need];
-        let written = tenso_core::encode_dense_into(&spec, &mut out, opts).map_err(DevErr::Core)?;
+        let written = tenso::encode_dense_into(&spec, &mut out, opts).map_err(DevErr::Core)?;
         out.truncate(written);
         Ok(out)
     }
@@ -648,7 +648,7 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
 
     /// Decode `bytes` and borrow the dense body; non-dense/IPC packets error.
     fn decode_dense_body<'p>(&self, bytes: &'p [u8]) -> Result<&'p [u8], DevErr> {
-        match tenso_core::decode(bytes).map_err(DevErr::Core)? {
+        match tenso::decode(bytes).map_err(DevErr::Core)? {
             Decoded::Dense(view) => Ok(view.body),
             // Only dense bodies here; IpcRef goes through import_ipc, structured
             // packets aren't a single contiguous device body.
@@ -703,7 +703,7 @@ mod tests {
     fn mock_alignment_is_configurable() {
         let be = MockBackend::new(false).with_alignment(128);
         assert_eq!(be.alignment(), 128);
-        assert_eq!(MockBackend::new(false).alignment(), tenso_core::ALIGNMENT);
+        assert_eq!(MockBackend::new(false).alignment(), tenso::ALIGNMENT);
     }
 
     #[test]

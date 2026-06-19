@@ -182,7 +182,7 @@ jobs:
           # workspace.package.version + the root crate version, and the internal
           # path-dependency version literals, all track the released version.
           sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/" Cargo.toml
-          sed -i -E "s/(tenso-(core|device|cuda) = \{ path = \"[^\"]+\", version = )\"[0-9]+\.[0-9]+\.[0-9]+\"/\1\"$V\"/" Cargo.toml
+          sed -i -E "s/(tenso(-device|-cuda)? = \{ path = \"[^\"]+\", version = )\"[0-9]+\.[0-9]+\.[0-9]+\"/\1\"$V\"/" Cargo.toml
 
       - name: Publish in dependency order
         if: steps.token.outputs.have == 'true'
@@ -191,7 +191,7 @@ jobs:
         run: |
           # cargo waits for each crate to appear in the index before returning,
           # so the dependents resolve the just-published versions.
-          cargo publish -p tenso-core --allow-dirty
+          cargo publish -p tenso --allow-dirty
           cargo publish -p tenso-device --allow-dirty
           cargo publish -p tenso-cuda --allow-dirty
           cargo publish -p tenso-ffi --allow-dirty

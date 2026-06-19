@@ -1,5 +1,5 @@
 [package]
-name = "tenso-core"
+name = "tenso"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ categories.workspace = true
 description = "Pure-Rust core engine for the Tenso tensor wire format (no pyo3/numpy/libc)."
 
 [lib]
-name = "tenso_core"
+name = "tenso"
 
 [features]
 # Default keeps the crate std-enabled for ergonomic host builds, but the crate
@@ -24,6 +24,6 @@ compression = ["std", "dep:lz4_flex"]
 integrity = ["dep:xxhash-rust"]
 
 [dependencies]
-# NOTE: tenso-core must NOT depend on pyo3, numpy, or libc.
+# NOTE: tenso must NOT depend on pyo3, numpy, or libc.
 lz4_flex = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }

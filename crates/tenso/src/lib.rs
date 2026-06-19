@@ -1,4 +1,4 @@
-//! tenso-core: pure-Rust engine for the Tenso tensor wire format.
+//! tenso: pure-Rust engine for the Tenso tensor wire format.
 //!
 //! `no_std + alloc` friendly; `std` feature gates streaming writers + lz4_flex. No pyo3/numpy/libc.
 //! Byte-level authority: root `src/lib.rs`, `src/tenso/{config,core,quantize,ragged}.py`.
@@ -2455,7 +2455,7 @@ mod conformance {
     use std::path::PathBuf;
 
     fn fixtures_dir() -> PathBuf {
-        // CARGO_MANIFEST_DIR = <root>/crates/tenso-core
+        // CARGO_MANIFEST_DIR = <root>/crates/tenso
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.pop(); // crates
         p.pop(); // root

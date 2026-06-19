@@ -2,9 +2,9 @@
 // useless_conversion (fires in macro-generated code) silenced until then.
 #![allow(deprecated, clippy::useless_conversion)]
 
-//! Thin PyO3 binding over `tenso-core`. Owns only Python-facing concerns
+//! Thin PyO3 binding over `tenso`. Owns only Python-facing concerns
 //! (numpy extraction, object construction, dense/bundle/sparse dispatch,
-//! zero-copy `loads`, shm_mutex); all wire-format codec lives in `tenso_core`.
+//! zero-copy `loads`, shm_mutex); all wire-format codec lives in `tenso`.
 
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
@@ -17,7 +17,7 @@ use std::os::unix::io::FromRawFd;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 
-use tenso_core::{
+use tenso::{
     bundle_required_size, decode, dense_required_size, encode_bundle_into, encode_dense_into,
     encode_quantized_into, encode_sparse_into, encode_string_into, parse_header,
     quantized_required_size, sparse_required_size, string_required_size, ArraySpec, Decoded, Dtype,
@@ -67,7 +67,7 @@ fn shape_to_u32(dims: &[usize]) -> PyResult<Vec<u32>> {
         .collect()
 }
 
-/// Resolve a numpy dtype `name` string to a `tenso_core::Dtype`.
+/// Resolve a numpy dtype `name` string to a `tenso::Dtype`.
 fn dtype_from_name(name: &str) -> PyResult<Dtype> {
     let d = match name {
         "float32" => Dtype::F32,
@@ -151,7 +151,7 @@ fn collect_bundle_entries(
     compress: bool,
     alignment: usize,
 ) -> PyResult<Vec<(String, Vec<u8>)>> {
-    if dict.len() > tenso_core::MAX_BUNDLE_ENTRIES {
+    if dict.len() > tenso::MAX_BUNDLE_ENTRIES {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Bundle has {} entries; the wire format encodes the entry count in a \
              single byte, so at most 255 entries are supported",
@@ -299,7 +299,7 @@ fn dumps_rs<'py>(
 // dumps_quantized_rs / dumps_string_rs — encode non-dense Python types via core.
 // -----------------------------------------------------------------------------
 
-/// Encode a `QuantizedTensor` (extracted field-by-field) via `tenso-core`.
+/// Encode a `QuantizedTensor` (extracted field-by-field) via `tenso`.
 #[pyfunction]
 #[pyo3(signature = (qt, check_integrity=false, alignment=64))]
 fn dumps_quantized_rs<'py>(
@@ -524,7 +524,7 @@ fn dump_to_fd_rs<'py>(
 }
 
 // -----------------------------------------------------------------------------
-// loads_rs — decode via tenso_core, zero-copy into the original Python buffer
+// loads_rs — decode via tenso, zero-copy into the original Python buffer
 // -----------------------------------------------------------------------------
 
 /// Build a zero-copy numpy view over the dense body, mapped into `root_data`
@@ -675,8 +675,7 @@ fn loads_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<Option<PyObject>
         Ok(decoded) => decoded_to_py(py, data, base_ptr, decoded),
         // Compressed dense: decompress via core, build an owned numpy array.
         Err(TensoError::Lz4(_)) => {
-            let (dtype, shape, owned) =
-                tenso_core::decode_dense_to_owned(bytes).map_err(map_err)?;
+            let (dtype, shape, owned) = tenso::decode_dense_to_owned(bytes).map_err(map_err)?;
             let np = py.import("numpy")?;
             let arr = np
                 .call_method1("frombuffer", (PyBytes::new(py, &owned), dtype.name()))?
@@ -974,12 +973,12 @@ fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
 
 // -----------------------------------------------------------------------------
 // Fuzzing shims (only under `--cfg fuzzing`): byte-in/Result-out API over
-// tenso_core so fuzz targets can parse without PyO3. Not for prod/tests.
+// tenso so fuzz targets can parse without PyO3. Not for prod/tests.
 // -----------------------------------------------------------------------------
 
 #[cfg(fuzzing)]
 pub mod fuzz_api {
-    use tenso_core::{parse_header, TensoError, HEADER_BASE_V4};
+    use tenso::{parse_header, TensoError, HEADER_BASE_V4};
 
     /// Result of a successful header + shape parse.
     #[derive(Debug)]
@@ -992,14 +991,14 @@ pub mod fuzz_api {
         pub shape: Vec<usize>,
     }
 
-    /// Pure-Rust wrapper around `tenso_core::parse_header` for fuzzing.
+    /// Pure-Rust wrapper around `tenso::parse_header` for fuzzing.
     pub fn fuzz_parse_header(bytes: &[u8]) -> Result<(u16, u8, usize, usize), TensoError> {
         let h = parse_header(bytes)?;
         Ok((h.flags, h.dtype_code, h.ndim, h.base_size))
     }
 
     /// Parse header + per-dim shape (the dense pre-body decode), delegating
-    /// to `tenso_core`.
+    /// to `tenso`.
     /// TODO(fuzz): rest of decode (LZ4/integrity/numpy) is in core or PyO3.
     pub fn fuzz_parse_header_and_shape(bytes: &[u8]) -> Result<ParsedShape, TensoError> {
         let h = parse_header(bytes)?;

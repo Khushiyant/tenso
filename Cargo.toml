@@ -1,7 +1,7 @@
 [workspace]
 members = [
     ".",
-    "crates/tenso-core",
+    "crates/tenso",
     "crates/tenso-ffi",
     "crates/tenso-device",
     "crates/tenso-cuda",
@@ -23,7 +23,7 @@ categories = ["encoding", "science", "data-structures"]
 
 [workspace.dependencies]
 # Shared deps pinned once here; member crates reference them with
-# `{ workspace = true }`. tenso-core MUST NOT depend on pyo3/numpy/libc.
+# `{ workspace = true }`. tenso MUST NOT depend on pyo3/numpy/libc.
 lz4_flex = "0.11"
 xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
 libc = "0.2"
@@ -32,7 +32,7 @@ cbindgen = "0.27"
 # Internal path deps so crates reference each other by `{ workspace = true }`.
 # The `version` is REQUIRED for crates.io publishing (a path-only dep is rejected);
 # it must track the workspace.package version for a lockstep release.
-tenso-core = { path = "crates/tenso-core", version = "0.22.0" }
+tenso = { path = "crates/tenso", version = "0.22.0" }
 tenso-device = { path = "crates/tenso-device", version = "0.22.0" }
 tenso-cuda = { path = "crates/tenso-cuda", version = "0.22.0" }
 
@@ -58,7 +58,7 @@ libc = { workspace = true }
 #   std         -> turns off no_std for std-only scaffolding
 #   compression -> LZ4 frame encode/decode (compressed dense packets; implies std)
 #   integrity   -> XXH3-64 footer encode/verify
-tenso-core = { workspace = true, features = [
+tenso = { workspace = true, features = [
     "std",
     "compression",
     "integrity",

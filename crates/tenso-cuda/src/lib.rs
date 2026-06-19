@@ -55,7 +55,7 @@ mod ffi {
     // cudaDevAttrIntegrated = 18 (1 on Tegra/Jetson iGPUs; 0 on discrete).
     pub const CUDA_DEV_ATTR_INTEGRATED: i32 = 18;
 
-    // cudaIpcMemHandle_t size: opaque 64-byte blob == tenso_core::IPC_REF_HANDLE_LEN.
+    // cudaIpcMemHandle_t size: opaque 64-byte blob == tenso::IPC_REF_HANDLE_LEN.
     pub const CUDA_IPC_HANDLE_BYTES: usize = 64;
 
     // cudaIpcMemLazyEnablePeerAccess = 1 (the only documented OpenMemHandle flag).
@@ -684,12 +684,12 @@ mod tests {
     /// IpcHandle blob must be exactly cudaIpcMemHandle_t size (64 bytes).
     #[test]
     fn ipc_handle_blob_is_64_bytes() {
-        assert_eq!(tenso_core::IPC_REF_HANDLE_LEN, 64);
+        assert_eq!(tenso::IPC_REF_HANDLE_LEN, 64);
         let h = IpcHandle {
-            bytes: [0u8; tenso_core::IPC_REF_HANDLE_LEN],
+            bytes: [0u8; tenso::IPC_REF_HANDLE_LEN],
             byte_offset: 0,
             nbytes: 0,
-            device_uuid: [0u8; tenso_core::IPC_REF_DEVICE_UUID_LEN],
+            device_uuid: [0u8; tenso::IPC_REF_DEVICE_UUID_LEN],
         };
         assert_eq!(h.bytes.len(), 64);
         assert_eq!(h.device_uuid.len(), 16);
@@ -700,7 +700,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     fn cuda_ipc_handle_struct_is_64_bytes() {
         assert_eq!(core::mem::size_of::<ffi::CudaIpcMemHandle>(), 64);
-        assert_eq!(ffi::CUDA_IPC_HANDLE_BYTES, tenso_core::IPC_REF_HANDLE_LEN);
+        assert_eq!(ffi::CUDA_IPC_HANDLE_BYTES, tenso::IPC_REF_HANDLE_LEN);
     }
 
     /// `pci_bus_id_to_uuid` copies bytes verbatim, stops at NUL, zero-pads to 16;
@@ -734,7 +734,7 @@ mod tests {
     #[ignore = "requires a real Linux + NVIDIA CUDA device"]
     #[cfg(feature = "cuda")]
     fn gpu_device_roundtrip_through_codec() {
-        use tenso_core::{Dtype, EncodeOpts};
+        use tenso::{Dtype, EncodeOpts};
         use tenso_device::GpuCodec;
 
         let be = CudaBackend::open(0).expect("CUDA device 0 must be present");
@@ -795,9 +795,9 @@ mod tests {
                 .and_then(|mut f| f.read_to_end(&mut buf))
                 .expect("child: read handle file");
             assert_eq!(buf.len(), 80, "child: handle file must be 80 bytes");
-            let mut bytes = [0u8; tenso_core::IPC_REF_HANDLE_LEN];
+            let mut bytes = [0u8; tenso::IPC_REF_HANDLE_LEN];
             bytes.copy_from_slice(&buf[0..64]);
-            let mut uuid = [0u8; tenso_core::IPC_REF_DEVICE_UUID_LEN];
+            let mut uuid = [0u8; tenso::IPC_REF_DEVICE_UUID_LEN];
             uuid.copy_from_slice(&buf[64..80]);
 
             let be = match CudaBackend::open(0) {

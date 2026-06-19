@@ -1,4 +1,4 @@
-//! tenso-bus: a shared-memory tensor bus over tenso-core (wire = tenso-core packets).
+//! tenso-bus: a shared-memory tensor bus over tenso (wire = tenso packets).
 //!
 //! [`LatestValueBus`]: triple-buffered seqlock single-slot pub/sub (1 writer, N lock-free readers, no torn reads).
 //! [`RingBus`]: SPMC ring of fixed-stride slots with an [`OverflowPolicy`] (1 producer, N cursor-tracking consumers).
@@ -9,9 +9,9 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use tenso_core::TensoError;
+use tenso::TensoError;
 
-/// 64-byte SIMD/cache-line alignment for all slot bodies (matches tenso-core wire alignment).
+/// 64-byte SIMD/cache-line alignment for all slot bodies (matches tenso wire alignment).
 pub const ALIGNMENT: usize = 64;
 
 /// Errors from bus operations.
@@ -495,11 +495,11 @@ impl LatestValueBus {
         }
     }
 
-    /// Atomically replace the stored packet (single writer); must be a valid tenso-core packet that fits the stride.
+    /// Atomically replace the stored packet (single writer); must be a valid tenso packet that fits the stride.
     #[cfg(unix)]
     pub fn publish(&self, packet: &[u8]) -> Result<(), BusError> {
         // Validate the wire packet before accepting it.
-        tenso_core::parse_header(packet)?;
+        tenso::parse_header(packet)?;
         if packet.len() > self.slot_stride {
             return Err(BusError::PacketTooLarge);
         }
@@ -789,7 +789,7 @@ impl RingBus {
     /// Publish a fully-formed Tenso packet onto the ring (single producer).
     #[cfg(unix)]
     pub fn push(&self, packet: &[u8]) -> Result<(), BusError> {
-        tenso_core::parse_header(packet)?;
+        tenso::parse_header(packet)?;
         if packet.len() > self.slot_stride {
             return Err(BusError::PacketTooLarge);
         }
@@ -999,12 +999,12 @@ mod tests {
     fn make_packet(payload_marker: u8, n_elems: u32) -> Vec<u8> {
         // v4 header is 10 bytes; shape is ndim * u32; body is n_elems * 4 (f32).
         let ndim: u8 = 1;
-        let header_base = tenso_core::HEADER_BASE_V4;
+        let header_base = tenso::HEADER_BASE_V4;
         let shape_bytes = ndim as usize * 4;
         let body_bytes = n_elems as usize * 4;
         let mut buf = vec![0u8; header_base + shape_bytes + body_bytes];
         // flags=0, dtype f32=1, ndim=1
-        tenso_core::write_v4_header(&mut buf, 0, 1, ndim);
+        tenso::write_v4_header(&mut buf, 0, 1, ndim);
         // shape[0] = n_elems (LE u32)
         buf[header_base..header_base + 4].copy_from_slice(&n_elems.to_le_bytes());
         // mark the body so we can verify content survived transport
@@ -1012,10 +1012,7 @@ mod tests {
             *b = payload_marker;
         }
         // sanity: must parse
-        assert!(
-            tenso_core::parse_header(&buf).is_ok(),
-            "test packet must parse"
-        );
+        assert!(tenso::parse_header(&buf).is_ok(), "test packet must parse");
         buf
     }
 

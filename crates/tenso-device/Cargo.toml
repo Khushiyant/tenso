@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "DeviceBackend trait + CpuBackend + MockBackend + GPU codec orchestration over tenso-core."
+description = "DeviceBackend trait + CpuBackend + MockBackend + GPU codec orchestration over tenso."
 
 [lib]
 name = "tenso_device"
@@ -15,4 +15,4 @@ name = "tenso_device"
 default = []
 
 [dependencies]
-tenso-core = { workspace = true }
+tenso = { workspace = true }

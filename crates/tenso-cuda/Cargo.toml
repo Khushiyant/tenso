@@ -19,6 +19,6 @@ default = []
 cuda = ["dep:libloading"]
 
 [dependencies]
-tenso-core = { workspace = true }
+tenso = { workspace = true }
 tenso-device = { workspace = true }
 libloading = { workspace = true, optional = true }

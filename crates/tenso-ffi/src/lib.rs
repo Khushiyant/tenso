@@ -1,4 +1,4 @@
-//! tenso-ffi: stable C ABI over tenso-core (`extern "C"`, `tenso_`-prefixed).
+//! tenso-ffi: stable C ABI over tenso (`extern "C"`, `tenso_`-prefixed).
 //!
 //! Mode A (caller-allocates): `tenso_dense_required_size` + `..encode_dense_into`.
 //! Mode B (core-allocates): `tenso_decode` returns an opaque `TensoView` freed
@@ -16,8 +16,8 @@ use std::ffi::CString;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use tenso_core::{decode, dense_required_size, encode_dense_into, parse_header};
-use tenso_core::{ArraySpec, Decoded, Dtype, EncodeOpts, TensoError};
+use tenso::{decode, dense_required_size, encode_dense_into, parse_header};
+use tenso::{ArraySpec, Decoded, Dtype, EncodeOpts, TensoError};
 
 // ---- Status codes (returned by integer-returning entry points) ----
 
@@ -174,7 +174,7 @@ unsafe fn build_spec_opts<'a>(
 
     // alignment 0 => protocol default; else power-of-two (core re-validates).
     let alignment = if alignment == 0 {
-        tenso_core::ALIGNMENT
+        tenso::ALIGNMENT
     } else {
         alignment
     };

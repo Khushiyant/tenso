@@ -16,7 +16,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 default = []
 
 [dependencies]
-tenso-core = { workspace = true }
+tenso = { workspace = true }
 
 [build-dependencies]
 cbindgen = { workspace = true }
