@@ -179,6 +179,29 @@ jobs:
       - name: cargo build -p tenso --no-default-features --features integrity
         run: cargo build -p tenso --no-default-features --features integrity --verbose
 
+  core-embedded:
+    name: tenso builds for bare-metal (thumbv7em-none-eabi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain (+ Cortex-M target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # Proves the core runs on microcontroller-class hardware (no_std + alloc,
+      # no OS). compression (lz4_flex, std-only) is intentionally excluded;
+      # integrity (xxhash-rust) is no_std friendly and must still cross-compile.
+      - name: cargo build -p tenso --no-default-features --target thumbv7em-none-eabi
+        run: cargo build -p tenso --no-default-features --target thumbv7em-none-eabi --verbose
+
+      - name: cargo build -p tenso --no-default-features --features integrity --target thumbv7em-none-eabi
+        run: cargo build -p tenso --no-default-features --features integrity --target thumbv7em-none-eabi --verbose
+
   ffi-header:
     name: tenso-ffi build + cbindgen header up to date
     runs-on: ubuntu-latest

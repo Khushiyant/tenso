@@ -15,8 +15,10 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [features]
 default = []
 
+# integrity (XXH3) + compression (LZ4) so the C ABI has full parity with the
+# Python binding — C/C++ callers can use check_integrity/compress.
 [dependencies]
-tenso = { workspace = true }
+tenso = { workspace = true, features = ["integrity", "compression"] }
 
 [build-dependencies]
 cbindgen = { workspace = true }

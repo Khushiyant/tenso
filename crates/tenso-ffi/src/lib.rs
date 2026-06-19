@@ -527,3 +527,113 @@ unsafe fn mut_slice_from_raw<'a>(out: *mut u8, cap: usize) -> Result<&'a mut [u8
         Ok(std::slice::from_raw_parts_mut(out, cap))
     }
 }
+
+// =============================================================================
+// Cross-language conformance: the C ABI must emit/read the SAME bytes as the
+// Python encoder. The `.tenso` fixtures are frozen `tenso.dumps(...)` output, so
+// "C ABI == fixture" proves "C ABI == Python" transitively (and the Python suite
+// pins the same files). Covers plain, integrity (XXH3), and compressed (LZ4).
+// =============================================================================
+#[cfg(test)]
+mod c_abi_conformance {
+    use super::*;
+    use tenso::Dtype;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn le<T: Copy, const N: usize>(vals: &[T], to_le: impl Fn(T) -> [u8; N]) -> Vec<u8> {
+        vals.iter().flat_map(|&v| to_le(v)).collect()
+    }
+
+    /// Encode a dense tensor through the C ABI exactly as a C caller would.
+    fn c_encode(
+        data: &[u8],
+        dtype: Dtype,
+        shape: &[u32],
+        integrity: bool,
+        compress: bool,
+    ) -> Vec<u8> {
+        unsafe {
+            let mut size = 0usize;
+            let rc = tenso_dense_required_size(
+                data.as_ptr(),
+                data.len(),
+                dtype.code(),
+                shape.as_ptr(),
+                shape.len(),
+                integrity,
+                compress,
+                0,
+                &mut size,
+            );
+            assert_eq!(rc, TENSO_OK, "tenso_dense_required_size returned {rc}");
+            let mut out = vec![0u8; size];
+            let mut written = 0usize;
+            let rc = tenso_encode_dense_into(
+                data.as_ptr(),
+                data.len(),
+                dtype.code(),
+                shape.as_ptr(),
+                shape.len(),
+                integrity,
+                compress,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut written,
+            );
+            assert_eq!(rc, TENSO_OK, "tenso_encode_dense_into returned {rc}");
+            out.truncate(written);
+            out
+        }
+    }
+
+    #[test]
+    fn c_abi_encode_dense_f32_matches_python() {
+        let data = le(&[1.0f32, 2.0, 3.0, 4.0, 5.0], f32::to_le_bytes);
+        let got = c_encode(&data, Dtype::F32, &[5], false, false);
+        assert_eq!(got, fixture("dense_f32_vec.tenso"));
+    }
+
+    #[test]
+    fn c_abi_encode_i32_integrity_matches_python() {
+        let vals: Vec<i32> = (0..8).collect();
+        let data = le(&vals, i32::to_le_bytes);
+        let got = c_encode(&data, Dtype::I32, &[8], true, false);
+        // Equal bytes => the C ABI's XXH3 footer is identical to Python's.
+        assert_eq!(got, fixture("dense_i32_integrity.tenso"));
+    }
+
+    #[test]
+    fn c_abi_encode_compressed_matches_python() {
+        // np.tile(np.arange(64, f64), 16), compress=True, check_integrity=True.
+        let vals: Vec<f64> = (0..16).flat_map(|_| 0..64).map(|x| x as f64).collect();
+        let data = le(&vals, f64::to_le_bytes);
+        let got = c_encode(&data, Dtype::F64, &[1024], true, true);
+        // Equal bytes => the C ABI's LZ4 frame is identical to Python's.
+        assert_eq!(got, fixture("dense_f64_compressed.tenso"));
+    }
+
+    #[test]
+    fn c_abi_decode_f64_matches_python() {
+        let packet = fixture("dense_f64_mat.tenso"); // np.arange(12, f64).reshape(3, 4)
+        unsafe {
+            let view = tenso_decode(packet.as_ptr(), packet.len());
+            assert!(!view.is_null(), "tenso_decode returned null");
+            assert_eq!(tenso_view_dtype(view), Dtype::F64.code());
+            assert_eq!(tenso_view_ndim(view), 2);
+            let shape = std::slice::from_raw_parts(tenso_view_shape(view), tenso_view_ndim(view));
+            assert_eq!(shape, &[3, 4]);
+            let body =
+                std::slice::from_raw_parts(tenso_view_body_ptr(view), tenso_view_body_len(view));
+            let expected: Vec<f64> = (0..12).map(|x| x as f64).collect();
+            assert_eq!(body, le(&expected, f64::to_le_bytes).as_slice());
+            tenso_view_free(view);
+        }
+    }
+}
