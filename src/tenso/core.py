@@ -153,107 +153,6 @@ def _quantized_body_size(dtype_code: int, num_elements: int) -> int:
     return num_elements
 
 
-def _read_stream_quantized(
-    source, flags: int, dtype_code: int, ndim: int, header_size: int = _HEADER_BASE_V4
-) -> "QuantizedTensor":
-    """Read a quantized tensor from a stream."""
-    # Read shape
-    shape_len = ndim * 4
-    shape_bytes = bytearray(shape_len)
-    try:
-        if not _read_into_buffer(source, shape_bytes):
-            raise EOFError("Stream ended during quantized shape read")
-    except EOFError as e:
-        raise EOFError(f"Stream ended during quantized shape read. {e}") from None
-    shape = struct.unpack(f"<{ndim}I", shape_bytes)
-    num_elements = int(np.prod(shape))
-
-    # Read quant metadata header (scheme 1 + axis 1 + group_size 4 + num_scales 4 = 10 bytes)
-    meta_header = bytearray(10)
-    try:
-        if not _read_into_buffer(source, meta_header):
-            raise EOFError("Stream ended during quant metadata read")
-    except EOFError as e:
-        raise EOFError(f"Stream ended during quant metadata read. {e}") from None
-
-    quant_scheme = meta_header[0]
-    axis = meta_header[1]
-    group_size = struct.unpack("<I", meta_header[2:6])[0]
-    num_scales = struct.unpack("<I", meta_header[6:10])[0]
-
-    # Read scales and zero_points
-    sz_len = num_scales * 4 * 2  # scales + zero_points
-    sz_bytes = bytearray(sz_len)
-    try:
-        if not _read_into_buffer(source, sz_bytes):
-            raise EOFError("Stream ended during scales/zero_points read")
-    except EOFError as e:
-        raise EOFError(f"Stream ended during scales/zero_points read. {e}") from None
-
-    scales = np.frombuffer(sz_bytes[: num_scales * 4], dtype=np.float32).copy()
-    zero_points = np.frombuffer(sz_bytes[num_scales * 4 :], dtype=np.float32).copy()
-
-    # Current position for alignment calculation
-    current_pos = header_size + shape_len + 10 + sz_len
-
-    # Alignment
-    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
-    if use_custom_align:
-        exp_buf = bytearray(1)
-        try:
-            if not _read_into_buffer(source, exp_buf):
-                raise EOFError("Stream ended during alignment byte read")
-        except EOFError as e:
-            raise EOFError(f"Stream ended during alignment byte read. {e}") from None
-        alignment = 1 << exp_buf[0]
-        current_pos += 1
-    elif flags & FLAG_ALIGNED:
-        alignment = _ALIGNMENT
-    else:
-        alignment = 1
-
-    remainder = current_pos % alignment
-    padding_len = 0 if remainder == 0 else (alignment - remainder)
-    body_len = _quantized_body_size(dtype_code, num_elements)
-    footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
-
-    # Read padding + body + footer
-    total_remaining = padding_len + body_len + footer_len
-    data_buffer = bytearray(total_remaining)
-    try:
-        if not _read_into_buffer(source, data_buffer):
-            raise EOFError("Stream ended during quantized body read")
-    except EOFError as e:
-        raise EOFError(f"Stream ended during quantized body read. {e}") from None
-
-    # Verify integrity — covers quant metadata + packed body (must match the
-    # in-memory serializer's coverage).
-    if footer_len > 0:
-        body_slice = data_buffer[padding_len : padding_len + body_len]
-        protected = bytes(meta_header) + bytes(sz_bytes) + bytes(body_slice)
-        actual_hash = xxhash.xxh3_64_intdigest(protected)
-        expected_hash = struct.unpack(
-            "<Q", data_buffer[padding_len + body_len : padding_len + body_len + 8]
-        )[0]
-        if actual_hash != expected_hash:
-            raise ValueError("Integrity check failed: XXH3 mismatch")
-
-    data = np.frombuffer(
-        data_buffer, dtype=np.uint8, offset=padding_len, count=body_len
-    ).copy()
-
-    return QuantizedTensor(
-        data=data,
-        scales=scales,
-        zero_points=zero_points,
-        shape=shape,
-        dtype_code=dtype_code,
-        quant_scheme=quant_scheme,
-        group_size=group_size,
-        axis=axis,
-    )
-
-
 def _read_into_buffer(
     source: Any, buf: Union[bytearray, memoryview, np.ndarray]
 ) -> bool:
@@ -380,281 +279,144 @@ def _read_packet_header(source: Any) -> Optional["tuple[int, int, int, int, int]
     raise ValueError(f"Unsupported protocol version: {ver}")
 
 
-async def _aread_packet_header(reader) -> Optional["tuple[int, int, int, int, int]"]:
-    """
-    Async counterpart to :func:`_read_packet_header`.
+def _read_full_packet(source: Any) -> Optional[bytearray]:
+    """Read exactly one complete Tenso packet's bytes from a synchronous stream.
 
-    Returns ``None`` on clean stream end (no bytes available); otherwise
-    returns ``(version, flags, dtype_code, ndim, header_size)``.
+    This performs only *framing* (using the wire-format length fields); the actual
+    decode is delegated to the Rust core via :func:`loads` in :func:`read_stream`.
+    Mirrors the async ``_aread_full_packet``. Returns ``None`` on a clean stream
+    end (no bytes available); raises ``EOFError`` on a truncated packet.
     """
-    import asyncio
+    head = bytearray(_HEADER_BASE_V3)
     try:
-        header = await reader.readexactly(_HEADER_BASE_V3)
-    except asyncio.IncompleteReadError as e:
-        if len(e.partial) == 0:
+        if not _read_into_buffer(source, head):
             return None
-        raise
+    except EOFError as e:
+        raise EOFError(f"Stream ended during header read. {e}") from None
 
-    if header[:4] != _MAGIC:
+    if head[:4] != _MAGIC:
         raise ValueError("Invalid tenso packet")
 
-    ver = header[4]
+    ver = head[4]
     if ver == 4:
-        extra = await reader.readexactly(_HEADER_BASE_V4 - _HEADER_BASE_V3)
-        full = header + extra
-        return ver, struct.unpack_from("<H", full, 5)[0], full[7], full[8], _HEADER_BASE_V4
-    if ver == 3:
-        return ver, header[5], header[6], header[7], _HEADER_BASE_V3
-    raise ValueError(f"Unsupported protocol version: {ver}")
+        extra = bytearray(_HEADER_BASE_V4 - _HEADER_BASE_V3)
+        if not _read_into_buffer(source, extra):
+            raise EOFError("Stream ended during v4 header read")
+        head += extra
+        flags = struct.unpack_from("<H", head, 5)[0]
+        dtype_code, ndim = head[7], head[8]
+    elif ver == 3:
+        flags, dtype_code, ndim = head[5], head[6], head[7]
+    else:
+        raise ValueError(f"Unsupported protocol version: {ver}")
 
+    buf = bytearray(head)
 
-def read_stream(source: Any) -> Optional[Any]:
-    """
-    Read and deserialize an object from a stream source with DoS protection.
+    def _take(n: int, what: str = "packet read") -> bytes:
+        b = bytearray(n)
+        if n:
+            try:
+                ok = _read_into_buffer(source, b)
+            except EOFError as e:
+                raise EOFError(f"Stream ended during {what}. {e}") from None
+            if not ok:
+                raise EOFError(f"Stream ended during {what}")
+        return bytes(b)
 
-    This function supports streaming deserialization for dense NumPy arrays,
-    multi-tensor bundles (dictionaries), and sparse matrices (COO, CSR, CSC).
-    It avoids loading the entire packet into memory before parsing, making it
-    suitable for large-scale data ingestion.
-
-    Parameters
-    ----------
-    source : Any
-        Stream source to read from (must support .read() or .recv()).
-
-    Returns
-    -------
-    Optional[Any]
-        The deserialized NumPy array, Sparse matrix, or Dictionary. Returns None
-        if the stream ended before any data was read.
-
-    Raises
-    ------
-    ValueError
-        If the packet is invalid or exceeds security limits.
-    EOFError
-        If the stream ends prematurely during reading.
-    ImportError
-        If scipy is missing during sparse matrix deserialization.
-    """
-    parsed = _read_packet_header(source)
-    if parsed is None:
-        return None
-    _ver, flags, dtype_code, ndim, header_size = parsed
-
-    # 2. Handle Bundle (Dictionaries)
+    # Bundle: ndim is the entry count; entries are length-prefixed (opaque here).
     if flags & FLAG_BUNDLE:
-        res = {}
-        # ndim stores the number of items for bundles (up to 255)
         for _ in range(ndim):
-            # Read Key Length
-            k_len_buf = bytearray(4)
-            try:
-                if not _read_into_buffer(source, k_len_buf):
-                    raise EOFError("Stream ended during bundle key length read")
-            except EOFError as e:
-                raise EOFError(
-                    f"Stream ended during bundle key length read. {e}"
-                ) from None
-            k_len = struct.unpack("<I", k_len_buf)[0]
+            k_len_b = _take(4)
+            buf += k_len_b
+            buf += _take(struct.unpack("<I", k_len_b)[0])
+            v_len_b = _take(4)
+            buf += v_len_b
+            buf += _take(struct.unpack("<I", v_len_b)[0])
+        return buf
 
-            # Read Key
-            key_buf = bytearray(k_len)
-            try:
-                if not _read_into_buffer(source, key_buf):
-                    raise EOFError("Stream ended during bundle key read")
-            except EOFError as e:
-                raise EOFError(f"Stream ended during bundle key read. {e}") from None
-            key = key_buf.decode("utf-8")
-
-            # Read Value Packet Length prefix (4 bytes)
-            v_len_buf = bytearray(4)
-            try:
-                if not _read_into_buffer(source, v_len_buf):
-                    raise EOFError("Stream ended during bundle value length read")
-            except EOFError as e:
-                raise EOFError(
-                    f"Stream ended during bundle value length read. {e}"
-                ) from None
-
-            # Recursively read the nested Tenso packet
-            res[key] = read_stream(source)
-        return res
-
-    # 3. Handle Sparse Formats (COO, CSR, CSC)
-    if flags & (FLAG_SPARSE | FLAG_SPARSE_CSR | FLAG_SPARSE_CSC):
-        try:
-            from scipy import sparse
-        except ImportError:
-            raise ImportError("scipy is required for sparse deserialization.")
-
-        # Read Shape
-        shape_len = ndim * 4
-        shape_bytes = bytearray(shape_len)
-        try:
-            if not _read_into_buffer(source, shape_bytes):
-                raise EOFError("Stream ended during sparse shape read")
-        except EOFError as e:
-            raise EOFError(f"Stream ended during sparse shape read. {e}") from None
-        shape = struct.unpack(f"<{ndim}I", shape_bytes)
-
-        # Read 3 sub-packets (data, indices/row, indptr/col)
-        sub_objs = []
-        for i, label in enumerate(["data", "indices/row", "indptr/col"]):
-            v_len_buf = bytearray(4)
-            try:
-                if not _read_into_buffer(source, v_len_buf):
-                    raise EOFError(f"Stream ended during sparse {label} length read")
-            except EOFError as e:
-                raise EOFError(
-                    f"Stream ended during sparse {label} length read. {e}"
-                ) from None
-            sub_objs.append(read_stream(source))
-
-        c1, c2, c3 = sub_objs
-        if flags & FLAG_SPARSE:
-            return sparse.coo_matrix((c1, (c2, c3)), shape=shape)
-        if flags & FLAG_SPARSE_CSR:
-            return sparse.csr_matrix((c1, c2, c3), shape=shape)
-        return sparse.csc_matrix((c1, c2, c3), shape=shape)
-
-    # 3.5 Handle Quantized Types
-    if dtype_code in _QUANTIZED_CODES:
-        return _read_stream_quantized(source, flags, dtype_code, ndim, header_size)
-
-    # 4. Dense Array Logic (DoS Protection & Buffer Allocation)
     if ndim > MAX_NDIM:
         raise ValueError(f"Packet exceeds maximum dimensions ({ndim} > {MAX_NDIM})")
 
-    shape_len = ndim * 4
-    shape_bytes = bytearray(shape_len)
-    try:
-        if not _read_into_buffer(source, shape_bytes):
-            raise EOFError("Stream ended during shape read")
-    except EOFError as e:
-        raise EOFError(f"Stream ended during shape read. {e}") from None
-
-    shape = struct.unpack(f"<{ndim}I", shape_bytes)
+    shape_b = _take(ndim * 4)
+    buf += shape_b
+    shape = struct.unpack(f"<{ndim}I", shape_b)
     num_elements = int(np.prod(shape))
     if num_elements > MAX_ELEMENTS:
-        raise ValueError(
-            f"Packet exceeds maximum elements ({num_elements} > {MAX_ELEMENTS})"
-        )
+        raise ValueError(f"Packet exceeds maximum elements ({num_elements})")
 
-    dtype = _REV_DTYPE_MAP.get(dtype_code)
-    if dtype is None:
-        raise ValueError(f"Unsupported dtype code: {dtype_code}")
+    # Sparse: three length-prefixed sub-packets.
+    if flags & (FLAG_SPARSE | FLAG_SPARSE_CSR | FLAG_SPARSE_CSC):
+        for _ in range(3):
+            sz_b = _take(4)
+            buf += sz_b
+            buf += _take(struct.unpack("<I", sz_b)[0])
+        return buf
 
-    if flags & FLAG_COMPRESSION:
-        # The streaming dense path computes body_len from the UNCOMPRESSED element
-        # count and has no length prefix for a compressed body, so it would over-
-        # read / mis-hash. Reject explicitly, matching the async and GPU readers.
-        raise ValueError(
-            "Cannot stream a compressed dense packet: the streaming format "
-            "carries no length prefix for compressed bodies. Read the full "
-            "packet and use loads() instead."
-        )
-
-    # Read Body & Padding
-    current_pos = header_size + shape_len
-    alignment = _ALIGNMENT
-    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
-
-    if use_custom_align:
-        # Read Exponent Byte
-        exp_buf = bytearray(1)
-        try:
-            if not _read_into_buffer(source, exp_buf):
-                raise EOFError("Stream ended during alignment byte read")
-        except EOFError as e:
-            raise EOFError(f"Stream ended during alignment byte read. {e}") from None
-        exponent = exp_buf[0]
-        alignment = 1 << exponent
-        current_pos += 1
-
-    remainder = current_pos % alignment
-    padding_len = 0 if remainder == 0 else (alignment - remainder)
-    body_len = num_elements * dtype.itemsize
     footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
 
-    data_buffer = np.empty(padding_len + body_len + footer_len, dtype=np.uint8)
-    try:
-        if not _read_into_buffer(source, data_buffer):
-            raise EOFError("Stream ended during body read")
-    except EOFError as e:
-        raise EOFError(f"Stream ended during body read. {e}") from None
+    if dtype_code in _QUANTIZED_CODES:
+        # Quant metadata: scheme(1)+axis(1)+group_size(4)+num_scales(4), then
+        # scales + zero_points.
+        meta = _take(10)
+        buf += meta
+        num_scales = struct.unpack("<I", meta[6:10])[0]
+        buf += _take(num_scales * 4 * 2)
+        body_len = _quantized_body_size(dtype_code, num_elements)
+    else:
+        dtype = _REV_DTYPE_MAP.get(dtype_code)
+        if dtype is None:
+            raise ValueError(f"Unsupported dtype code: {dtype_code}")
+        if flags & FLAG_COMPRESSION:
+            raise ValueError(
+                "Cannot stream a compressed dense packet: the streaming format "
+                "carries no length prefix for compressed bodies. Read the full "
+                "packet and use loads() instead."
+            )
+        body_len = num_elements * dtype.itemsize
 
-    # Verify Integrity
-    if footer_len > 0:
-        body_slice = data_buffer[padding_len : padding_len + body_len]
-        actual_hash = xxhash.xxh3_64_intdigest(body_slice)
-        expected_hash = struct.unpack("<Q", data_buffer[padding_len + body_len :])[0]
-        if actual_hash != expected_hash:
-            raise ValueError("Integrity check failed: XXH3 mismatch")
+    cursor = len(buf)
+    if flags & FLAG_CUST_ALIGN:
+        ab = _take(1)
+        buf += ab
+        alignment = 1 << ab[0]
+        cursor += 1
+    elif flags & FLAG_ALIGNED:
+        alignment = _ALIGNMENT
+    else:
+        alignment = 1
 
-    arr = np.frombuffer(
-        data_buffer, dtype=dtype, offset=padding_len, count=num_elements
-    ).reshape(shape)
-    arr = _ensure_aligned(arr, alignment, copy=False)
-    arr.flags.writeable = False
-    return arr
+    pad_len = (alignment - (cursor % alignment)) % alignment
+    if pad_len:
+        buf += _take(pad_len, "body read")
+
+    buf += _take(body_len + footer_len, "body read")
+    return buf
+
+
+def read_stream(source: Any) -> Optional[Any]:
+    """Read and deserialize one Tenso packet from a synchronous stream.
+
+    Frames the complete packet from the stream (header + length-prefixed payload)
+    and decodes it through the Rust core via :func:`loads`. Supports dense,
+    bundle, sparse, and quantized packets (v3/v4, custom alignment, integrity).
+    Returns ``None`` if the stream ends before any byte is read.
+    """
+    packet = _read_full_packet(source)
+    if packet is None:
+        return None
+    return loads(bytes(packet))
 
 
 def iter_dumps(
-    tensor: np.ndarray, strict: bool = False, check_integrity: bool = False
+    tensor: Any, strict: bool = False, check_integrity: bool = False
 ) -> Generator[Union[bytes, memoryview], None, None]:
+    """Yield the Tenso packet for ``tensor`` (encoded by the Rust core).
+
+    Retained for the streaming-write API (``write_stream`` / ``awrite_stream``);
+    it now yields the single packet produced by :func:`dumps` rather than
+    re-encoding in Python.
     """
-    Vectored serialization: Yields packet parts to avoid memory copies.
-
-    Parameters
-    ----------
-    tensor : np.ndarray
-        The array to serialize.
-    strict : bool, default False
-        If True, raises ValueError for non-contiguous arrays.
-    check_integrity : bool, default False
-        If True, includes an XXH3 checksum footer.
-
-    Yields
-    ------
-    Union[bytes, memoryview]
-        Sequential chunks of the Tenso packet.
-    """
-    # Handle QuantizedTensor by delegating to dumps
-    if isinstance(tensor, QuantizedTensor):
-        yield bytes(dumps(tensor, check_integrity=check_integrity))
-        return
-
-    if tensor.dtype not in _DTYPE_MAP:
-        raise ValueError(f"Unsupported dtype: {tensor.dtype}")
-
-    if not tensor.flags["C_CONTIGUOUS"]:
-        if strict:
-            raise ValueError("Tensor is not C-Contiguous")
-        tensor = np.ascontiguousarray(tensor)
-
-    if not IS_LITTLE_ENDIAN or tensor.dtype.byteorder == ">":
-        tensor = tensor.astype(tensor.dtype.newbyteorder("<"))
-
-    dtype_code = _DTYPE_MAP[tensor.dtype]
-    shape = tensor.shape
-    ndim = len(shape)
-
-    flags = FLAG_ALIGNED | (FLAG_INTEGRITY if check_integrity else 0)
-    header = struct.pack("<4sBHBBB", _MAGIC, _VERSION, flags, dtype_code, ndim, 0)
-    shape_block = struct.pack(f"<{ndim}I", *shape)
-    yield header
-    yield shape_block
-
-    current_len = _HEADER_BASE_V4 + (ndim * 4)
-    padding_len = (_ALIGNMENT - (current_len % _ALIGNMENT)) % _ALIGNMENT
-    if padding_len > 0:
-        yield b"\x00" * padding_len
-
-    yield tensor.data
-
-    if check_integrity:
-        yield struct.pack("<Q", xxhash.xxh3_64_intdigest(tensor.data))
+    yield bytes(dumps(tensor, strict=strict, check_integrity=check_integrity))
 
 
 def write_stream(
