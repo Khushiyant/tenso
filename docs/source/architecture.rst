@@ -1,64 +1,55 @@
 Architecture
 ============
 
-Tenso uses a **hybrid Python-Rust architecture** to achieve maximum performance while maintaining an intuitive Python API.
+Tenso has a **single Rust core** that implements the wire format once, wrapped by
+thin language bindings. Python, C/C++, GPU, and shared-memory transports all
+encode and decode through that one core — there is no separate per-language
+re-implementation and no pure-Python fallback.
 
 Overview
 --------
 
 .. code-block:: text
 
-    ┌─────────────────────────────────────────┐
-    │  Python API Layer (tenso.*)             │
-    │  - High-level functions                 │
-    │  - Type validation                      │
-    │  - Feature routing (GPU, async, etc.)   │
-    └──────────┬──────────────────────────────┘
-               │
-               ├─── Fast Path: Rust Core (tenso_rs)
-               │    └─→ dumps_rs(), loads_rs(), dump_to_fd_rs()
-               │        • Zero-copy serialization
-               │        • SIMD-optimized operations
-               │        • ~35x faster deserialization
-               │
-               └─── Fallback: Pure Python
-                    └─→ Used for compression, sparse matrices, bundles
+    Python (pip)        C / C++ (binaries)     GPU            local IPC
+    ┌────────────┐      ┌────────────────┐   ┌──────────┐   ┌──────────┐
+    │  tenso_rs  │      │   tenso-ffi    │   │tenso-cuda│   │ tenso-bus│
+    │  (PyO3)    │      │   (C ABI)      │   │          │   │          │
+    └─────┬──────┘      └───────┬────────┘   └────┬─────┘   └────┬─────┘
+          │                     │                 │              │
+          └─────────────────────┴────────┬────────┴──────────────┘
+                                          │
+                                  ┌───────▼────────┐
+                                  │     tenso      │   the single core
+                                  │  (Rust, no_std │   - all encode/decode
+                                  │   + alloc)     │   - zero-copy + SIMD layout
+                                  └────────────────┘   - no external runtime deps
 
-Performance Strategy
---------------------
+The core (the ``tenso`` crate) is ``no_std + alloc`` and depends on nothing
+language- or OS-specific, so the *same* codec runs behind every binding.
 
-Tenso automatically selects the optimal implementation:
+How (de)serialization works
+---------------------------
 
-1. **Rust Fast Path** (Primary)
-   
-   - Used for standard NumPy arrays
-   - Requirements: C-contiguous, supported dtype, no compression
-   - Implementation: ``tenso_rs`` Rust extension module
-   - Performance: 0.004ms deserialize time for 64MB
+Every path funnels through the core:
 
-2. **Python Fallback** (Automatic)
-   
-   - Used when Rust requirements aren't met
-   - Handles: LZ4 compression, sparse matrices, bundles, complex dtypes
-   - Still optimized with NumPy/xxhash
-
-3. **Shared Memory IPC**
-   
-   - Used for local inter-process communication
-   - Implementation: ``TensoShm`` class backed by ``dump_to_buffer_rs``
-   - Performance: Zero-copy transfer via memory mapping
+1. **Python** — ``tenso.dumps`` / ``tenso.loads`` call the PyO3 binding
+   (``tenso_rs``), which calls the ``tenso`` core. The compiled extension is
+   **required**; there is no Python-side codec fallback.
+2. **C / C++** — ``tenso-ffi`` exposes a stable C ABI (``tenso_encode_dense_into``,
+   ``tenso_decode``, …) over the same core.
+3. **Shared-memory IPC** — ``TensoShm`` (Python) and ``tenso-bus`` (Rust) write
+   core-encoded packets directly into a shared buffer for zero-copy transfer.
 
 .. code-block:: python
 
     import numpy as np
     import tenso
 
-    # Uses Rust fast path automatically
     data = np.random.rand(1000, 1000)
-    packet = tenso.dumps(data)  # → calls dumps_rs() internally
-    
-    # Falls back to Python for compression
-    packet_compressed = tenso.dumps(data, compress=True)
+    packet = tenso.dumps(data)              # encoded by the Rust core
+    packet_z = tenso.dumps(data, compress=True)   # LZ4 also runs in the core
+    out = tenso.loads(packet)               # zero-copy view back
 
 Wire Protocol
 -------------
@@ -102,74 +93,73 @@ for future feature flags. All other field semantics are unchanged.
   parse the wrong fields. If you need to interop with old clients across the
   upgrade, hold readers ahead of writers.
 
-Rust Components
----------------
+Workspace crates
+----------------
 
-The Rust extension (``tenso_rs``) provides core functions exposed to Python via PyO3:
+The Rust side is a Cargo workspace. The core is published as ``tenso``; the
+others are thin skins over it:
 
-``dumps_rs(tensor, check_integrity=False, alignment=64) -> bytes``
-    Serialize a NumPy array with zero-copy efficiency.
+- ``tenso`` — the core codec (``no_std + alloc``); the single source of truth.
+  Rust users add it with ``cargo add tenso`` and call ``encode_dense_into`` /
+  ``decode``.
+- ``tenso-ffi`` — the C ABI (``extern "C"``, ``tenso_``-prefixed). Generates
+  ``include/tenso.h``; ships as prebuilt per-OS binaries.
+- ``tenso-device`` — ``DeviceBackend`` trait + CPU/Mock backends and the
+  GPU codec orchestration (IPC framing) over the core.
+- ``tenso-cuda`` — CUDA backend; ``libcudart`` is ``dlopen``'d at runtime and
+  gated behind the ``cuda`` feature (no link-time toolkit dependency).
+- ``tenso-bus`` — shared-memory tensor bus (seqlock latest-value buffer + SPMC
+  ring) carrying core-encoded packets.
+- ``tenso-rs`` (repo root) — the PyO3 binding that produces the Python
+  extension module ``tenso_rs``. Not published to crates.io.
 
-``dump_to_buffer_rs(array, buffer, check_integrity=False) -> int``
-    Serialize directly into a pre-allocated writable buffer (e.g., SharedMemory).
+Building
+--------
 
-``loads_rs(packet) -> numpy.ndarray``
-    Deserialize a Tenso packet with minimal memory copying.
-
-``dump_to_fd_rs(fd, tensor, check_integrity=False) -> int``
-    Write directly to a file descriptor (Unix systems).
-
-These are **not meant to be called directly**—use the Python API functions instead.
-
-Building the Extension
-----------------------
-
-The Rust extension is built automatically via Maturin during package installation:
+The Python extension builds automatically via Maturin during install:
 
 .. code-block:: bash
 
-    # Development build
+    # Development build (rebuilds the Rust extension)
     pip install -e .
-    
-    # Or explicitly rebuild the Rust extension
     maturin develop --release
 
-For contributors working on the Rust code:
+Working on the core or other crates directly:
 
 .. code-block:: bash
 
-    # Install Rust toolchain
+    # Install the Rust toolchain
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    
-    # Edit Rust source
-    vim src/lib.rs
-    
-    # Rebuild and test
-    maturin develop && pytest
 
-Source Files
-------------
+    # Build / test the whole workspace
+    cargo build --workspace
+    cargo test -p tenso -p tenso-device -p tenso-bus -p tenso-ffi
 
-- ``src/lib.rs`` - Rust implementation (serialization, deserialization, dtypes)
-- ``src/tenso/core.py`` - Python wrapper that calls Rust or falls back
-- ``Cargo.toml`` - Rust dependencies (PyO3, numpy, xxhash, lz4_flex, rayon)
-- ``pyproject.toml`` - Python package config and Maturin build settings
+Source layout
+-------------
+
+- ``crates/tenso/`` - the core codec (encode/decode, dtypes, framing)
+- ``crates/tenso-ffi/`` - C ABI + generated ``include/tenso.h``
+- ``crates/tenso-device/``, ``crates/tenso-cuda/``, ``crates/tenso-bus/`` - device, CUDA, and IPC crates
+- ``src/lib.rs`` - PyO3 binding (Python-facing glue only; calls the core)
+- ``src/tenso/`` - Python package (high-level API, async, GPU, integrations)
+- ``Cargo.toml`` / ``pyproject.toml`` - workspace + Python build config
 
 Why Rust?
 ---------
 
-1. **Zero-Copy Memory Access**: Direct pointer manipulation without Python GIL
-2. **SIMD Optimization**: Compiler auto-vectorization for data alignment
-3. **Type Safety**: Compile-time guarantees prevent segfaults
-4. **Parallelism**: Rayon for parallel processing without GIL limitations
+1. **Zero-Copy Memory Access**: direct pointer manipulation without holding the GIL.
+2. **SIMD-friendly layout**: 64-byte alignment enables compiler auto-vectorization.
+3. **Type safety**: compile-time guarantees prevent whole classes of memory bugs.
+4. **Portable core**: ``no_std`` means the same codec runs in Python, C/C++, and
+   eventually embedded/WASM targets.
 
-The overhead of calling Rust from Python is ~100ns, which is negligible compared to the microseconds saved during (de)serialization.
+The overhead of calling Rust from Python is ~100ns, negligible against the
+microseconds saved during (de)serialization.
 
 Future Extensions
 -----------------
 
-Planned Rust optimizations:
-
-- LZ4 compression integration (currently Python-only)
-- GPU-direct deserialization (CUDA/ROCm interop)
-- WebAssembly compilation for browser use
+- GPU-direct deserialization (broader CUDA/ROCm interop)
+- WebAssembly build of the core for browser use
+- A ``tenso`` umbrella crate exposing the device/cuda/bus features behind flags
