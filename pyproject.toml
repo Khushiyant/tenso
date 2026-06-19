@@ -1,6 +1,6 @@
 [project]
 name = "tenso"
-version = "0.23.0"
+version = "0.24.0"
 description = "High-performance zero-copy tensor protocol"
 readme = "README.md"
 dependencies = [
@@ -47,6 +47,7 @@ gpu = [
 
 
 
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -62,6 +63,7 @@ branch = "main"
 upload_to_pypi = false
 upload_to_release = true
 build_command = "echo 'Skipping build in semantic-release, handled by CI'"
+
 
 
 

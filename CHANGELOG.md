@@ -1,6 +1,32 @@
 # CHANGELOG
 
 
+## v0.24.0 (2026-06-19)
+
+### Documentation
+
+- Document Rust and C/C++ usage and correct the architecture docs
+  ([`2c45faa`](https://github.com/Khushiyant/tenso/commit/2c45faaaacd6c7f3addeb5bc36b01fa97ed54286))
+
+The architecture page described a pure-Python fallback and rayon that no longer exist; rewrite it
+  around the single Rust core and its crate workspace. Add Rust (cargo add tenso) and C/C++ install
+  + usage to the README, refresh the contributor project structure, and update the contributing
+  wishlist.
+
+### Features
+
+- Give the C ABI integrity+compression parity and prove the edge claims
+  ([`581aaba`](https://github.com/Khushiyant/tenso/commit/581aabab1bff759ccd9f76206056b994880b51ea))
+
+tenso-ffi only pulled tenso's default features, so the shipped C ABI could not produce integrity
+  (XXH3) or compressed (LZ4) packets — a parity gap with the Python binding. Enable both features so
+  C/C++ callers match Python.
+
+Add C-ABI conformance tests proving encode (plain, integrity, compressed) and decode are
+  byte-identical to the frozen tenso.dumps fixtures, and a CI job building the core for a bare-metal
+  Cortex-M target (thumbv7em-none-eabi) to back the no_std / edge claim with a green check.
+
+
 ## v0.23.0 (2026-06-19)
 
 ### Bug Fixes
