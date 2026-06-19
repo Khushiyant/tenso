@@ -1,6 +1,43 @@
 # CHANGELOG
 
 
+## v0.23.0 (2026-06-19)
+
+### Bug Fixes
+
+- Enforce array alignment and reject oversized dims
+  ([`8780ace`](https://github.com/Khushiyant/tenso/commit/8780ace0ac2415657c1a8597d6739f297bc30b93))
+
+### Build System
+
+- Distribute native libraries via crates.io, C ABI, and ROS
+  ([`3dfb990`](https://github.com/Khushiyant/tenso/commit/3dfb9901371a5915b418f839da7cac16d30de310))
+
+### Features
+
+- Native Rust core workspace and thin PyO3 binding
+  ([`99a0904`](https://github.com/Khushiyant/tenso/commit/99a0904c2ac58d31b92dd46b67bd04ca8dba8404))
+
+- Single-source wire format encode and decode via tenso-core
+  ([`0313d79`](https://github.com/Khushiyant/tenso/commit/0313d79b528091cc9e4310f81fa0cce49218815a))
+
+### Refactoring
+
+- Condense verbose code comments
+  ([`6446793`](https://github.com/Khushiyant/tenso/commit/6446793619a6ea582ae0d47e25c7ffefa9343175))
+
+- Rename the tenso-core crate to tenso so consumers use `cargo add tenso`
+  ([`0931f5a`](https://github.com/Khushiyant/tenso/commit/0931f5aa1776d049a2d36f3f07d3bd1bf367eb82))
+
+- Route streaming readers and writer through tenso-core
+  ([`7d870b8`](https://github.com/Khushiyant/tenso/commit/7d870b8033cc06182bc6f1df28c153dc9c9ca5b0))
+
+### Testing
+
+- Add conformance fixtures and fix get_packet_info for bundles
+  ([`25d04a8`](https://github.com/Khushiyant/tenso/commit/25d04a83c4b912e12821cacec5b73aad5812e1bd))
+
+
 ## v0.22.0 (2026-05-31)
 
 ### Features
@@ -504,7 +541,7 @@ Registers Tenso as a custom serializer for Ray, replacing pickle-based serializa
 - Remove IS_LITTLE_ENDIAN variable from config
   ([`9c77814`](https://github.com/Khushiyant/tenso/commit/9c77814031891db68ba319bbd1234c5f2453c7c6))
 
-- Update package name from tenso to tenso in installation instructions
+- Update package name from tenso-core to tenso in installation instructions
   ([`ebdf752`](https://github.com/Khushiyant/tenso/commit/ebdf7522c40e5d99890e7514be1352e63f943d04))
 
 - Update project description in pyproject.toml
