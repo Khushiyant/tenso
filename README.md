@@ -135,15 +135,63 @@ Tenso is built for one pattern: **serialize once, deserialize many times, over t
 
 ## Installation
 
+Tenso ships from one codebase to three ecosystems — all backed by the same Rust core.
+
+### Python
+
 ```bash
 pip install tenso
 ```
 
-Optional extras:
+Prebuilt wheels (with the compiled core inside, no toolchain needed) cover Linux
+x86_64/aarch64, macOS Apple Silicon, and Windows x64. Optional extras:
 
 ```bash
 pip install tenso[api]    # gRPC, FastAPI, Ray integration
 pip install tenso[gpu]    # GPU acceleration (CuPy/PyTorch/JAX)
+```
+
+### Rust
+
+```bash
+cargo add tenso
+```
+
+```rust
+use tenso::{ArraySpec, Dtype, EncodeOpts, dense_required_size, encode_dense_into, decode};
+
+let spec = ArraySpec { data: &bytes, dtype: Dtype::F32, shape: &[2, 3] };
+let opts = EncodeOpts::default();
+
+let mut buf = vec![0u8; dense_required_size(&spec, &opts)?];
+encode_dense_into(&spec, &mut buf, &opts)?;
+let decoded = decode(&buf)?;   // borrows buf, zero-copy
+```
+
+The C ABI (`tenso-ffi`), CUDA backend (`tenso-cuda`), and shared-memory bus
+(`tenso-bus`) are published alongside it.
+
+### C / C++
+
+Download the `tenso-ffi-<platform>.tar.gz` archive from the
+[latest GitHub Release](https://github.com/Khushiyant/tenso/releases) — it
+contains `lib/` (shared + static) and `include/` (`tenso.h`, `tenso.hpp`). No
+Rust toolchain required.
+
+```c
+#include "tenso.h"
+
+uintptr_t need = 0, written = 0;
+tenso_dense_required_size(data, data_len, dtype_code, shape, ndim,
+                          /*check_integrity=*/false, /*compress=*/false,
+                          /*alignment=*/64, &need);
+uint8_t *out = malloc(need);
+tenso_encode_dense_into(data, data_len, dtype_code, shape, ndim,
+                        false, false, 64, out, need, &written);
+
+TensoView *v = tenso_decode(packet, packet_len);
+const uint8_t *body = tenso_view_body_ptr(v);
+tenso_view_free(v);
 ```
 
 ---
@@ -370,9 +418,11 @@ The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 
 
 ## Contributing
 
-Contributions are welcome! We are currently looking for help with:
+Contributions are welcome! A C ABI (`tenso-ffi`, usable from C/C++) already
+ships; we are currently looking for help with:
 
-* **C++ / JavaScript Clients**: Extending the protocol to other ecosystems.
+* **More language clients**: JavaScript/WASM, Go, and other ecosystems on top of the C ABI.
+* **Rust ergonomics**: a `tenso` umbrella crate exposing the device/cuda/bus features behind flags.
 
 ---
 

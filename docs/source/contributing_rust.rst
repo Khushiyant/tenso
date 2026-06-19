@@ -26,13 +26,21 @@ Project Structure
 
 .. code-block:: text
 
+    crates/
+    ├── tenso/                  # the core codec (cargo add tenso)
+    ├── tenso-ffi/              # C ABI + generated include/tenso.h
+    ├── tenso-device/           # DeviceBackend + CPU/Mock + GPU codec
+    ├── tenso-cuda/             # CUDA backend (dlopen libcudart)
+    └── tenso-bus/              # shared-memory tensor bus
     src/
-    ├── lib.rs                  # Main Rust module
-    ├── tenso/                  # Python package
-    │   ├── __init__.py
-    │   ├── core.py            # Calls Rust functions
-    │   └── tenso_rs.pyi       # Type stubs (optional)
-    └── Cargo.toml             # Rust dependencies
+    ├── lib.rs                  # PyO3 binding (calls the core)
+    └── tenso/                  # Python package
+        ├── __init__.py
+        └── core.py             # high-level API over tenso_rs
+    Cargo.toml                  # workspace + root binding crate
+
+Wire-format logic belongs in the ``tenso`` core crate, **not** in ``src/lib.rs``
+— the binding is only the Python-facing glue.
 
 Working on Rust Code
 --------------------
@@ -61,22 +69,16 @@ Adding New Functions
         Ok(())
     }
 
-3. **Wrap it in Python** (``src/tenso/core.py``):
+3. **Wrap it in Python** (``src/tenso/core.py``). The compiled extension is
+   required, so import it directly — there is no Python fallback:
 
 .. code-block:: python
 
-    try:
-        from .tenso_rs import my_new_function
-        HAS_MY_FEATURE = True
-    except ImportError:
-        HAS_MY_FEATURE = False
+    from .tenso_rs import my_new_function
 
     def my_feature(data):
         """User-facing docstring here."""
-        if HAS_MY_FEATURE:
-            return my_new_function(data)
-        else:
-            return fallback_implementation(data)
+        return my_new_function(data)
 
 4. **Rebuild and test**:
 
@@ -123,9 +125,9 @@ Code Style
 Performance Guidelines
 ~~~~~~~~~~~~~~~~~~~~~~
 
-- Use ``rayon`` for parallelism (already included)
+- Keep the ``tenso`` core ``no_std``-friendly (no std-only deps without a feature gate)
 - Avoid unnecessary allocations
-- Use ``unsafe`` sparingly (document thoroughly)
+- Use ``unsafe`` sparingly (document thoroughly with ``// SAFETY:``)
 - Profile with ``cargo flamegraph``
 
 .. code-block:: bash
