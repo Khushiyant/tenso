@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 
 import tenso
-from tenso import StringTensor
+from tenso import StringTensor, QuantizedTensor
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent
@@ -75,6 +75,32 @@ def main() -> None:
     # 7. StringTensor with mixed-length UTF-8 strings
     st = StringTensor(["hi", "", "world", "ñ"])
     results.append(_write("string_mixed_utf8.tenso", st.dumps()))
+
+    # 8. Compressed dense float64 (repetitive => compresses), with integrity.
+    arr = np.tile(np.arange(64, dtype=np.float64), 16)
+    results.append(
+        _write(
+            "dense_f64_compressed.tenso",
+            tenso.dumps(arr, compress=True, check_integrity=True),
+        )
+    )
+
+    # 9. Quantized int8 per-tensor, shape (4, 4).
+    qarr = np.linspace(-2.0, 2.0, 16, dtype=np.float32).reshape(4, 4)
+    qt = QuantizedTensor.quantize(qarr, dtype="qint8", scheme="per_tensor")
+    results.append(_write("quantized_qint8_per_tensor.tenso", tenso.dumps(qt)))
+
+    # 10. Sparse COO float32 (explicit components for a deterministic layout).
+    try:
+        from scipy import sparse  # type: ignore
+
+        sdata = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        srow = np.array([0, 0, 1, 2], dtype=np.int32)
+        scol = np.array([0, 2, 1, 0], dtype=np.int32)
+        m = sparse.coo_matrix((sdata, (srow, scol)), shape=(3, 3))
+        results.append(_write("sparse_coo_f32.tenso", tenso.dumps(m)))
+    except ImportError:
+        pass
 
     # Print a summary that can be pasted into test_conformance.py
     width = max(len(name) for name, _, _ in results)

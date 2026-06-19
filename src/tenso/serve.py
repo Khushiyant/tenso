@@ -22,13 +22,14 @@ import asyncio
 import inspect
 import logging
 import os
+import warnings
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger("tenso.serve")
 
 
 def _detect_workers() -> int:
-    """Determine optimal worker count based on available resources."""
+    """Determine optimal worker count based on the available CPU count."""
     cpu_count = os.cpu_count() or 1
     # For tensor serving, use fewer workers than CPUs to leave room
     # for numpy/torch compute threads within each worker.
@@ -47,12 +48,10 @@ class TensoApp:
         self,
         title: str = "Tenso Server",
         check_integrity: bool = False,
-        compress_response: bool = False,
     ):
         from fastapi import FastAPI
         self._app = FastAPI(title=title)
         self._check_integrity = check_integrity
-        self._compress_response = compress_response
         self._endpoints = []
 
     @property
@@ -153,6 +152,7 @@ def run(
     port: int = 8000,
     workers: Optional[int] = None,
     log_level: str = "info",
+    app_import_string: Optional[str] = None,
 ):
     """
     Run a TensoApp using uvicorn with optimized settings.
@@ -169,14 +169,35 @@ def run(
         Number of worker processes. Auto-detected if None.
     log_level : str
         Uvicorn log level.
+    app_import_string : str, optional
+        Import string for the underlying ASGI app (e.g. ``"mymodule:app.app"``).
+        Required by uvicorn to spawn more than one worker process; if omitted
+        when ``workers > 1``, the server falls back to a single worker.
     """
     import uvicorn
 
     if workers is None:
         workers = _detect_workers()
 
+    # uvicorn can only spawn multiple worker processes when given an import
+    # string (so each subprocess can import the app independently). A live app
+    # object cannot be pickled/forked across workers, so fall back to a single
+    # worker and warn rather than silently appearing to scale.
+    target = app.app
+    if workers > 1 and app_import_string is not None:
+        target = app_import_string
+    elif workers > 1:
+        warnings.warn(
+            "Multi-worker serving requires an import string "
+            "(app_import_string='module:app'); a live app object cannot be "
+            "used with workers > 1. Falling back to workers=1.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        workers = 1
+
     uvicorn.run(
-        app.app,
+        target,
         host=host,
         port=port,
         workers=workers,

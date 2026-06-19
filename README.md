@@ -26,7 +26,7 @@ Traditional formats waste CPU cycles during deserialization:
 ### The Solution
 
 Tenso achieves **true zero-copy** with:
-- **Minimalist Header**: Fixed 8-byte header eliminates JSON parsing overhead.
+- **Minimalist Header**: Fixed 10-byte header eliminates JSON parsing overhead.
 - **64-byte Alignment**: SIMD-ready padding ensures the data body is cache-line aligned.
 - **Direct Memory Mapping**: The CPU points directly to existing buffers without copying.
 
@@ -90,6 +90,39 @@ Tenso achieves **true zero-copy** with:
 - **Packet Throughput**: 89,183 packets/sec (over localhost TCP)
 - **Latency**: 11.2 µs/packet
 - **Async Write Throughput**: 88,397 MB/s (1.4M tensors/sec)
+
+---
+
+## When should I use Tenso?
+
+Tenso is built for one pattern: **serialize once, deserialize many times, over the network or between processes.** Reading data back is effectively free (a zero-copy memory view), so the more often your tensors are *read*, the more Tenso wins.
+
+### Reach for Tenso when
+
+- **You serve models over a network or RPC.** Inference nodes spend ~0.8% CPU decoding tensors instead of ~40%, leaving the cores for actual compute.
+- **You pass tensors between machines or processes** — gradients/activations in distributed training (native Ray integration), or zero-copy hand-offs via shared memory (`TensoShm`).
+- **Latency is critical** — real-time inference, robotics, sensor fusion (single-digit-µs reads).
+- **You stream many tensors** — high-throughput pipelines (1.4M tensors/sec), with `write_stream` sending straight from the array's own memory.
+- **You feed GPUs** from the network or disk with minimal host involvement.
+- **You want integrity without overhead** — optional 64-bit XXH3 checksums.
+
+### Consider an alternative when
+
+- **You store model weights on disk and rarely reload them** → [SafeTensors](https://github.com/huggingface/safetensors) is purpose-built for that.
+- **You need columnar analytics or a data ecosystem** (filters, Parquet, query engines) → [Apache Arrow](https://arrow.apache.org/).
+- **You're serializing arbitrary Python objects**, not tensors → `pickle` (but never on untrusted input).
+- **You only ever write and never read back** — Tenso's edge is on the read side, so the payoff is smaller.
+
+> **Note on writes:** `dumps()` returns a fresh `bytes` object, so it pays a one-time buffer-allocation cost like any format that does. For write-heavy or networked paths, prefer `write_stream` / `iter_dumps`, which send the tensor's own memory with **zero body copy**.
+
+### How it compares
+
+| vs. | Built for | Where Tenso pulls ahead |
+|-----|-----------|--------------------------|
+| **Pickle** | Arbitrary Python objects | ~600x faster reads, ~50x less CPU, and **no arbitrary-code-execution risk** |
+| **SafeTensors** | Safe on-disk weight storage | ~600x faster reads — **0.8% vs 37% CPU**, built for the wire, not the disk |
+| **Apache Arrow** | Columnar data ecosystems | Up to **32x faster** deserialization on large tensors, with a tiny header instead of a full columnar runtime |
+| **NumPy `.npy`** | Saving arrays to disk | Faster reads/writes **plus** streaming, integrity checks, and multi-tensor bundles |
 
 ---
 
@@ -314,10 +347,12 @@ Tenso uses a minimalist structure designed for direct memory access:
 ```
 ┌─────────────┬──────────────┬──────────────┬────────────────────────┬──────────────┐
 │   HEADER    │    SHAPE     │   PADDING    │    BODY (Raw Data)     │    FOOTER    │
-│   8 bytes   │  Variable    │   0-63 bytes │   C-Contiguous Array   │   8 bytes*   │
+│   10 bytes  │  Variable    │   0-63 bytes │   C-Contiguous Array   │   8 bytes*   │
 └─────────────┴──────────────┴──────────────┴────────────────────────┴──────────────┘
                                                                         (*Optional)
 ```
+
+The v4 header is 10 bytes: magic (`TNSO`, 4) + version (1) + flags (`u16`, 2) + dtype (1) + ndim (1) + reserved (1). Tenso writes v4 packets and still reads legacy v3 packets (which use an 8-byte header with a 1-byte flags field), and the widened `u16` flags field enables the StringTensor and RaggedArray formats.
 
 The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 vectorization and zero-copy memory mapping.
 

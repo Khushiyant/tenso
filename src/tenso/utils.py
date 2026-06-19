@@ -1,7 +1,6 @@
-import ctypes
 import struct
 import numpy as np
-from .config import _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_INTEGRITY
+from .config import _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_BUNDLE, FLAG_INTEGRITY
 from .core import _parse_header
 
 # --- RUST INTEGRATION ---
@@ -29,9 +28,12 @@ def is_aligned(data: bytes, alignment: int = 64) -> bool:
     bool
         True if the data is aligned, False otherwise.
     """
-    return (
-        ctypes.addressof(ctypes.c_char.from_buffer(bytearray(data))) % alignment
-    ) == 0
+    mv = memoryview(data)
+    if mv.nbytes == 0:
+        return True
+    # np.frombuffer is zero-copy, so .ctypes.data is the caller's own buffer address.
+    addr = np.frombuffer(mv, dtype=np.uint8).ctypes.data
+    return (addr % alignment) == 0
 
 
 def get_packet_info(data: bytes) -> dict:
@@ -67,13 +69,12 @@ def get_packet_info(data: bytes) -> dict:
 
     Uses Rust implementation for performance if available, otherwise falls back to Python.
     """
-    # 1. Fast Path (Rust)
+    # Fast path (Rust).
     if HAS_RUST:
         try:
             info = get_packet_info_rs(data)
 
-            # Post-process Rust output to match Python API expectations
-            # Rust returns 'dtype_code' (int), tests expect 'dtype' (np.dtype)
+            # Map Rust's 'dtype_code' (int) to the 'dtype' (np.dtype) Python expects.
             if "dtype" not in info and "dtype_code" in info:
                 dc = info["dtype_code"]
                 if dc in _QDTYPE_NAMES:
@@ -94,12 +95,27 @@ def get_packet_info(data: bytes) -> dict:
 
             return info
         except ValueError as e:
-            # Rust raises ValueError on bad packets, propagate it
+            # Rust raises ValueError on bad packets; propagate.
             raise e
 
-    # 2. Slow Path (Python Fallback)
+    # Slow path (Python fallback).
     mv = memoryview(data)
     ver, flags, dtype_code, ndim, header_base = _parse_header(mv)
+
+    if flags & FLAG_BUNDLE:
+        # Bundle: `ndim` is the entry count; post-header bytes are key-length prefixes.
+        return {
+            "version": ver,
+            "dtype": None,
+            "shape": (),
+            "ndim": ndim,
+            "entry_count": ndim,
+            "flags": flags,
+            "aligned": bool(flags & 1),
+            "integrity_protected": bool(flags & FLAG_INTEGRITY),
+            "total_elements": 0,
+            "data_size_bytes": 0,
+        }
 
     shape_end = header_base + (ndim * 4)
     if len(mv) < shape_end:

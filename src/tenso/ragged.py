@@ -30,7 +30,10 @@ from .config import (
     FLAG_INTEGRITY,
     FLAG_STRING,
 )
-from .core import _parse_header
+from .core import _parse_header, loads as _core_loads
+
+# Rust extension is required (tenso.core raises if missing), so always available.
+from .tenso_rs import dumps_string_rs
 
 
 class StringTensor:
@@ -89,80 +92,33 @@ class StringTensor:
         return (self._count,)
 
     def dumps(self, check_integrity: bool = False) -> memoryview:
-        """Serialize to a Tenso v4 packet."""
-        offsets_bytes = self._offsets.tobytes()
-        data_bytes = self._data
-
-        flags = FLAG_STRING | FLAG_ALIGNED
-        if check_integrity:
-            flags |= FLAG_INTEGRITY
-
-        # v4 header(10) + shape[1 dim](4) + padding + body
-        header_len = _HEADER_BASE_V4 + 4
-        padding_len = (_ALIGNMENT - (header_len % _ALIGNMENT)) % _ALIGNMENT
-        body = offsets_bytes + data_bytes
-        footer_len = 8 if check_integrity else 0
-        total = header_len + padding_len + len(body) + footer_len
-
-        buf = bytearray(total)
-        # magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1)
-        struct.pack_into(
-            "<4sBHBBB", buf, 0,
-            _MAGIC, _VERSION, flags, DTYPE_STRING, 1, 0,
+        """Serialize to a Tenso v4 packet (via the Rust core)."""
+        return memoryview(
+            dumps_string_rs(
+                self._offsets.tobytes(),
+                bytes(self._data),
+                self._count,
+                check_integrity,
+            )
         )
-        struct.pack_into("<I", buf, _HEADER_BASE_V4, self._count)
-
-        body_start = header_len + padding_len
-        buf[body_start:body_start + len(body)] = body
-
-        if check_integrity:
-            digest = xxhash.xxh3_64_intdigest(body)
-            struct.pack_into("<Q", buf, body_start + len(body), digest)
-
-        return memoryview(buf)
 
     @classmethod
     def loads(cls, data: Union[bytes, bytearray, memoryview]) -> "StringTensor":
-        """Deserialize a StringTensor packet."""
-        mv = memoryview(data)
-        _ver, flags, dtype_code, ndim, header_base = _parse_header(mv)
-
-        if not (flags & FLAG_STRING) or dtype_code != DTYPE_STRING or ndim != 1:
+        """Deserialize a StringTensor packet (decoded by the Rust core)."""
+        obj = _core_loads(data)
+        if not isinstance(obj, cls):
             raise ValueError("Not a StringTensor packet")
+        return obj
 
-        shape_end = header_base + 4
-        if len(mv) < shape_end:
-            raise ValueError("StringTensor packet truncated (shape)")
-        count = struct.unpack_from("<I", mv, header_base)[0]
 
-        padding_len = (_ALIGNMENT - (shape_end % _ALIGNMENT)) % _ALIGNMENT
-        body_start = shape_end + padding_len
-
-        offsets_size = (count + 1) * 8
-        if len(mv) < body_start + offsets_size:
-            raise ValueError("StringTensor packet truncated (offsets)")
-        offsets = np.frombuffer(
-            mv[body_start:body_start + offsets_size], dtype=np.uint64
-        ).copy()
-        data_start = body_start + offsets_size
-        total_str_bytes = int(offsets[-1])
-        if len(mv) < data_start + total_str_bytes:
-            raise ValueError("StringTensor packet truncated (data)")
-        raw_data = bytes(mv[data_start:data_start + total_str_bytes])
-
-        if flags & FLAG_INTEGRITY:
-            body_end = data_start + total_str_bytes
-            if len(mv) < body_end + 8:
-                raise ValueError("StringTensor packet truncated (integrity footer)")
-            expected = struct.unpack_from("<Q", mv, body_end)[0]
-            body_view = mv[body_start:body_end]
-            if xxhash.xxh3_64_intdigest(body_view) != expected:
-                raise ValueError("Integrity check failed: XXH3 mismatch")
-
+    @classmethod
+    def _from_raw(cls, offsets, data, count: int) -> "StringTensor":
+        """Reconstruct from already-parsed raw fields (used by the Rust decoder,
+        which owns the wire parsing; this only assembles the Python object)."""
         obj = object.__new__(cls)
-        obj._offsets = offsets
-        obj._data = raw_data
-        obj._count = count
+        obj._offsets = np.asarray(offsets, dtype=np.uint64)
+        obj._data = bytes(data)
+        obj._count = int(count)
         return obj
 
     def __repr__(self) -> str:

@@ -1,0 +1,29 @@
+[package]
+name = "tenso"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Pure-Rust core engine for the Tenso tensor wire format (no pyo3/numpy/libc)."
+
+[lib]
+name = "tenso"
+
+[features]
+# Default keeps the crate std-enabled for ergonomic host builds, but the crate
+# is no_std+alloc friendly: build with `--no-default-features` for embedded.
+default = ["std"]
+# `std` turns off `no_std` for std-only scaffolding. It does NOT pull lz4 — LZ4 is
+# gated by `compression`, so a std build without compression stays lean.
+std = []
+# Compression support (LZ4 frame). Implies std because lz4_flex is std-only.
+compression = ["std", "dep:lz4_flex"]
+# Integrity checksums (XXH3). xxhash-rust is no_std friendly.
+integrity = ["dep:xxhash-rust"]
+
+[dependencies]
+# NOTE: tenso must NOT depend on pyo3, numpy, or libc.
+lz4_flex = { workspace = true, optional = true }
+xxhash-rust = { workspace = true, optional = true }

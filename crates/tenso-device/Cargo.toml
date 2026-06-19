@@ -1,0 +1,18 @@
+[package]
+name = "tenso-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "DeviceBackend trait + CpuBackend + MockBackend + GPU codec orchestration over tenso."
+
+[lib]
+name = "tenso_device"
+
+[features]
+default = []
+
+[dependencies]
+tenso = { workspace = true }

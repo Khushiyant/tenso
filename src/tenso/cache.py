@@ -39,6 +39,7 @@ except ImportError:
 
 import numpy as np
 
+from .config import _HEADER_BASE_V4
 from .core import dumps, loads
 from .utils import get_packet_info
 
@@ -58,6 +59,10 @@ try:
     _HAS_ROBUST_MUTEX = True
 except ImportError:
     _HAS_ROBUST_MUTEX = False
+
+# POSIX mutex is only robust (auto-recovers after a holder crash) on Linux via
+# PTHREAD_MUTEX_ROBUST; elsewhere fall back to kernel-released fcntl.flock.
+_ROBUST_MUTEX_OK = _HAS_ROBUST_MUTEX and sys.platform.startswith("linux")
 
 try:
     from .quantize import QuantizedTensor
@@ -115,8 +120,7 @@ _H_GENERATION = 68    # 8 bytes
 _H_HITS = 76          # 8 bytes
 _H_MISSES = 84        # 8 bytes
 _H_MUTEX_INIT = 92    # 1 byte (0=not initialized, 1=robust mutex initialized)
-_H_MUTEX = 128        # 64 bytes — POSIX pthread_mutex_t (process-shared, robust)
-                      # Aligned to 64 bytes for portability
+_H_MUTEX = 128        # 64 bytes — POSIX pthread_mutex_t, 64-byte aligned
 
 # Entry slot field offsets (within each 256-byte slot, 212 bytes used, 44 spare)
 _E_STATUS = 0         # 1 byte  (0=free, 1=active)
@@ -351,7 +355,7 @@ class TensoCache:
             self._lock_file_path = None
             # Attach to existing robust mutex if creator initialized one
             self._use_robust_mutex = (
-                _HAS_ROBUST_MUTEX and buf[_H_MUTEX_INIT] == 1
+                _ROBUST_MUTEX_OK and buf[_H_MUTEX_INIT] == 1
             )
             if not self._use_robust_mutex:
                 self._init_file_lock()
@@ -379,12 +383,10 @@ class TensoCache:
     def _init_file_lock(self):
         """Open/create a lock file scoped to the current user."""
         if not _HAS_FCNTL:
-            # No kernel locking available (Windows). Rely on the per-process
-            # threading.RLock — multi-process cache sharing is unsupported
-            # on this platform without the Rust robust mutex.
+            # No kernel locking (Windows): rely on per-process RLock only;
+            # multi-process sharing needs the Rust robust mutex here.
             return
-        # Namespace by UID so users on a shared host can't collide on (or
-        # squat) each other's lock files.
+        # Namespace by UID so users on a shared host can't collide/squat lock files.
         uid = os.getuid()
         filename = f".tenso_cache_{uid}_{self._name}.lock"
         self._lock_file_path = os.path.join(tempfile.gettempdir(), filename)
@@ -415,20 +417,14 @@ class TensoCache:
         fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
 
     # -- SHM locking (cross-process safety) --
-    #
-    # Two strategies are available:
-    #   1. Robust POSIX pthread_mutex via tenso_rs (preferred). Uses
-    #      PTHREAD_PROCESS_SHARED and, on Linux, PTHREAD_MUTEX_ROBUST so
-    #      the kernel auto-recovers if a holder crashes — no 30-second
-    #      stale-lock window and no CPU-thrashing spinloop.
-    #   2. Python spinlock fallback (original). Used when the Rust
-    #      extension is not compiled or on non-Unix platforms.
+    # Two strategies: (1) robust POSIX pthread_mutex via tenso_rs (preferred,
+    # kernel auto-recovers on holder crash); (2) Python file-lock fallback.
 
     _STALE_LOCK_THRESHOLD = 30.0  # seconds before force-acquiring a stale lock
 
     def _init_robust_mutex(self):
         """Initialize the POSIX robust mutex in the pool header (once)."""
-        if not _HAS_ROBUST_MUTEX:
+        if not _ROBUST_MUTEX_OK:
             return False
         buf = self._shm.buf
         if buf[_H_MUTEX_INIT] == 1:
@@ -457,9 +453,7 @@ class TensoCache:
                 self._recover_pool_state()
             return
 
-        # --- File-lock fallback ---
-        # Uses OS-level file locking (fcntl.flock on Unix) which is
-        # kernel-guaranteed atomic and auto-released on process crash.
+        # File-lock fallback: fcntl.flock is atomic and auto-released on crash.
         self._file_lock_acquire(timeout)
 
     def _shm_lock_release(self):
@@ -555,7 +549,14 @@ class TensoCache:
         packet_size = struct.unpack_from('<I', buf, off + _E_PACKET_SIZE)[0]
         dtype_code = buf[off + _E_DTYPE]
         ndim = buf[off + _E_NDIM]
-        shape = struct.unpack_from(f'<{ndim}I', buf, off + _E_SHAPE) if ndim > 0 else ()
+        # Only up to 8 dims are stored in _E_SHAPE (32 bytes); never read past
+        # that, or we'd run into the adjacent metadata / next slot for ndim > 8.
+        stored_dims = min(ndim, 8)
+        shape = (
+            struct.unpack_from(f'<{stored_dims}I', buf, off + _E_SHAPE)
+            if stored_dims > 0
+            else ()
+        )
         access_time = struct.unpack_from('<d', buf, off + _E_ACCESS_TIME)[0]
         create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
         ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
@@ -575,13 +576,12 @@ class TensoCache:
         off = self._slot_offset(slot)
         key_bytes = key.encode('utf-8')
 
-        # Write barrier: mark FREE so concurrent readers skip this entry
+        # Write barrier: mark FREE so concurrent readers skip this entry.
         buf[off + _E_STATUS] = _STATUS_FREE
 
-        # Write all metadata fields
         buf[off + _E_KEY_LEN] = len(key_bytes)
         buf[off + _E_KEY: off + _E_KEY + len(key_bytes)] = key_bytes
-        # Zero remaining key space
+        # Zero remaining key space.
         if len(key_bytes) < _MAX_KEY_LEN:
             buf[off + _E_KEY + len(key_bytes): off + _E_KEY + _MAX_KEY_LEN] = (
                 b'\x00' * (_MAX_KEY_LEN - len(key_bytes))
@@ -601,7 +601,7 @@ class TensoCache:
         struct.pack_into('<I', buf, off + _E_LRU_PREV, _SENTINEL)
         struct.pack_into('<I', buf, off + _E_LRU_NEXT, _SENTINEL)
 
-        # Release barrier: metadata fully written, now visible to readers
+        # Release barrier: metadata fully written, now visible to readers.
         buf[off + _E_STATUS] = _STATUS_ACTIVE
 
     def _clear_entry(self, slot: int):
@@ -782,7 +782,7 @@ class TensoCache:
     def _evict_expired(self) -> int:
         """Evict all TTL-expired entries. Returns bytes freed."""
         freed = 0
-        now = time.monotonic()
+        now = time.time()  # wall clock: create/access times are compared cross-process
         buf = self._shm.buf
 
         for i in range(self._max_entries):
@@ -888,7 +888,7 @@ class TensoCache:
 
         if isinstance(tensor, np.ndarray):
             ndim = tensor.ndim
-            header_size = 8 + ndim * 4
+            header_size = _HEADER_BASE_V4 + ndim * 4
             padding = (_DATA_ALIGNMENT - (header_size % _DATA_ALIGNMENT)) % _DATA_ALIGNMENT
             return header_size + padding + tensor.nbytes + 256
 
@@ -964,7 +964,7 @@ class TensoCache:
                             self._shm.buf[data_off:data_off + packet_size]
                         )
 
-                        now = time.monotonic()
+                        now = time.time()  # wall clock: create/access times are compared cross-process
                         self._write_entry(
                             existing_slot, key, data_off, actual_alloc, packet_size,
                             dtype_code, ndim, shape, ttl or 0.0, now
@@ -1015,7 +1015,7 @@ class TensoCache:
                     self._shm.buf[data_off:data_off + packet_size]
                 )
 
-                now = time.monotonic()
+                now = time.time()  # wall clock: create/access times are compared cross-process
                 self._write_entry(
                     slot, key, data_off, alloc_size, packet_size,
                     dtype_code, ndim, shape, ttl or 0.0, now
@@ -1094,7 +1094,9 @@ class TensoCache:
                 ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
                 if ttl > 0:
                     create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-                    if time.monotonic() - create_time >= ttl:
+                    # TTL uses wall clock (time.time), not monotonic: create_time
+                    # is in SHM and compared cross-process where monotonic epochs differ.
+                    if time.time() - create_time >= ttl:
                         self._delete_slot(slot)
                         self._bump_generation()
                         self._inc_misses()
@@ -1103,11 +1105,10 @@ class TensoCache:
                 data_off = struct.unpack_from('<Q', buf, off + _E_DATA_OFF)[0]
                 packet_size = struct.unpack_from('<I', buf, off + _E_PACKET_SIZE)[0]
 
-                # Snapshot the packet bytes while holding the lock so a
-                # concurrent put/delete cannot mutate the data under us.
+                # Snapshot under the lock so a concurrent put/delete can't mutate it.
                 packet_snapshot = bytes(buf[data_off:data_off + packet_size])
 
-                struct.pack_into('<d', buf, off + _E_ACCESS_TIME, time.monotonic())
+                struct.pack_into('<d', buf, off + _E_ACCESS_TIME, time.time())
                 self._lru_move_to_head(slot)
                 self._inc_hits()
 
@@ -1191,7 +1192,7 @@ class TensoCache:
             # Check TTL
             ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
             create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-            now = time.monotonic()
+            now = time.time()  # wall clock: create/access times are compared cross-process
 
             if ttl > 0 and now - create_time >= ttl:
                 self._delete_slot(slot)
@@ -1230,7 +1231,7 @@ class TensoCache:
         with self._lock:
             self._check_closed()
             self._sync_index()
-            now = time.monotonic()
+            now = time.time()  # wall clock: create/access times are compared cross-process
             result = []
             buf = self._shm.buf
 
@@ -1291,11 +1292,11 @@ class TensoCache:
             if buf[off + _E_STATUS] != _STATUS_ACTIVE:
                 return False
 
-            # Check TTL
+            # Check TTL (wall clock: create_time is compared cross-process)
             ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
             if ttl > 0:
                 create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-                if time.monotonic() - create_time >= ttl:
+                if time.time() - create_time >= ttl:
                     return False
             return True
 
@@ -1353,8 +1354,7 @@ class TensoCache:
             try:
                 self._shm.close()
             except BufferError:
-                # Zero-copy numpy views still reference the mmap.
-                # Disarm __del__ so it won't re-raise the same error.
+                # Zero-copy views still reference the mmap; disarm __del__.
                 self._shm._buf = None
                 self._shm._mmap = None
             except Exception:

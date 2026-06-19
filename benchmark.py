@@ -885,46 +885,6 @@ def run_gpu_benchmark():
         print("Skipping GPU benchmark (Torch/CUDA not found)")
 
 
-def run_gpu_benchmark():
-    print("\n" + "=" * 80)
-    print("BENCHMARK: GPU TRANSFER")
-    print("=" * 80)
-
-    try:
-        import torch
-
-        import tenso.gpu as t_gpu
-
-        # Setup: Create a large tensor in RAM
-        shape = (4096, 4096)  # ~64MB float32
-        data = np.random.rand(*shape).astype(np.float32)
-        stream = io.BytesIO(tenso.dumps(data))
-
-        # Benchmark
-        t0 = time.perf_counter()
-        # This uses your pinned memory logic
-        t_gpu.read_to_device(stream, device_id=0)
-        torch.cuda.synchronize()  # Wait for GPU to finish
-        t_total = (time.perf_counter() - t0) * 1000
-
-        print(f"CPU -> GPU (Tenso): {t_total:.2f} ms")
-
-        # Compare to Standard PyTorch Load
-        stream.seek(0)
-        t0 = time.perf_counter()
-        # Standard way: Load to CPU -> Move to GPU
-        cpu_arr = tenso.loads(stream.read())
-        torch.tensor(cpu_arr).to("cuda")
-        torch.cuda.synchronize()
-        t_std = (time.perf_counter() - t0) * 1000
-
-        print(f"CPU -> GPU (Standard): {t_std:.2f} ms")
-        print(f"Speedup: {t_std / t_total:.1f}x")
-
-    except ImportError:
-        print("Skipping GPU benchmark (Torch/CUDA not found)")
-
-
 def run_shm_benchmark():
     """Run Shared Memory IPC benchmarks."""
     print("\n" + "=" * 80)
@@ -1010,6 +970,9 @@ Benchmark Modes:
   dtypes      - Dtype coverage
   arrow       - Arrow comparison
   correctness - Data integrity
+  async       - Async I/O throughput
+  gpu         - CPU -> GPU transfer
+  shm         - Shared memory IPC
   quick       - Quick overview (ser + arrow)
         """,
     )
@@ -1028,6 +991,8 @@ Benchmark Modes:
             "dtypes",
             "arrow",
             "correctness",
+            "async",
+            "gpu",
             "shm",
             "quick",
         ],
@@ -1069,6 +1034,8 @@ Benchmark Modes:
         run_shm_benchmark()
     elif args.mode == "async":
         run_async_benchmark()
+    elif args.mode == "gpu":
+        run_gpu_benchmark()
     elif args.mode == "dtypes":
         run_dtype_coverage()
     elif args.mode == "quick":

@@ -1,6 +1,44 @@
+[workspace]
+members = [
+    ".",
+    "crates/tenso",
+    "crates/tenso-ffi",
+    "crates/tenso-device",
+    "crates/tenso-cuda",
+    "crates/tenso-bus",
+]
+exclude = ["fuzz"]
+resolver = "2"
+
+# Shared package metadata inherited by every member crate via `*.workspace = true`.
+# Keeping version here makes a lockstep release a single edit (plus the matching
+# `version = ...` on the internal deps below).
+[workspace.package]
+version = "0.22.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Khushiyant/tenso"
+keywords = ["tensor", "serialization", "zero-copy", "ipc"]
+categories = ["encoding", "science", "data-structures"]
+
+[workspace.dependencies]
+# Shared deps pinned once here; member crates reference them with
+# `{ workspace = true }`. tenso MUST NOT depend on pyo3/numpy/libc.
+lz4_flex = "0.11"
+xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
+libc = "0.2"
+libloading = "0.8"
+cbindgen = "0.27"
+# Internal path deps so crates reference each other by `{ workspace = true }`.
+# The `version` is REQUIRED for crates.io publishing (a path-only dep is rejected);
+# it must track the workspace.package version for a lockstep release.
+tenso = { path = "crates/tenso", version = "0.22.0" }
+tenso-device = { path = "crates/tenso-device", version = "0.22.0" }
+tenso-cuda = { path = "crates/tenso-cuda", version = "0.22.0" }
+
 [package]
 name = "tenso-rs"
-version = "0.1.0"
+version = "0.22.0"
 edition = "2021"
 
 [lib]
@@ -14,10 +52,17 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 # PyO3 is the bridge between Rust and Python
 pyo3 = { version = "0.22", features = ["gil-refs", "abi3-py311"] }
-xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
-rayon = "1.8"
-lz4_flex = "0.11"
-libc = "0.2"
+libc = { workspace = true }
+# The pure-Rust engine: single source of truth for the wire-format codec.
+# Enable everything the dense + container encode/decode needs:
+#   std         -> turns off no_std for std-only scaffolding
+#   compression -> LZ4 frame encode/decode (compressed dense packets; implies std)
+#   integrity   -> XXH3-64 footer encode/verify
+tenso = { workspace = true, features = [
+    "std",
+    "compression",
+    "integrity",
+] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

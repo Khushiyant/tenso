@@ -1,0 +1,22 @@
+[package]
+name = "tenso-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Stable C ABI for the Tenso core (cdylib + staticlib); cbindgen generates include/tenso.h."
+
+[lib]
+name = "tenso_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+tenso = { workspace = true }
+
+[build-dependencies]
+cbindgen = { workspace = true }

@@ -50,6 +50,12 @@ EXPECTED_SHA256 = {
         "848d656444bb1d8ebdd921667a17d75d42d27f3b01d13a2df646cc7b6c6e9ed5",
     "string_mixed_utf8.tenso":
         "a7d2668fe1672083c47e5714a2ff45318fff252c79952ad06391f2835b008c30",
+    "dense_f64_compressed.tenso":
+        "9608679ed6964e6933d2dc1abc688fe0323f792cb9d5365db9e3e36890f59fa6",
+    "quantized_qint8_per_tensor.tenso":
+        "db8d4e0ed8e583f6a84c2fb1de0c6fdb622b52a447fe243f9087409150605c1c",
+    "sparse_coo_f32.tenso":
+        "b909f9fdf4c3054f3983aaf376fab0a6eb343716c5c7555f784dabd360cf612d",
 }
 
 
@@ -169,3 +175,63 @@ def test_string_mixed_utf8():
     assert isinstance(st, StringTensor)
     assert len(st) == 4
     assert st.to_list() == ["hi", "", "world", "ñ"]
+
+
+def test_dense_f64_compressed():
+    name = "dense_f64_compressed.tenso"
+    data = _read_fixture(name)
+    _assert_sha256(name, data)
+
+    arr = tenso.loads(data)
+    expected = np.tile(np.arange(64, dtype=np.float64), 16)
+    assert arr.dtype == np.float64
+    np.testing.assert_array_equal(arr, expected)
+
+
+def test_quantized_qint8_per_tensor():
+    from tenso import QuantizedTensor
+
+    name = "quantized_qint8_per_tensor.tenso"
+    data = _read_fixture(name)
+    _assert_sha256(name, data)
+
+    qt = tenso.loads(data)
+    assert isinstance(qt, QuantizedTensor)
+    assert qt.shape == (4, 4)
+    expected = np.linspace(-2.0, 2.0, 16, dtype=np.float32).reshape(4, 4)
+    np.testing.assert_allclose(qt.dequantize(), expected, atol=0.05)
+
+
+def test_sparse_coo_f32():
+    pytest.importorskip("scipy")
+
+    name = "sparse_coo_f32.tenso"
+    data = _read_fixture(name)
+    _assert_sha256(name, data)
+
+    m = tenso.loads(data)
+    dense = np.zeros((3, 3), dtype=np.float32)
+    dense[0, 0], dense[0, 2], dense[1, 1], dense[2, 0] = 1.0, 2.0, 3.0, 4.0
+    np.testing.assert_array_equal(m.toarray(), dense)
+
+
+def test_v3_dense_backward_read():
+    """The decoder must still read a v3 packet (8-byte header) — there is no v3
+    writer, so this hand-frames a minimal v3 dense packet and asserts it decodes.
+    This is the backward-compatibility canary the v4-only fixtures cannot give."""
+    import struct as _struct
+
+    from tenso.config import _ALIGNMENT, _MAGIC, FLAG_ALIGNED
+
+    values = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    dtype_code, ndim = 1, 1  # float32, 1-D
+    # v3 header: magic(4) + ver=3 + flags_u8 + dtype + ndim  (8 bytes)
+    header = _struct.pack("<4sBBBB", _MAGIC, 3, FLAG_ALIGNED, dtype_code, ndim)
+    shape = _struct.pack("<I", values.size)
+    cursor = 8 + ndim * 4
+    pad = (_ALIGNMENT - cursor % _ALIGNMENT) % _ALIGNMENT
+    packet = header + shape + b"\x00" * pad + values.tobytes()
+
+    out = tenso.loads(packet)
+    assert out.dtype == np.float32
+    np.testing.assert_array_equal(out, values)

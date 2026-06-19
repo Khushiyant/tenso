@@ -142,3 +142,102 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           event-type: release-complete
+
+  # ---------------------------------------------------------------------------
+  # Native-library distribution (Rust crates + C ABI binaries). These run on the
+  # same release as the PyPI publish and are kept independent of it.
+  # ---------------------------------------------------------------------------
+  publish-crates:
+    name: Publish crates to crates.io
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      # Opt-in: only publishes when the CARGO_REGISTRY_TOKEN secret is configured,
+      # so the release does not fail before crates.io publishing is set up.
+      - name: Check for crates.io token
+        id: token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CARGO_REGISTRY_TOKEN not set - skipping crates.io publish."
+          fi
+
+      - name: Set up Rust toolchain
+        if: steps.token.outputs.have == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Lock crate versions to the release version (lockstep)
+        if: steps.token.outputs.have == 'true'
+        run: |
+          V="${{ needs.release.outputs.version }}"
+          # workspace.package.version + the root crate version, and the internal
+          # path-dependency version literals, all track the released version.
+          sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/" Cargo.toml
+          sed -i -E "s/(tenso(-device|-cuda)? = \{ path = \"[^\"]+\", version = )\"[0-9]+\.[0-9]+\.[0-9]+\"/\1\"$V\"/" Cargo.toml
+
+      - name: Publish in dependency order
+        if: steps.token.outputs.have == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # cargo waits for each crate to appear in the index before returning,
+          # so the dependents resolve the just-published versions.
+          cargo publish -p tenso --allow-dirty
+          cargo publish -p tenso-device --allow-dirty
+          cargo publish -p tenso-cuda --allow-dirty
+          cargo publish -p tenso-ffi --allow-dirty
+          cargo publish -p tenso-bus --allow-dirty
+
+  release-binaries:
+    name: C ABI binaries (${{ matrix.name }})
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: linux-x86_64 }
+          - { os: macos-14,       name: macos-aarch64 }
+          - { os: windows-latest, name: windows-x64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build tenso-ffi (release)
+        run: cargo build -p tenso-ffi --release
+
+      - name: Stage C ABI bundle
+        shell: bash
+        run: |
+          dir="tenso-ffi-${{ matrix.name }}"
+          mkdir -p "$dir/lib" "$dir/include"
+          cp include/tenso.h "$dir/include/"
+          cp cpp/tenso.hpp "$dir/include/" 2>/dev/null || true
+          # Copy whichever lib artifacts this OS produced (shared + static).
+          cp target/release/libtenso_ffi.so    "$dir/lib/" 2>/dev/null || true
+          cp target/release/libtenso_ffi.a     "$dir/lib/" 2>/dev/null || true
+          cp target/release/libtenso_ffi.dylib "$dir/lib/" 2>/dev/null || true
+          cp target/release/tenso_ffi.dll      "$dir/lib/" 2>/dev/null || true
+          cp target/release/tenso_ffi.dll.lib  "$dir/lib/" 2>/dev/null || true
+          cp target/release/tenso_ffi.lib      "$dir/lib/" 2>/dev/null || true
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Attach to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.tag }}
+          files: tenso-ffi-${{ matrix.name }}.tar.gz
