@@ -1291,6 +1291,13 @@ mod tests {
                             reads += 1;
                         }
                         Err(BusError::Empty) => {}
+                        // A reader can legitimately fall behind a publish storm
+                        // and get Lagged (the bounded seqlock retry gave up). That
+                        // is NOT a torn read, so it must not fail this no-tearing
+                        // test -- otherwise the test is flaky on slow/contended CI
+                        // (e.g. the macOS runner). The Ok branch still asserts no
+                        // tearing on every frame that is read successfully.
+                        Err(BusError::Lagged) => {}
                         Err(e) => panic!("reader error: {:?}", e),
                     }
                 }

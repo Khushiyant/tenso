@@ -289,3 +289,102 @@ def test_read_stream_rejects_compressed_dense():
     packet = bytes(tenso.dumps(np.arange(1000, dtype=np.float64), compress=True))
     with pytest.raises(ValueError, match="compressed"):
         tenso.read_stream(io.BytesIO(packet))
+
+
+# --------------------------------------------------------------------------
+# Issue #4: dimensions > u32 must raise instead of silently truncating.
+# --------------------------------------------------------------------------
+
+def test_oversized_dim_raises_not_truncates():
+    # A real 4.29 GB allocation is unnecessary: a stride-0 broadcast view
+    # reports the oversized shape while owning a single byte. The dim guard
+    # fires before any data is touched.
+    huge = np.broadcast_to(np.zeros(1, dtype=np.uint8), (0x100000003,))
+    assert huge.shape == (0x100000003,)
+    with pytest.raises(ValueError, match="32-bit"):
+        tenso.dumps(huge)
+
+
+def test_max_u32_dim_boundary():
+    # u32::MAX itself must be rejected only when exceeded; a dim at the limit is
+    # allowed by the guard (allocation aside, the wire format can encode it).
+    at_limit = np.broadcast_to(np.zeros(1, dtype=np.uint8), (0xFFFFFFFF,))
+    # The guard must not raise for a dim that fits in u32. It may still fail
+    # later on the (correct) max-elements cap, but never with the truncation
+    # error.
+    try:
+        tenso.dumps(at_limit)
+    except ValueError as e:
+        assert "32-bit" not in str(e)
+
+
+# --------------------------------------------------------------------------
+# Issue #5: loads() must return arrays aligned to the packet's boundary,
+# regardless of the transport buffer's own alignment.
+# --------------------------------------------------------------------------
+
+def _misaligned_packet_bytes(packet) -> bytes:
+    # Force a deliberately misaligned backing buffer: a bytes object at an
+    # arbitrary address plus a 1-byte prefix shift, then strip the prefix so the
+    # packet starts at an odd offset within an owned buffer.
+    raw = bytes(packet)
+    shifted = (b"\x00" + raw)
+    return memoryview(shifted)[1:]
+
+
+@pytest.mark.parametrize("dtype", [np.uint64, np.float32, np.int16, np.float64])
+def test_loads_returns_aligned_array(dtype):
+    x = np.array([[1, 5], [9, 24]], dtype=dtype)
+    for _ in range(64):
+        packet = _misaligned_packet_bytes(tenso.dumps(x))
+        out = tenso.loads(packet)
+        assert out.ctypes.data % 64 == 0, (
+            f"deserialized array not 64-byte aligned: {out.ctypes.data % 64}"
+        )
+        assert np.array_equal(out, x)
+
+
+def test_loads_aligned_with_copy():
+    x = np.arange(37, dtype=np.float64)
+    packet = _misaligned_packet_bytes(tenso.dumps(x))
+    out = tenso.loads(packet, copy=True)
+    assert out.ctypes.data % 64 == 0
+    assert out.flags.writeable is True
+    assert np.array_equal(out, x)
+
+
+def test_loads_custom_alignment_honored():
+    x = np.arange(50, dtype=np.float32)
+    packet = _misaligned_packet_bytes(tenso.dumps(x, alignment=128))
+    out = tenso.loads(packet)
+    assert out.ctypes.data % 128 == 0
+    assert np.array_equal(out, x)
+
+
+def test_loads_bundle_arrays_aligned():
+    bundle = {
+        "a": np.arange(10, dtype=np.float32),
+        "b": np.array([[1, 2], [3, 4]], dtype=np.uint64),
+    }
+    packet = _misaligned_packet_bytes(tenso.dumps(bundle))
+    out = tenso.loads(packet)
+    for k, v in out.items():
+        assert v.ctypes.data % 64 == 0, f"bundle member {k} not aligned"
+
+
+def test_loads_zero_copy_preserved_when_input_aligned():
+    # When the caller's buffer is already aligned, no copy should occur: the
+    # result must share memory with the input (true zero-copy path).
+    x = np.arange(64, dtype=np.float64)
+    src = bytes(tenso.dumps(x))
+    n = len(src)
+    buf = np.empty(n + 64, dtype=np.uint8)
+    off = (-buf.ctypes.data) % 64
+    aligned = buf[off : off + n]
+    aligned[:] = np.frombuffer(src, dtype=np.uint8)
+    assert aligned.ctypes.data % 64 == 0
+
+    out = tenso.loads(memoryview(aligned))
+    assert np.array_equal(out, x)
+    # body lives at an aligned offset within an aligned buffer -> aliased view.
+    assert np.shares_memory(out, aligned)

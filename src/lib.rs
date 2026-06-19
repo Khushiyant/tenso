@@ -62,6 +62,25 @@ fn map_err(e: TensoError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(msg)
 }
 
+/// Convert numpy shape dims (`usize`) to the wire format's `u32` dims, rejecting
+/// any dimension that would not fit. The wire format stores each dim as a 32-bit
+/// integer, so a silent `as u32` truncation here would corrupt the array on
+/// reserialization (see issue #4).
+fn shape_to_u32(dims: &[usize]) -> PyResult<Vec<u32>> {
+    dims.iter()
+        .map(|&d| {
+            u32::try_from(d).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Dimension {} exceeds the wire-format limit of {} \
+                     (each dimension is stored as a 32-bit integer)",
+                    d,
+                    u32::MAX
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Resolve a numpy dtype `name` string to a `tenso_core::Dtype`.
 fn dtype_from_name(name: &str) -> PyResult<Dtype> {
     let d = match name {
@@ -122,7 +141,7 @@ fn extract_numpy<'a>(array: &'a PyAny) -> PyResult<NumpyView<'a>> {
     let nbytes: usize = array.getattr("nbytes")?.extract()?;
     let data_ptr: usize = array.getattr("ctypes")?.getattr("data")?.extract()?;
     let shape_usize: Vec<usize> = array.getattr("shape")?.extract()?;
-    let shape: Vec<u32> = shape_usize.iter().map(|&d| d as u32).collect();
+    let shape = shape_to_u32(&shape_usize)?;
 
     // Safety: C-contiguity was verified above, so numpy guarantees `data_ptr`
     // points to `nbytes` of contiguous little-endian array memory while the GIL
@@ -196,7 +215,7 @@ fn collect_sparse_components<'py>(
     };
 
     let shape_usize: Vec<usize> = tensor.getattr("shape")?.extract()?;
-    let shape: Vec<u32> = shape_usize.iter().map(|&d| d as u32).collect();
+    let shape = shape_to_u32(&shape_usize)?;
 
     let mut comps = Vec::with_capacity(3);
     for name in names {

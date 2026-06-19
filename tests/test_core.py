@@ -168,7 +168,11 @@ def test_copy_flag():
 
     arr_copy = tenso.loads(packet, copy=True)
     assert arr_copy.flags.writeable is True
-    assert arr_copy.base is None
+    # copy=True returns an independent, writeable array. It may be a view into a
+    # privately-owned aligned buffer (so .base need not be None); independence is
+    # what matters: mutating it must not corrupt a fresh load of the packet.
+    arr_copy[0] = 42.0
+    assert tenso.loads(packet, copy=False)[0] == 0.0
 
 
 def test_dumps_return_type():
