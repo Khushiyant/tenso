@@ -1,9 +1,12 @@
 [package]
 name = "tenso-bus"
-version = "0.22.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Shared-memory tensor bus (ring + latest-value buffer) built over tenso-core."
-license = "MIT"
 
 [lib]
 name = "tenso_bus"

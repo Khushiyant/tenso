@@ -1,9 +1,12 @@
 [package]
 name = "tenso-cuda"
-version = "0.22.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "The only crate touching CUDA. Dlopen-based (libloading) DeviceBackend; aarch64-buildable without the CUDA toolkit."
-license = "MIT"
 
 [lib]
 name = "tenso_cuda"

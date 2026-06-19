@@ -10,6 +10,17 @@ members = [
 exclude = ["fuzz"]
 resolver = "2"
 
+# Shared package metadata inherited by every member crate via `*.workspace = true`.
+# Keeping version here makes a lockstep release a single edit (plus the matching
+# `version = ...` on the internal deps below).
+[workspace.package]
+version = "0.22.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Khushiyant/tenso"
+keywords = ["tensor", "serialization", "zero-copy", "ipc"]
+categories = ["encoding", "science", "data-structures"]
+
 [workspace.dependencies]
 # Shared deps pinned once here; member crates reference them with
 # `{ workspace = true }`. tenso-core MUST NOT depend on pyo3/numpy/libc.
@@ -18,10 +29,12 @@ xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
 libc = "0.2"
 libloading = "0.8"
 cbindgen = "0.27"
-# Internal path deps so crates can reference each other by `{ workspace = true }`.
-tenso-core = { path = "crates/tenso-core" }
-tenso-device = { path = "crates/tenso-device" }
-tenso-cuda = { path = "crates/tenso-cuda" }
+# Internal path deps so crates reference each other by `{ workspace = true }`.
+# The `version` is REQUIRED for crates.io publishing (a path-only dep is rejected);
+# it must track the workspace.package version for a lockstep release.
+tenso-core = { path = "crates/tenso-core", version = "0.22.0" }
+tenso-device = { path = "crates/tenso-device", version = "0.22.0" }
+tenso-cuda = { path = "crates/tenso-cuda", version = "0.22.0" }
 
 [package]
 name = "tenso-rs"

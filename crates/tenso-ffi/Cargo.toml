@@ -1,9 +1,12 @@
 [package]
 name = "tenso-ffi"
-version = "0.22.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Stable C ABI for the Tenso core (cdylib + staticlib); cbindgen generates include/tenso.h."
-license = "MIT"
 
 [lib]
 name = "tenso_ffi"

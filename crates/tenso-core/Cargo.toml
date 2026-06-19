@@ -1,9 +1,12 @@
 [package]
 name = "tenso-core"
-version = "0.22.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Pure-Rust core engine for the Tenso tensor wire format (no pyo3/numpy/libc)."
-license = "MIT"
 
 [lib]
 name = "tenso_core"

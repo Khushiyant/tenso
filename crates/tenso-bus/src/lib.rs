@@ -1461,6 +1461,7 @@ mod tests {
         let prod = Arc::new(RingBus::open_with(&cfg, 256, OverflowPolicy::DropOldest).unwrap());
 
         let stop = Arc::new(AtomicBool::new(false));
+        let prod_stop = Arc::new(AtomicBool::new(false));
         let total = Arc::new(StdAtomicU64::new(0));
         let mut handles = Vec::new();
         for _ in 0..3 {
@@ -1494,7 +1495,7 @@ mod tests {
         }
 
         let prod_c = prod.clone();
-        let stop_p = stop.clone();
+        let stop_p = prod_stop.clone();
         let pt = std::thread::spawn(move || {
             let mut marker = 1u8;
             let mut pushed = 0u64;
@@ -1507,8 +1508,15 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(200));
-        stop.store(true, O::Relaxed);
+        // Stop the PRODUCER first and join it, then give the consumers a short
+        // uncontended window to drain the now-static ring before stopping them.
+        // Under DropOldest a perpetually-lagged consumer can otherwise read
+        // nothing on a slow/contended runner (legitimate drop behavior, not a
+        // torn read), which made `total > 0` flaky on the macOS CI runner.
+        prod_stop.store(true, O::Relaxed);
         let pushed = pt.join().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, O::Relaxed);
         for h in handles {
             h.join().unwrap();
         }
