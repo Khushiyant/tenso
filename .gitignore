@@ -29,4 +29,5 @@ docs/source/reference/
 # Added by cargo
 *.so
 /target
+benchmarks/target/
 .DS_Store
