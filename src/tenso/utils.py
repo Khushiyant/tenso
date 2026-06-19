@@ -1,6 +1,6 @@
 import struct
 import numpy as np
-from .config import _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_INTEGRITY
+from .config import _QDTYPE_NAMES, _REV_DTYPE_MAP, FLAG_BUNDLE, FLAG_INTEGRITY
 from .core import _parse_header
 
 # --- RUST INTEGRATION ---
@@ -104,6 +104,22 @@ def get_packet_info(data: bytes) -> dict:
     # 2. Slow Path (Python Fallback)
     mv = memoryview(data)
     ver, flags, dtype_code, ndim, header_base = _parse_header(mv)
+
+    if flags & FLAG_BUNDLE:
+        # For a bundle, `ndim` is the entry count and the post-header bytes are
+        # key-length prefixes, not dimensions (mirrors get_packet_info_rs).
+        return {
+            "version": ver,
+            "dtype": None,
+            "shape": (),
+            "ndim": ndim,
+            "entry_count": ndim,
+            "flags": flags,
+            "aligned": bool(flags & 1),
+            "integrity_protected": bool(flags & FLAG_INTEGRITY),
+            "total_elements": 0,
+            "data_size_bytes": 0,
+        }
 
     shape_end = header_base + (ndim * 4)
     if len(mv) < shape_end:

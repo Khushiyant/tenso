@@ -33,7 +33,7 @@ use tenso_core::{
     bundle_required_size, decode, dense_required_size, encode_bundle_into, encode_dense_into,
     encode_quantized_into, encode_sparse_into, encode_string_into, parse_header,
     quantized_required_size, sparse_required_size, string_required_size, ArraySpec, Decoded, Dtype,
-    EncodeOpts, QuantSpec, SparseFormat, TensoError, FLAG_ALIGNED, FLAG_INTEGRITY,
+    EncodeOpts, QuantSpec, SparseFormat, TensoError, FLAG_ALIGNED, FLAG_BUNDLE, FLAG_INTEGRITY,
 };
 
 // -----------------------------------------------------------------------------
@@ -736,43 +736,49 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
 
     let hdr = parse_header(bytes).map_err(map_err)?;
 
-    let shape_end = hdr.base_size + (hdr.ndim * 4);
-    if bytes.len() < shape_end {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Packet too short to contain shape",
-        ));
-    }
-
-    let mut shape = Vec::with_capacity(hdr.ndim);
-    let mut cursor = hdr.base_size;
-    for _ in 0..hdr.ndim {
-        let dim = u32::from_le_bytes([
-            bytes[cursor],
-            bytes[cursor + 1],
-            bytes[cursor + 2],
-            bytes[cursor + 3],
-        ]) as usize;
-        shape.push(dim);
-        cursor += 4;
-    }
-
     let dict = PyDict::new(py);
     dict.set_item("version", bytes[4])?;
     dict.set_item("flags", hdr.flags)?;
     dict.set_item("dtype_code", hdr.dtype_code)?;
     dict.set_item("ndim", hdr.ndim)?;
-
-    // Saturating product: the dims are attacker-controlled u32s read off the
-    // packet, so the plain product can overflow usize and (in release builds)
-    // wrap to a small, misleading value. Saturate to usize::MAX instead so an
-    // oversized/malformed header surfaces as an obviously-huge count rather than a
-    // wrapped one. (decode() separately enforces MAX_NDIM / MAX_ELEMENTS.)
-    let total_elements: usize = shape.iter().fold(1usize, |acc, &d| acc.saturating_mul(d));
-    dict.set_item("total_elements", total_elements)?;
-    dict.set_item("shape", PyTuple::new(py, shape))?;
-
     dict.set_item("aligned", (hdr.flags & FLAG_ALIGNED) != 0)?;
     dict.set_item("integrity_protected", (hdr.flags & FLAG_INTEGRITY) != 0)?;
+
+    if hdr.flags & FLAG_BUNDLE != 0 {
+        // For a bundle, `ndim` is the ENTRY COUNT and the post-header bytes are
+        // key-length prefixes, not dimensions. Report the entry count and an
+        // empty shape rather than the meaningless dims a naive read would yield.
+        dict.set_item("entry_count", hdr.ndim)?;
+        dict.set_item("shape", PyTuple::empty(py))?;
+        dict.set_item("total_elements", 0usize)?;
+    } else {
+        // dense / sparse / quantized / string: `ndim` is the dimension count and
+        // the post-header bytes are the shape.
+        let shape_end = hdr.base_size + (hdr.ndim * 4);
+        if bytes.len() < shape_end {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Packet too short to contain shape",
+            ));
+        }
+        let mut shape = Vec::with_capacity(hdr.ndim);
+        let mut cursor = hdr.base_size;
+        for _ in 0..hdr.ndim {
+            let dim = u32::from_le_bytes([
+                bytes[cursor],
+                bytes[cursor + 1],
+                bytes[cursor + 2],
+                bytes[cursor + 3],
+            ]) as usize;
+            shape.push(dim);
+            cursor += 4;
+        }
+        // Saturating product: dims are attacker-controlled u32s, so the plain
+        // product can overflow usize and wrap; saturate instead. (decode()
+        // separately enforces MAX_NDIM / MAX_ELEMENTS.)
+        let total_elements: usize = shape.iter().fold(1usize, |acc, &d| acc.saturating_mul(d));
+        dict.set_item("total_elements", total_elements)?;
+        dict.set_item("shape", PyTuple::new(py, shape))?;
+    }
 
     Ok(dict)
 }
