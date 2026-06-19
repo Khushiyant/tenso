@@ -41,7 +41,7 @@ Tenso achieves **true zero-copy** with:
 For native, no-Python comparisons against the tools people actually use to move
 tensors — CBOR, MessagePack, postcard, Apache Arrow, and ROS 2 / CDR — plus
 binary footprint and verified embedded targets, see
-[`benchmarks/`](benchmarks/README.md).
+[`benchmarks/`](https://github.com/Khushiyant/tenso/tree/main/benchmarks).
 
 **System**: Python 3.12.9, NumPy 2.3.5, 12 CPU cores, M4 Pro
 
