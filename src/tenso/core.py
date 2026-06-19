@@ -48,14 +48,28 @@ except ImportError:
     HAS_LZ4 = False
 
 # --- RUST CORE INTEGRATION ---
+# The compiled Rust extension is REQUIRED: it is the single source of truth for
+# the wire format. The pure-Python codec fallback was removed, so a missing
+# extension is a hard error rather than a silent (and now divergent) fallback.
 try:
-    # Attempt to import the optimized Rust backend
-    from .tenso_rs import dumps_rs, loads_rs, dump_to_fd_rs
+    from .tenso_rs import (
+        dumps_rs,
+        loads_rs,
+        dump_to_fd_rs,
+        dumps_quantized_rs,
+        dumps_string_rs,
+        encode_bundle_rs,
+    )
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "tenso requires its compiled Rust extension (tenso.tenso_rs), which could "
+        "not be imported. Install a prebuilt wheel (`pip install tenso`) or build "
+        "it with maturin (`maturin develop`). The pure-Python codec fallback was "
+        "removed in favor of a single Rust core."
+    ) from exc
 
-    HAS_RUST = True
-except ImportError:
-    # Fallback to pure Python if the extension isn't compiled
-    HAS_RUST = False
+# Retained (always True) so internal call sites that branch on it keep working.
+HAS_RUST = True
 
 IS_LITTLE_ENDIAN = sys.byteorder == "little"
 
@@ -137,170 +151,6 @@ def _quantized_body_size(dtype_code: int, num_elements: int) -> int:
     if dtype_code in _4BIT_CODES:
         return (num_elements + 1) // 2
     return num_elements
-
-
-def _serialize_quantized(
-    qt: "QuantizedTensor", check_integrity: bool, alignment: int
-) -> memoryview:
-    """Serialize a QuantizedTensor to a Tenso packet."""
-    import math
-
-    shape = qt.shape
-    ndim = len(shape)
-    num_elements = int(np.prod(shape))
-
-    use_custom_align = alignment != 64
-    flags = 0
-    if use_custom_align:
-        flags |= FLAG_CUST_ALIGN
-    else:
-        flags |= FLAG_ALIGNED
-    if check_integrity:
-        flags |= FLAG_INTEGRITY
-
-    # Quant metadata: 1 byte scheme + 1 byte axis + 4 bytes group_size
-    #                  + 4 bytes num_scales + num_scales*4 scales
-    #                  + num_scales*4 zero_points
-    num_scales = len(qt.scales)
-    quant_meta_len = 1 + 1 + 4 + 4 + num_scales * 4 + num_scales * 4
-
-    header_len = _HEADER_BASE_V4 + ndim * 4 + quant_meta_len
-    if use_custom_align:
-        header_len += 1
-
-    remainder = header_len % alignment
-    padding_len = 0 if remainder == 0 else (alignment - remainder)
-
-    body_len = _quantized_body_size(qt.dtype_code, num_elements)
-    footer_len = 8 if check_integrity else 0
-    total_len = header_len + padding_len + body_len + footer_len
-
-    buffer = bytearray(total_len)
-
-    # v4 Header: magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1)
-    struct.pack_into("<4sBHBBB", buffer, 0, _MAGIC, _VERSION, flags, qt.dtype_code, ndim, 0)
-    struct.pack_into(f"<{ndim}I", buffer, _HEADER_BASE_V4, *shape)
-
-    cursor = _HEADER_BASE_V4 + ndim * 4
-    meta_start = cursor
-
-    # Quant metadata
-    buffer[cursor] = qt.quant_scheme
-    cursor += 1
-    buffer[cursor] = qt.axis & 0xFF
-    cursor += 1
-    struct.pack_into("<I", buffer, cursor, qt.group_size)
-    cursor += 4
-    struct.pack_into("<I", buffer, cursor, num_scales)
-    cursor += 4
-    # Scales
-    scales_bytes = qt.scales.tobytes()
-    buffer[cursor : cursor + len(scales_bytes)] = scales_bytes
-    cursor += len(scales_bytes)
-    # Zero points
-    zp_bytes = qt.zero_points.tobytes()
-    buffer[cursor : cursor + len(zp_bytes)] = zp_bytes
-    cursor += len(zp_bytes)
-
-    # Alignment exponent
-    if use_custom_align:
-        buffer[cursor] = alignment.bit_length() - 1
-        cursor += 1
-
-    # Body
-    body_start = header_len + padding_len
-    buffer[body_start : body_start + body_len] = bytes(qt.data[:body_len])
-
-    # Integrity footer — covers the quant metadata (scheme/axis/group_size/
-    # scales/zero_points) as well as the packed body, so corruption of the
-    # scales or zero points is also detected.
-    if check_integrity:
-        protected = bytes(buffer[meta_start : meta_start + quant_meta_len]) + bytes(
-            buffer[body_start : body_start + body_len]
-        )
-        digest = xxhash.xxh3_64_intdigest(protected)
-        struct.pack_into("<Q", buffer, body_start + body_len, digest)
-
-    return memoryview(buffer)
-
-
-def _deserialize_quantized(
-    mv: memoryview, flags: int, dtype_code: int, ndim: int, copy: bool
-) -> "QuantizedTensor":
-    """Deserialize a QuantizedTensor from a Tenso packet memoryview."""
-    base = _HEADER_BASE_V4 if mv[4] >= 4 else _HEADER_BASE_V3
-    shape_end = base + ndim * 4
-    shape = struct.unpack(f"<{ndim}I", mv[base:shape_end])
-    num_elements = int(np.prod(shape))
-
-    cursor = shape_end
-    meta_start = cursor
-
-    # Quant metadata
-    quant_scheme = mv[cursor]
-    cursor += 1
-    axis = mv[cursor]
-    cursor += 1
-    group_size = struct.unpack("<I", mv[cursor : cursor + 4])[0]
-    cursor += 4
-    num_scales = struct.unpack("<I", mv[cursor : cursor + 4])[0]
-    cursor += 4
-    scales = np.frombuffer(
-        mv[cursor : cursor + num_scales * 4], dtype=np.float32
-    ).copy()
-    cursor += num_scales * 4
-    zero_points = np.frombuffer(
-        mv[cursor : cursor + num_scales * 4], dtype=np.float32
-    ).copy()
-    cursor += num_scales * 4
-    meta_len = cursor - meta_start
-
-    # Alignment
-    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
-    if use_custom_align:
-        exponent = mv[cursor]
-        alignment = 1 << exponent
-        cursor += 1
-    elif flags & FLAG_ALIGNED:
-        alignment = _ALIGNMENT
-    else:
-        alignment = 1
-
-    header_len = cursor
-    remainder = header_len % alignment
-    padding_len = 0 if remainder == 0 else (alignment - remainder)
-    body_start = header_len + padding_len
-
-    body_len = _quantized_body_size(dtype_code, num_elements)
-    footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
-
-    # Integrity check — covers quant metadata + packed body.
-    if flags & FLAG_INTEGRITY:
-        protected = bytes(mv[meta_start : meta_start + meta_len]) + bytes(
-            mv[body_start : body_start + body_len]
-        )
-        expected = struct.unpack(
-            "<Q", mv[body_start + body_len : body_start + body_len + 8]
-        )[0]
-        if xxhash.xxh3_64_intdigest(protected) != expected:
-            raise ValueError("Integrity check failed: XXH3 mismatch")
-
-    data = np.frombuffer(mv[body_start : body_start + body_len], dtype=np.uint8)
-    if copy:
-        data = data.copy()
-    else:
-        data = np.array(data)
-
-    return QuantizedTensor(
-        data=data,
-        scales=scales,
-        zero_points=zero_points,
-        shape=shape,
-        dtype_code=dtype_code,
-        quant_scheme=quant_scheme,
-        group_size=group_size,
-        axis=axis,
-    )
 
 
 def _read_stream_quantized(
@@ -916,154 +766,67 @@ def dumps(
     # the Rust and Python paths instead of a silent truncation (issue #4).
     if isinstance(tensor, np.ndarray):
         _validate_dims(tensor.shape)
+        # Also reject an oversized element COUNT here, BEFORE any contiguity
+        # coercion: a huge broadcast/strided view (e.g. shape (0xFFFFFFFF,)) would
+        # otherwise force a multi-GB ascontiguousarray allocation just to be
+        # rejected by the element cap downstream (OOM on small machines).
+        if int(np.prod(tensor.shape, dtype=object)) > MAX_ELEMENTS:
+            raise ValueError(
+                f"Packet exceeds maximum elements ({int(np.prod(tensor.shape, dtype=object))} "
+                f"> {MAX_ELEMENTS})"
+            )
     elif hasattr(tensor, "shape") and not isinstance(tensor, dict):
         _validate_dims(tensor.shape)
 
-    # 1. FAST PATH: RUST ACCELERATION
-    if HAS_RUST and not compress:
-        try:
-            # Check if this type is handled by Rust
-            is_numpy = isinstance(tensor, np.ndarray)
-            is_sparse = hasattr(tensor, "format")
-            is_dict = isinstance(tensor, dict)
-
-            # Skip Rust for any bundle that holds a QuantizedTensor at ANY depth:
-            # the Rust dense path cannot introspect a QuantizedTensor (it has no
-            # `dtype`/`ctypes` surface) and would raise; only the Python path
-            # serializes quantized values. A top-level-only check missed nested
-            # dicts like {"a": {"b": qt}}.
-            if is_dict and _bundle_contains_quantized(tensor):
-                is_dict = False
-                is_numpy = False
-                is_sparse = False
-
-            if is_numpy or is_sparse or is_dict:
-                if is_numpy and not tensor.flags["C_CONTIGUOUS"]:
-                    if strict:
-                        raise ValueError("Tensor is not C-Contiguous")
-                    tensor = np.ascontiguousarray(tensor)
-
-                # For a bundle, the Rust path reads each numpy value's raw bytes at
-                # ctypes.data assuming C-contiguity; a non-contiguous nested value
-                # (transposed/sliced/Fortran-order) would otherwise be serialized as
-                # corrupt data. Normalize every nested array to C-order first.
-                if is_dict:
-                    tensor = _bundle_make_contiguous(tensor, strict)
-
-                # dumps_rs handles Dense, Sparse, and Bundles
-                return memoryview(dumps_rs(tensor, check_integrity=check_integrity, alignment=alignment))
-        # AttributeError: the Rust path tried to introspect a value it does not
-        # support (e.g. a nested custom type) — fall back to the Python path
-        # rather than crashing.
-        except (TypeError, ValueError, AttributeError):
-            pass
-
-    # 1.5. Quantized Tensor (always Python path)
+    # All wire-format encoding goes through the Rust core (the single source of
+    # truth). The compiled extension is required (imported at module load).
     if isinstance(tensor, QuantizedTensor):
-        return _serialize_quantized(tensor, check_integrity, alignment)
+        return memoryview(
+            dumps_quantized_rs(tensor, check_integrity=check_integrity, alignment=alignment)
+        )
 
-    # 2. Multi-tensor Bundle (Dictionaries) - Python Fallback
-    if isinstance(tensor, dict):
+    is_numpy = isinstance(tensor, np.ndarray)
+    is_sparse = hasattr(tensor, "format") and not is_numpy
+    is_dict = isinstance(tensor, dict)
+
+    # A bundle holding a QuantizedTensor can't go through dumps_rs's dict path
+    # (its recursion only handles numpy/sparse), so encode each value here
+    # (recursion routes quantized/string to their own Rust encoders) and frame
+    # the bundle via encode_bundle_rs — every byte still comes from the core.
+    if is_dict and _bundle_contains_quantized(tensor):
         if len(tensor) > 255:
             raise ValueError(
                 f"Bundle has {len(tensor)} entries; the wire format encodes the "
-                "entry count in a single byte, so at most 255 entries are supported"
+                "entry count in a single byte, so at most 255 are supported"
             )
-        parts = []
-        header = struct.pack(
-            "<4sBHBBB", _MAGIC, _VERSION, FLAG_BUNDLE, 0, len(tensor), 0
+        entries = [
+            (key, bytes(dumps(value, strict, check_integrity, compress, alignment)))
+            for key, value in tensor.items()
+        ]
+        return memoryview(encode_bundle_rs(entries))
+
+    if is_numpy or is_sparse or is_dict:
+        if is_numpy and not tensor.flags["C_CONTIGUOUS"]:
+            if strict:
+                raise ValueError("Tensor is not C-Contiguous")
+            tensor = np.ascontiguousarray(tensor)
+        # Normalize nested bundle arrays to C-order so the Rust dense path reads
+        # correct bytes (it copies from ctypes.data assuming C-contiguity).
+        if is_dict:
+            tensor = _bundle_make_contiguous(tensor, strict)
+        # dumps_rs handles Dense, Sparse, and Bundles (compressed or not).
+        return memoryview(
+            dumps_rs(
+                tensor,
+                check_integrity=check_integrity,
+                compress=compress,
+                alignment=alignment,
+            )
         )
-        parts.append(header)
-        for key, value in tensor.items():
-            key_bytes = key.encode("utf-8")
-            parts.append(struct.pack("<I", len(key_bytes)) + key_bytes)
-            val_packet = dumps(value, strict, check_integrity, compress, alignment)
-            parts.append(struct.pack("<I", len(val_packet)) + val_packet)
-        return memoryview(b"".join(parts))
 
-    # 3. Sparse Formats (COO, CSR, CSC) - Python Fallback
-    if hasattr(tensor, "format") and not isinstance(tensor, np.ndarray):
-        fmt = tensor.format
-        flag = {"coo": FLAG_SPARSE, "csr": FLAG_SPARSE_CSR, "csc": FLAG_SPARSE_CSC}.get(
-            fmt
-        )
-        if flag is None:
-            raise ValueError(f"Unsupported sparse format: {fmt}")
+    raise TypeError(f"Cannot serialize object of type {type(tensor).__name__!r}")
 
-        comps = (
-            [tensor.data, tensor.row, tensor.col]
-            if fmt == "coo"
-            else [tensor.data, tensor.indices, tensor.indptr]
-        )
-        header = struct.pack("<4sBHBBB", _MAGIC, _VERSION, flag, 0, len(tensor.shape), 0)
-        shape_block = struct.pack(f"<{len(tensor.shape)}I", *tensor.shape)
 
-        sub_pkts = []
-        for c in comps:
-            sp = dumps(c, strict, False, False, alignment)
-            sub_pkts.append(struct.pack("<I", len(sp)) + sp)
-        return memoryview(b"".join([header, shape_block] + sub_pkts))
-
-    # 4. Standard Python Implementation (Fallback for Dense)
-    if tensor.dtype not in _DTYPE_MAP:
-        raise ValueError(f"Unsupported dtype: {tensor.dtype}")
-
-    if not tensor.flags["C_CONTIGUOUS"]:
-        if strict:
-            raise ValueError("Tensor is not C-Contiguous")
-        tensor = np.ascontiguousarray(tensor)
-
-    if not IS_LITTLE_ENDIAN or tensor.dtype.byteorder == ">":
-        tensor = tensor.astype(tensor.dtype.newbyteorder("<"))
-
-    dtype_code = _DTYPE_MAP[tensor.dtype]
-    shape = tensor.shape
-    ndim = len(shape)
-    body = tensor.tobytes()
-    
-    flags = 0
-    use_custom_align = alignment != 64
-    if use_custom_align:
-        flags |= FLAG_CUST_ALIGN
-    else:
-        flags |= FLAG_ALIGNED
-    
-    if check_integrity:
-        flags |= FLAG_INTEGRITY
-
-    if compress:
-        if not HAS_LZ4:
-            raise ImportError("Compression requires 'lz4' package.")
-        body = lz4.frame.compress(body)
-        flags |= FLAG_COMPRESSION
-
-    current_len = _HEADER_BASE_V4 + (ndim * 4)
-    if use_custom_align:
-        current_len += 1
-
-    padding_len = 0
-    remainder = current_len % alignment
-    if remainder != 0:
-        padding_len = alignment - remainder
-
-    total_len = current_len + padding_len + len(body) + (8 if check_integrity else 0)
-
-    buffer = bytearray(total_len)
-    struct.pack_into("<4sBHBBB", buffer, 0, _MAGIC, _VERSION, flags, dtype_code, ndim, 0)
-    struct.pack_into(f"<{ndim}I", buffer, _HEADER_BASE_V4, *shape)
-
-    cursor = _HEADER_BASE_V4 + (ndim * 4)
-    if use_custom_align:
-        buffer[cursor] = alignment.bit_length() - 1
-        cursor += 1
-    
-    body_start = current_len + padding_len
-
-    buffer[body_start : body_start + len(body)] = body
-    if check_integrity:
-        digest = xxhash.xxh3_64_intdigest(body)
-        struct.pack_into("<Q", buffer, body_start + len(body), digest)
-    return memoryview(buffer)
 
 
 def loads(
@@ -1097,119 +860,20 @@ def loads(
         _hdr = None
         alignment = _ALIGNMENT
 
-    # 0. FAST PATH: RUST ACCELERATION
-    if HAS_RUST and (hasattr(data, "__buffer__") or isinstance(data, (bytes, bytearray, memoryview, np.ndarray, mmap.mmap))):
-        # loads_rs returns None if flags are unsupported (e.g. Bundle/Sparse/Compression)
-        # It raises ValueError if the packet is malformed or integrity check fails.
-        try:
-            res = loads_rs(data)
-            if res is not None:
-                return _ensure_aligned(res, alignment, copy)
-        except (ValueError, TypeError):
-             # Fallback to Python if Rust fails for any reason
-             pass
+    # All decoding goes through the Rust core (the single source of truth). It
+    # handles every kind: dense, bundle, sparse, quantized, string, and
+    # compressed packets, and raises ValueError on a malformed/integrity-failed
+    # packet.
+    res = loads_rs(data)
+    if res is None:
+        # The only kind the core does not surface to Python is a GPU IpcRef
+        # packet (decoded on the device, never produced by dumps()).
+        raise ValueError(
+            "Unsupported tenso packet (e.g. a GPU IPC reference, which is "
+            "decoded on the device rather than via loads())"
+        )
+    return _ensure_aligned(res, alignment, copy)
 
-    _ver, flags, dtype_code, ndim, header_base = (
-        _hdr if _hdr is not None else _parse_header(mv)
-    )
-
-    # 1. Bundle Deserialization
-    if flags & FLAG_BUNDLE:
-        res = {}
-        offset = header_base
-        for _ in range(ndim):
-            k_len = struct.unpack("<I", mv[offset : offset + 4])[0]
-            offset += 4
-            key = bytes(mv[offset : offset + k_len]).decode("utf-8")
-            offset += k_len
-            v_len = struct.unpack("<I", mv[offset : offset + 4])[0]
-            offset += 4
-            res[key] = loads(mv[offset : offset + v_len], copy=copy)
-            offset += v_len
-        return res
-
-    # 2. Sparse Deserialization
-    if flags & (FLAG_SPARSE | FLAG_SPARSE_CSR | FLAG_SPARSE_CSC):
-        try:
-            from scipy import sparse
-        except ImportError:
-            raise ImportError("scipy is required for sparse deserialization.")
-
-        shape_end = header_base + (ndim * 4)
-        shape = struct.unpack(f"<{ndim}I", mv[header_base:shape_end])
-        offset = shape_end
-        sub_objs = []
-        for _ in range(3):
-            sub_len = struct.unpack("<I", mv[offset : offset + 4])[0]
-            offset += 4
-            sub_objs.append(loads(mv[offset : offset + sub_len], copy=copy))
-            offset += sub_len
-
-        c1, c2, c3 = sub_objs
-        if flags & FLAG_SPARSE:
-            return sparse.coo_matrix((c1, (c2, c3)), shape=shape)
-        if flags & FLAG_SPARSE_CSR:
-            return sparse.csr_matrix((c1, c2, c3), shape=shape)
-        return sparse.csc_matrix((c1, c2, c3), shape=shape)
-
-    # 2.5. Quantized Types
-    if dtype_code in _QUANTIZED_CODES:
-        return _deserialize_quantized(mv, flags, dtype_code, ndim, copy)
-
-    # 3. Dense Array Deserialization
-    if ndim > MAX_NDIM:
-        raise ValueError(f"Packet exceeds maximum dimensions ({ndim} > {MAX_NDIM})")
-
-    shape_end = header_base + (ndim * 4)
-    shape = struct.unpack(f"<{ndim}I", mv[header_base:shape_end])
-    num_elements = int(np.prod(shape))
-    if num_elements > MAX_ELEMENTS:
-        raise ValueError("Packet exceeds maximum elements")
-
-    dtype = _REV_DTYPE_MAP.get(dtype_code)
-    if dtype is None:
-        raise ValueError(f"Unsupported dtype code: {dtype_code}")
-
-    body_start = shape_end
-
-    use_custom_align = (flags & FLAG_CUST_ALIGN) != 0
-    alignment = 1
-
-    if use_custom_align:
-        if len(mv) < body_start + 1:
-            raise ValueError("Packet too short (alignment byte)")
-        exponent = mv[body_start]
-        alignment = 1 << exponent
-        body_start += 1
-    elif flags & FLAG_ALIGNED:
-        alignment = _ALIGNMENT
-
-    remainder = body_start % alignment
-    if remainder != 0:
-        body_start += (alignment - remainder)
-
-    body_len = (
-        (num_elements * dtype.itemsize)
-        if not (flags & FLAG_COMPRESSION)
-        else (len(mv) - body_start - (8 if flags & FLAG_INTEGRITY else 0))
-    )
-    body_data = mv[body_start : body_start + body_len]
-
-    if flags & FLAG_INTEGRITY:
-        expected = struct.unpack(
-            "<Q", mv[body_start + body_len : body_start + body_len + 8]
-        )[0]
-        if xxhash.xxh3_64_intdigest(body_data) != expected:
-            raise ValueError("Integrity check failed: XXH3 mismatch")
-
-    if flags & FLAG_COMPRESSION:
-        body_data = lz4.frame.decompress(body_data)
-
-    arr = np.frombuffer(body_data, dtype=dtype, count=num_elements).reshape(shape)
-    arr = _ensure_aligned(arr, alignment, copy)
-    if not copy:
-        arr.flags.writeable = False
-    return arr
 
 
 def dump(

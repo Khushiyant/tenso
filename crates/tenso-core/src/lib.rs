@@ -789,6 +789,257 @@ pub fn encode_sparse_into(
 }
 
 // =============================================================================
+// Quantized encode API
+// =============================================================================
+
+/// A quantized tensor to encode. `scales`/`zero_points` are f32 values (one per
+/// tensor/channel/group); `data` is the already-packed body (4-bit dtypes pack
+/// two elements per byte). Mirrors `core.py::_serialize_quantized`.
+pub struct QuantSpec<'a> {
+    pub dtype: Dtype,
+    pub shape: &'a [u32],
+    pub scheme: u8,
+    pub axis: u8,
+    pub group_size: u32,
+    /// Raw little-endian f32 bytes (one f32 per tensor/channel/group), exactly as
+    /// they appear on the wire (`numpy.float32 array.tobytes()`).
+    pub scales: &'a [u8],
+    pub zero_points: &'a [u8],
+    pub data: &'a [u8],
+}
+
+struct QuantLayout {
+    use_custom_align: bool,
+    quant_meta_len: usize,
+    header_len: usize,
+    padding_len: usize,
+    body_len: usize,
+}
+
+fn quant_layout(spec: &QuantSpec, opts: &EncodeOpts) -> Result<QuantLayout, TensoError> {
+    if !opts.alignment.is_power_of_two() {
+        return Err(TensoError::Malformed);
+    }
+    if !matches!(
+        spec.dtype,
+        Dtype::QInt8 | Dtype::QUInt8 | Dtype::QInt4 | Dtype::QUInt4
+    ) {
+        return Err(TensoError::BadDtype(spec.dtype.code()));
+    }
+    let ndim = spec.shape.len();
+    if ndim > MAX_NDIM {
+        return Err(TensoError::TooManyDims);
+    }
+    // scales/zero_points are raw f32 bytes: equal length, multiple of 4.
+    if spec.scales.len() != spec.zero_points.len() || !spec.scales.len().is_multiple_of(4) {
+        return Err(TensoError::Malformed);
+    }
+    let num_elements = shape_num_elements(spec.shape)?;
+    if num_elements > MAX_ELEMENTS {
+        return Err(TensoError::TooManyElements);
+    }
+    // meta: scheme(1) + axis(1) + group_size(4) + num_scales(4) + scales + zp
+    let quant_meta_len = 1 + 1 + 4 + 4 + spec.scales.len() + spec.zero_points.len();
+    let use_custom_align = opts.alignment != ALIGNMENT;
+    let mut header_len = HEADER_BASE_V4 + ndim * 4 + quant_meta_len;
+    if use_custom_align {
+        header_len += 1;
+    }
+    let padding_len = padding_for(header_len, opts.alignment);
+    let body_len = if spec.dtype.is_4bit() {
+        (num_elements as usize).div_ceil(2)
+    } else {
+        num_elements as usize
+    };
+    if spec.data.len() < body_len {
+        return Err(TensoError::Malformed);
+    }
+    Ok(QuantLayout {
+        use_custom_align,
+        quant_meta_len,
+        header_len,
+        padding_len,
+        body_len,
+    })
+}
+
+/// Exact buffer size needed to encode `spec` as a quantized packet.
+pub fn quantized_required_size(spec: &QuantSpec, opts: &EncodeOpts) -> Result<usize, TensoError> {
+    let l = quant_layout(spec, opts)?;
+    let footer_len = if opts.check_integrity { 8 } else { 0 };
+    Ok(l.header_len + l.padding_len + l.body_len + footer_len)
+}
+
+/// Encode a quantized tensor into `out`, returning the number of bytes written.
+/// Byte-identical to `core.py::_serialize_quantized`.
+pub fn encode_quantized_into(
+    spec: &QuantSpec,
+    out: &mut [u8],
+    opts: &EncodeOpts,
+) -> Result<usize, TensoError> {
+    let l = quant_layout(spec, opts)?;
+    let ndim = spec.shape.len();
+    let num_scales = spec.scales.len() / 4;
+    let footer_len = if opts.check_integrity { 8 } else { 0 };
+    let total_len = l.header_len + l.padding_len + l.body_len + footer_len;
+    if out.len() < total_len {
+        return Err(TensoError::BufferTooSmall);
+    }
+
+    let mut flags: u16 = 0;
+    if l.use_custom_align {
+        flags |= FLAG_CUST_ALIGN;
+    } else {
+        flags |= FLAG_ALIGNED;
+    }
+    if opts.check_integrity {
+        flags |= FLAG_INTEGRITY;
+    }
+    write_v4_header(out, flags, spec.dtype.code(), ndim as u8);
+
+    let mut cursor = HEADER_BASE_V4;
+    for &dim in spec.shape {
+        out[cursor..cursor + 4].copy_from_slice(&dim.to_le_bytes());
+        cursor += 4;
+    }
+    let meta_start = cursor;
+    out[cursor] = spec.scheme;
+    cursor += 1;
+    out[cursor] = spec.axis;
+    cursor += 1;
+    out[cursor..cursor + 4].copy_from_slice(&spec.group_size.to_le_bytes());
+    cursor += 4;
+    out[cursor..cursor + 4].copy_from_slice(&(num_scales as u32).to_le_bytes());
+    cursor += 4;
+    out[cursor..cursor + spec.scales.len()].copy_from_slice(spec.scales);
+    cursor += spec.scales.len();
+    out[cursor..cursor + spec.zero_points.len()].copy_from_slice(spec.zero_points);
+    cursor += spec.zero_points.len();
+    debug_assert_eq!(cursor - meta_start, l.quant_meta_len);
+    if l.use_custom_align {
+        out[cursor] = opts.alignment.trailing_zeros() as u8;
+        cursor += 1;
+    }
+    debug_assert_eq!(cursor, l.header_len);
+    let body_start = l.header_len + l.padding_len;
+    for b in &mut out[l.header_len..body_start] {
+        *b = 0;
+    }
+    out[body_start..body_start + l.body_len].copy_from_slice(&spec.data[..l.body_len]);
+
+    if opts.check_integrity {
+        #[cfg(feature = "integrity")]
+        {
+            // Integrity covers quant metadata + packed body (matches core.py).
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+            hasher.update(&out[meta_start..meta_start + l.quant_meta_len]);
+            hasher.update(&out[body_start..body_start + l.body_len]);
+            let footer_start = body_start + l.body_len;
+            out[footer_start..footer_start + 8].copy_from_slice(&hasher.digest().to_le_bytes());
+        }
+        #[cfg(not(feature = "integrity"))]
+        {
+            return Err(TensoError::IntegrityMismatch);
+        }
+    }
+    Ok(total_len)
+}
+
+// =============================================================================
+// String (StringTensor) encode API
+// =============================================================================
+
+/// Exact buffer size for a StringTensor packet (`count` strings, `payload_len`
+/// total UTF-8 bytes).
+pub fn string_required_size(
+    count: u32,
+    payload_len: usize,
+    check_integrity: bool,
+) -> Result<usize, TensoError> {
+    let header_len = HEADER_BASE_V4 + 4;
+    let padding_len = padding_for(header_len, ALIGNMENT);
+    let offsets_len = (count as usize + 1)
+        .checked_mul(8)
+        .ok_or(TensoError::Malformed)?;
+    let body_len = offsets_len
+        .checked_add(payload_len)
+        .ok_or(TensoError::Malformed)?;
+    let footer_len = if check_integrity { 8 } else { 0 };
+    Ok(header_len + padding_len + body_len + footer_len)
+}
+
+/// Encode a StringTensor into `out`. `offsets` is `count + 1` u64 values starting
+/// at 0, monotonic non-decreasing, ending at `payload.len()`. Byte-identical to
+/// `ragged.py::StringTensor.dumps` (always 64-aligned, dtype = Str, ndim = 1).
+pub fn encode_string_into(
+    count: u32,
+    offsets: &[u64],
+    payload: &[u8],
+    out: &mut [u8],
+    check_integrity: bool,
+) -> Result<usize, TensoError> {
+    if offsets.len() != count as usize + 1 {
+        return Err(TensoError::Malformed);
+    }
+    if offsets[0] != 0 {
+        return Err(TensoError::Malformed);
+    }
+    let mut prev = 0u64;
+    for &o in offsets {
+        if o < prev {
+            return Err(TensoError::Malformed);
+        }
+        prev = o;
+    }
+    if prev as usize != payload.len() {
+        return Err(TensoError::Malformed);
+    }
+
+    let header_len = HEADER_BASE_V4 + 4;
+    let padding_len = padding_for(header_len, ALIGNMENT);
+    let offsets_len = (count as usize + 1) * 8;
+    let body_len = offsets_len + payload.len();
+    let footer_len = if check_integrity { 8 } else { 0 };
+    let total_len = header_len + padding_len + body_len + footer_len;
+    if out.len() < total_len {
+        return Err(TensoError::BufferTooSmall);
+    }
+
+    let mut flags = FLAG_STRING | FLAG_ALIGNED;
+    if check_integrity {
+        flags |= FLAG_INTEGRITY;
+    }
+    write_v4_header(out, flags, DCODE_STR, 1);
+    out[HEADER_BASE_V4..HEADER_BASE_V4 + 4].copy_from_slice(&count.to_le_bytes());
+
+    let body_start = header_len + padding_len;
+    for b in &mut out[header_len..body_start] {
+        *b = 0;
+    }
+    let mut cursor = body_start;
+    for &o in offsets {
+        out[cursor..cursor + 8].copy_from_slice(&o.to_le_bytes());
+        cursor += 8;
+    }
+    out[cursor..cursor + payload.len()].copy_from_slice(payload);
+
+    if check_integrity {
+        #[cfg(feature = "integrity")]
+        {
+            // Integrity covers the body (offsets + payload), matching ragged.py.
+            let hash = integrity_hash(&out[body_start..body_start + body_len]);
+            let footer_start = body_start + body_len;
+            out[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
+        }
+        #[cfg(not(feature = "integrity"))]
+        {
+            return Err(TensoError::IntegrityMismatch);
+        }
+    }
+    Ok(total_len)
+}
+
+// =============================================================================
 // Decode API
 // =============================================================================
 
@@ -807,6 +1058,7 @@ pub struct QuantView<'a> {
     pub shape: Vec<u32>,
     pub scheme: u8,
     pub axis: i32,
+    pub group_size: u32,
     pub scales: &'a [u8],
     pub zero_points: &'a [u8],
     pub packed: &'a [u8],
@@ -1106,6 +1358,48 @@ fn decode_dense<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, TensoE
     }))
 }
 
+/// Owning dense decode that also handles COMPRESSED bodies (decompresses them).
+///
+/// The borrowing [`decode`] rejects a compressed dense packet because it cannot
+/// hand back an owned decompressed buffer; this is its owning counterpart for
+/// binding / FFI callers. Returns `(dtype, shape, owned_body)`. Integrity (when
+/// present) is verified by the underlying parse before decompression.
+#[cfg(feature = "compression")]
+pub fn decode_dense_to_owned(bytes: &[u8]) -> Result<(Dtype, Vec<u32>, Vec<u8>), TensoError> {
+    // Uncompressed dense reuses the borrowing decoder directly (which also runs
+    // the integrity check); a non-dense packet is an error here.
+    match decode(bytes) {
+        Ok(Decoded::Dense(v)) => return Ok((v.dtype, v.shape, v.body.to_vec())),
+        Ok(_) => return Err(TensoError::Malformed),
+        // Compressed dense: `decode` verified integrity, then rejected the borrow.
+        Err(TensoError::Lz4(_)) => {}
+        Err(e) => return Err(e),
+    }
+
+    let hdr = parse_header(bytes)?;
+    let dtype = Dtype::from_code(hdr.dtype_code)?;
+    let shape = read_shape(bytes, hdr.base_size, hdr.ndim)?;
+    let shape_end = hdr.base_size + hdr.ndim * 4;
+    let (alignment, header_len) = resolve_alignment(bytes, hdr.flags, shape_end)?;
+    let padding_len = padding_for(header_len, alignment);
+    let body_start = header_len
+        .checked_add(padding_len)
+        .ok_or(TensoError::Malformed)?;
+    let footer_len = if hdr.flags & FLAG_INTEGRITY != 0 {
+        8
+    } else {
+        0
+    };
+    if bytes.len() < body_start + footer_len {
+        return Err(TensoError::TooShort);
+    }
+    // Compressed body extends from body_start to the footer (it has no length
+    // prefix). Bounds were validated by the `decode` parse above.
+    let body = &bytes[body_start..bytes.len() - footer_len];
+    let owned = lz4_decompress_frame(body)?;
+    Ok((dtype, shape, owned))
+}
+
 fn decode_quantized<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, TensoError> {
     let flags = hdr.flags;
     let ndim = hdr.ndim;
@@ -1130,7 +1424,7 @@ fn decode_quantized<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, Te
     cursor += 1;
     let axis_byte = bytes[cursor];
     cursor += 1;
-    let _group_size = read_u32(bytes, cursor)?;
+    let group_size = read_u32(bytes, cursor)?;
     cursor += 4;
     let num_scales = read_u32(bytes, cursor)? as usize;
     cursor += 4;
@@ -1200,6 +1494,7 @@ fn decode_quantized<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, Te
         // serializer writes `axis & 0xFF` and reads it back unsigned), so
         // surface it as an unsigned-extended i32 to match round-trip semantics.
         axis: axis_byte as i32,
+        group_size,
         scales,
         zero_points,
         packed,
@@ -2140,6 +2435,100 @@ mod tests {
                 assert_eq!(q.packed.len(), 3);
             }
             _ => panic!("expected quantized"),
+        }
+    }
+
+    #[test]
+    fn encode_quantized_roundtrip_per_tensor() {
+        let scales = 0.5f32.to_le_bytes();
+        let zps = 3.0f32.to_le_bytes();
+        let data = [10u8, 20, 30, 40];
+        let shape = [2u32, 2];
+        let spec = QuantSpec {
+            dtype: Dtype::QInt8,
+            shape: &shape,
+            scheme: QUANT_PER_TENSOR,
+            axis: 0,
+            group_size: 0,
+            scales: &scales,
+            zero_points: &zps,
+            data: &data,
+        };
+        // check_integrity stays false so this runs under default features too
+        // (the integrity footer path requires the `integrity` feature).
+        let opts = EncodeOpts {
+            check_integrity: false,
+            compress: false,
+            alignment: ALIGNMENT,
+        };
+        let need = quantized_required_size(&spec, &opts).unwrap();
+        let mut out = vec![0u8; need];
+        assert_eq!(encode_quantized_into(&spec, &mut out, &opts).unwrap(), need);
+        match decode(&out).unwrap() {
+            Decoded::Quantized(q) => {
+                assert_eq!(q.dtype, Dtype::QInt8);
+                assert_eq!(q.shape, vec![2u32, 2]);
+                assert_eq!(q.scheme, QUANT_PER_TENSOR);
+                assert_eq!(q.packed, &data[..]);
+                assert_eq!(q.scales, &0.5f32.to_le_bytes()[..]);
+                assert_eq!(q.zero_points, &3.0f32.to_le_bytes()[..]);
+            }
+            _ => panic!("expected quantized"),
+        }
+    }
+
+    #[test]
+    fn encode_quantized_int4_body_len() {
+        // 5 elements 4-bit -> ceil(5/2) = 3 body bytes.
+        let scales = 1.0f32.to_le_bytes();
+        let zps = 0.0f32.to_le_bytes();
+        let data = [0xABu8, 0xCD, 0x0E, 0x99];
+        let shape = [5u32];
+        let spec = QuantSpec {
+            dtype: Dtype::QInt4,
+            shape: &shape,
+            scheme: QUANT_PER_TENSOR,
+            axis: 0,
+            group_size: 0,
+            scales: &scales,
+            zero_points: &zps,
+            data: &data,
+        };
+        let opts = EncodeOpts::default();
+        let need = quantized_required_size(&spec, &opts).unwrap();
+        let mut out = vec![0u8; need];
+        encode_quantized_into(&spec, &mut out, &opts).unwrap();
+        match decode(&out).unwrap() {
+            Decoded::Quantized(q) => assert_eq!(q.packed.len(), 3),
+            _ => panic!("expected quantized"),
+        }
+    }
+
+    #[test]
+    fn encode_string_roundtrip_and_matches_fixture() {
+        // Same strings as the string_mixed_utf8.tenso fixture (Python-produced):
+        // the Rust encoder must be byte-identical.
+        let parts: [&[u8]; 4] = [b"hi", b"", b"world", "\u{00f1}".as_bytes()];
+        let mut payload: Vec<u8> = Vec::new();
+        let mut offsets: Vec<u64> = vec![0];
+        for p in parts {
+            payload.extend_from_slice(p);
+            offsets.push(payload.len() as u64);
+        }
+        let need = string_required_size(4, payload.len(), false).unwrap();
+        let mut out = vec![0u8; need];
+        encode_string_into(4, &offsets, &payload, &mut out, false).unwrap();
+        match decode(&out).unwrap() {
+            Decoded::String { shape, .. } => assert_eq!(shape, vec![4u32]),
+            _ => panic!("expected string"),
+        }
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/string_mixed_utf8.tenso");
+        if let Ok(fixture) = std::fs::read(&fixture_path) {
+            assert_eq!(
+                out, fixture,
+                "Rust string encoder must match the Python fixture byte-for-byte"
+            );
         }
     }
 }

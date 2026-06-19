@@ -31,8 +31,9 @@ use std::os::windows::io::FromRawHandle;
 
 use tenso_core::{
     bundle_required_size, decode, dense_required_size, encode_bundle_into, encode_dense_into,
-    encode_sparse_into, parse_header, sparse_required_size, ArraySpec, Decoded, Dtype, EncodeOpts,
-    SparseFormat, TensoError, FLAG_ALIGNED, FLAG_INTEGRITY,
+    encode_quantized_into, encode_sparse_into, encode_string_into, parse_header,
+    quantized_required_size, sparse_required_size, string_required_size, ArraySpec, Decoded, Dtype,
+    EncodeOpts, QuantSpec, SparseFormat, TensoError, FLAG_ALIGNED, FLAG_INTEGRITY,
 };
 
 // -----------------------------------------------------------------------------
@@ -318,6 +319,106 @@ fn dumps_rs<'py>(
 }
 
 // -----------------------------------------------------------------------------
+// dumps_quantized_rs / dumps_string_rs — encode the non-dense Python types via
+// tenso-core (so there is a single Rust implementation of every wire format).
+// -----------------------------------------------------------------------------
+
+/// Encode a `QuantizedTensor` (extracted field-by-field) via `tenso-core`.
+#[pyfunction]
+#[pyo3(signature = (qt, check_integrity=false, alignment=64))]
+fn dumps_quantized_rs<'py>(
+    py: Python<'py>,
+    qt: &'py PyAny,
+    check_integrity: bool,
+    alignment: usize,
+) -> PyResult<&'py PyBytes> {
+    if !alignment.is_power_of_two() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Alignment must be a power of two",
+        ));
+    }
+    let dtype_code: u8 = qt.getattr("dtype_code")?.extract()?;
+    let dtype = Dtype::from_code(dtype_code).map_err(map_err)?;
+    let scheme: u8 = qt.getattr("quant_scheme")?.extract()?;
+    let group_size: u32 = qt.getattr("group_size")?.extract()?;
+    // Python stores `axis & 0xFF` as a single byte.
+    let axis_i: i64 = qt.getattr("axis")?.extract()?;
+    let axis = (axis_i & 0xFF) as u8;
+    let shape_usize: Vec<usize> = qt.getattr("shape")?.extract()?;
+    let shape = shape_to_u32(&shape_usize)?;
+    // scales / zero_points / data are numpy arrays -> raw little-endian bytes.
+    let scales: Vec<u8> = qt.getattr("scales")?.call_method0("tobytes")?.extract()?;
+    let zero_points: Vec<u8> = qt
+        .getattr("zero_points")?
+        .call_method0("tobytes")?
+        .extract()?;
+    let data: Vec<u8> = qt.getattr("data")?.call_method0("tobytes")?.extract()?;
+
+    let spec = QuantSpec {
+        dtype,
+        shape: &shape,
+        scheme,
+        axis,
+        group_size,
+        scales: &scales,
+        zero_points: &zero_points,
+        data: &data,
+    };
+    let o = opts(check_integrity, false, alignment);
+    let size = quantized_required_size(&spec, &o).map_err(map_err)?;
+    PyBytes::new_with(py, size, |out: &mut [u8]| {
+        encode_quantized_into(&spec, out, &o).map_err(map_err)?;
+        Ok(())
+    })
+}
+
+/// Encode a `StringTensor` from its raw `offsets` ((count+1) u64 LE bytes) and
+/// `payload` bytes via `tenso-core`.
+#[pyfunction]
+#[pyo3(signature = (offsets, payload, count, check_integrity=false))]
+fn dumps_string_rs<'py>(
+    py: Python<'py>,
+    offsets: &[u8],
+    payload: &[u8],
+    count: u32,
+    check_integrity: bool,
+) -> PyResult<&'py PyBytes> {
+    if !offsets.len().is_multiple_of(8) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "offsets length must be a multiple of 8",
+        ));
+    }
+    let offs: Vec<u64> = offsets
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let size = string_required_size(count, payload.len(), check_integrity).map_err(map_err)?;
+    PyBytes::new_with(py, size, |out: &mut [u8]| {
+        encode_string_into(count, &offs, payload, out, check_integrity).map_err(map_err)?;
+        Ok(())
+    })
+}
+
+/// Frame already-encoded `(key, value_packet)` entries into a bundle packet via
+/// `tenso-core`. Lets the Python layer orchestrate recursion (e.g. bundles that
+/// contain quantized/string values) while the bundle wire frame stays in Rust.
+#[pyfunction]
+fn encode_bundle_rs<'py>(
+    py: Python<'py>,
+    entries: Vec<(String, Vec<u8>)>,
+) -> PyResult<&'py PyBytes> {
+    let refs: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_slice()))
+        .collect();
+    let size = bundle_required_size(&refs).map_err(map_err)?;
+    PyBytes::new_with(py, size, |out: &mut [u8]| {
+        encode_bundle_into(&refs, out).map_err(map_err)?;
+        Ok(())
+    })
+}
+
+// -----------------------------------------------------------------------------
 // dump_to_buffer_rs — same dispatch, encode into a caller-provided buffer
 // -----------------------------------------------------------------------------
 
@@ -514,8 +615,84 @@ fn decoded_to_py<'py>(
             }
             Ok(Some(res.into()))
         }
-        // Sparse / Quantized / String / Ragged / IpcRef are handled by the
-        // Python layer; signal fallback.
+        Decoded::Quantized(q) => {
+            // Build a QuantizedTensor from the Rust-parsed fields. Rust owns the
+            // byte parsing; Python only assembles the object.
+            let np = py.import("numpy")?;
+            let qcls = py.import("tenso.quantize")?.getattr("QuantizedTensor")?;
+            let data = np
+                .call_method1("frombuffer", (PyBytes::new(py, q.packed), "uint8"))?
+                .call_method0("copy")?;
+            let scales = np
+                .call_method1("frombuffer", (PyBytes::new(py, q.scales), "float32"))?
+                .call_method0("copy")?;
+            let zero_points = np
+                .call_method1("frombuffer", (PyBytes::new(py, q.zero_points), "float32"))?
+                .call_method0("copy")?;
+            let shape = PyTuple::new(py, q.shape.iter().map(|&d| d as usize));
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("data", data)?;
+            kwargs.set_item("scales", scales)?;
+            kwargs.set_item("zero_points", zero_points)?;
+            kwargs.set_item("shape", shape)?;
+            kwargs.set_item("dtype_code", q.dtype.code())?;
+            kwargs.set_item("quant_scheme", q.scheme)?;
+            kwargs.set_item("group_size", q.group_size)?;
+            kwargs.set_item("axis", q.axis)?;
+            Ok(Some(qcls.call((), Some(kwargs))?.into()))
+        }
+        Decoded::String {
+            shape,
+            offsets,
+            payload,
+        } => {
+            // Build a StringTensor via its raw-field classmethod.
+            let np = py.import("numpy")?;
+            let scls = py.import("tenso.ragged")?.getattr("StringTensor")?;
+            let offs = np
+                .call_method1("frombuffer", (PyBytes::new(py, offsets), "uint64"))?
+                .call_method0("copy")?;
+            let count = *shape.first().unwrap_or(&0) as usize;
+            Ok(Some(
+                scls.call_method1("_from_raw", (offs, PyBytes::new(py, payload), count))?
+                    .into(),
+            ))
+        }
+        Decoded::Sparse {
+            format,
+            shape,
+            components,
+        } => {
+            // Components are dense sub-packets; build them, then assemble scipy.
+            let sparse = py.import("scipy.sparse").map_err(|_| {
+                pyo3::exceptions::PyImportError::new_err(
+                    "scipy is required for sparse deserialization",
+                )
+            })?;
+            let mut comps: Vec<PyObject> = Vec::with_capacity(components.len());
+            for c in components {
+                match decoded_to_py(py, root_data, base_ptr, c)? {
+                    Some(o) => comps.push(o),
+                    None => return Ok(None),
+                }
+            }
+            if comps.len() != 3 {
+                return Ok(None);
+            }
+            let shape_t = PyTuple::new(py, shape.iter().map(|&d| d as usize));
+            let (c0, c1, c2) = (&comps[0], &comps[1], &comps[2]);
+            let obj = match format {
+                SparseFormat::Coo => {
+                    let coords = PyTuple::new(py, [c1, c2]);
+                    sparse.call_method1("coo_matrix", ((c0, coords), shape_t))?
+                }
+                SparseFormat::Csr => sparse.call_method1("csr_matrix", ((c0, c1, c2), shape_t))?,
+                SparseFormat::Csc => sparse.call_method1("csc_matrix", ((c0, c1, c2), shape_t))?,
+            };
+            Ok(Some(obj.into()))
+        }
+        // Ragged is produced as a bundle in practice; IpcRef stays a Python
+        // concern. Signal fallback for those.
         _ => Ok(None),
     }
 }
@@ -531,9 +708,18 @@ fn loads_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<Option<PyObject>
 
     match decode(bytes) {
         Ok(decoded) => decoded_to_py(py, data, base_ptr, decoded),
-        // Compressed-dense bodies (and any other kind core can't return as a
-        // borrow) fall back to the Python decoder — same observable result.
-        Err(TensoError::Lz4(_)) => Ok(None),
+        // Compressed dense: decode + decompress via the owning core path and
+        // build an (owned) numpy array. No Python fallback needed.
+        Err(TensoError::Lz4(_)) => {
+            let (dtype, shape, owned) =
+                tenso_core::decode_dense_to_owned(bytes).map_err(map_err)?;
+            let np = py.import("numpy")?;
+            let arr = np
+                .call_method1("frombuffer", (PyBytes::new(py, &owned), dtype.name()))?
+                .call_method0("copy")?;
+            let shape_usize: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+            Ok(Some(arr.call_method1("reshape", (shape_usize,))?.into()))
+        }
         Err(e) => Err(map_err(e)),
     }
 }
@@ -808,6 +994,9 @@ fn shm_mutex_size() -> usize {
 fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_packet_info_rs, m)?)?;
     m.add_function(wrap_pyfunction!(dumps_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(dumps_quantized_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(dumps_string_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_bundle_rs, m)?)?;
     m.add_function(wrap_pyfunction!(dump_to_buffer_rs, m)?)?;
     m.add_function(wrap_pyfunction!(dump_to_fd_rs, m)?)?;
     m.add_function(wrap_pyfunction!(loads_rs, m)?)?;
