@@ -60,11 +60,8 @@ try:
 except ImportError:
     _HAS_ROBUST_MUTEX = False
 
-# The POSIX mutex is only *robust* (auto-recoverable after a holder crash) on
-# Linux via PTHREAD_MUTEX_ROBUST/EOWNERDEAD. On macOS the process-shared mutex
-# has no such recovery, so a crash while holding it would deadlock every later
-# acquirer forever. There we fall back to fcntl.flock, which the kernel releases
-# automatically when the holder dies.
+# POSIX mutex is only robust (auto-recovers after a holder crash) on Linux via
+# PTHREAD_MUTEX_ROBUST; elsewhere fall back to kernel-released fcntl.flock.
 _ROBUST_MUTEX_OK = _HAS_ROBUST_MUTEX and sys.platform.startswith("linux")
 
 try:
@@ -123,8 +120,7 @@ _H_GENERATION = 68    # 8 bytes
 _H_HITS = 76          # 8 bytes
 _H_MISSES = 84        # 8 bytes
 _H_MUTEX_INIT = 92    # 1 byte (0=not initialized, 1=robust mutex initialized)
-_H_MUTEX = 128        # 64 bytes — POSIX pthread_mutex_t (process-shared, robust)
-                      # Aligned to 64 bytes for portability
+_H_MUTEX = 128        # 64 bytes — POSIX pthread_mutex_t, 64-byte aligned
 
 # Entry slot field offsets (within each 256-byte slot, 212 bytes used, 44 spare)
 _E_STATUS = 0         # 1 byte  (0=free, 1=active)
@@ -387,12 +383,10 @@ class TensoCache:
     def _init_file_lock(self):
         """Open/create a lock file scoped to the current user."""
         if not _HAS_FCNTL:
-            # No kernel locking available (Windows). Rely on the per-process
-            # threading.RLock — multi-process cache sharing is unsupported
-            # on this platform without the Rust robust mutex.
+            # No kernel locking (Windows): rely on per-process RLock only;
+            # multi-process sharing needs the Rust robust mutex here.
             return
-        # Namespace by UID so users on a shared host can't collide on (or
-        # squat) each other's lock files.
+        # Namespace by UID so users on a shared host can't collide/squat lock files.
         uid = os.getuid()
         filename = f".tenso_cache_{uid}_{self._name}.lock"
         self._lock_file_path = os.path.join(tempfile.gettempdir(), filename)
@@ -423,14 +417,8 @@ class TensoCache:
         fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
 
     # -- SHM locking (cross-process safety) --
-    #
-    # Two strategies are available:
-    #   1. Robust POSIX pthread_mutex via tenso_rs (preferred). Uses
-    #      PTHREAD_PROCESS_SHARED and, on Linux, PTHREAD_MUTEX_ROBUST so
-    #      the kernel auto-recovers if a holder crashes — no 30-second
-    #      stale-lock window and no CPU-thrashing spinloop.
-    #   2. Python spinlock fallback (original). Used when the Rust
-    #      extension is not compiled or on non-Unix platforms.
+    # Two strategies: (1) robust POSIX pthread_mutex via tenso_rs (preferred,
+    # kernel auto-recovers on holder crash); (2) Python file-lock fallback.
 
     _STALE_LOCK_THRESHOLD = 30.0  # seconds before force-acquiring a stale lock
 
@@ -465,9 +453,7 @@ class TensoCache:
                 self._recover_pool_state()
             return
 
-        # --- File-lock fallback ---
-        # Uses OS-level file locking (fcntl.flock on Unix) which is
-        # kernel-guaranteed atomic and auto-released on process crash.
+        # File-lock fallback: fcntl.flock is atomic and auto-released on crash.
         self._file_lock_acquire(timeout)
 
     def _shm_lock_release(self):
@@ -590,13 +576,12 @@ class TensoCache:
         off = self._slot_offset(slot)
         key_bytes = key.encode('utf-8')
 
-        # Write barrier: mark FREE so concurrent readers skip this entry
+        # Write barrier: mark FREE so concurrent readers skip this entry.
         buf[off + _E_STATUS] = _STATUS_FREE
 
-        # Write all metadata fields
         buf[off + _E_KEY_LEN] = len(key_bytes)
         buf[off + _E_KEY: off + _E_KEY + len(key_bytes)] = key_bytes
-        # Zero remaining key space
+        # Zero remaining key space.
         if len(key_bytes) < _MAX_KEY_LEN:
             buf[off + _E_KEY + len(key_bytes): off + _E_KEY + _MAX_KEY_LEN] = (
                 b'\x00' * (_MAX_KEY_LEN - len(key_bytes))
@@ -616,7 +601,7 @@ class TensoCache:
         struct.pack_into('<I', buf, off + _E_LRU_PREV, _SENTINEL)
         struct.pack_into('<I', buf, off + _E_LRU_NEXT, _SENTINEL)
 
-        # Release barrier: metadata fully written, now visible to readers
+        # Release barrier: metadata fully written, now visible to readers.
         buf[off + _E_STATUS] = _STATUS_ACTIVE
 
     def _clear_entry(self, slot: int):
@@ -1109,10 +1094,8 @@ class TensoCache:
                 ttl = struct.unpack_from('<d', buf, off + _E_TTL)[0]
                 if ttl > 0:
                     create_time = struct.unpack_from('<d', buf, off + _E_CREATE_TIME)[0]
-                    # TTL bookkeeping uses the wall clock (time.time), NOT
-                    # time.monotonic: create_time lives in shared memory and is
-                    # compared by other processes, whose monotonic epoch differs,
-                    # so a monotonic timestamp would be meaningless cross-process.
+                    # TTL uses wall clock (time.time), not monotonic: create_time
+                    # is in SHM and compared cross-process where monotonic epochs differ.
                     if time.time() - create_time >= ttl:
                         self._delete_slot(slot)
                         self._bump_generation()
@@ -1122,8 +1105,7 @@ class TensoCache:
                 data_off = struct.unpack_from('<Q', buf, off + _E_DATA_OFF)[0]
                 packet_size = struct.unpack_from('<I', buf, off + _E_PACKET_SIZE)[0]
 
-                # Snapshot the packet bytes while holding the lock so a
-                # concurrent put/delete cannot mutate the data under us.
+                # Snapshot under the lock so a concurrent put/delete can't mutate it.
                 packet_snapshot = bytes(buf[data_off:data_off + packet_size])
 
                 struct.pack_into('<d', buf, off + _E_ACCESS_TIME, time.time())
@@ -1372,8 +1354,7 @@ class TensoCache:
             try:
                 self._shm.close()
             except BufferError:
-                # Zero-copy numpy views still reference the mmap.
-                # Disarm __del__ so it won't re-raise the same error.
+                # Zero-copy views still reference the mmap; disarm __del__.
                 self._shm._buf = None
                 self._shm._mmap = None
             except Exception:

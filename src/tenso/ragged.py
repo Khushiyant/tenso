@@ -32,8 +32,7 @@ from .config import (
 )
 from .core import _parse_header, loads as _core_loads
 
-# The Rust extension is required (tenso.core raises on a missing extension, and
-# importing this module imports tenso.core), so these are always available.
+# Rust extension is required (tenso.core raises if missing), so always available.
 from .tenso_rs import dumps_string_rs
 
 

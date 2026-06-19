@@ -1,31 +1,14 @@
-//! tenso-cuda: the ONLY crate that touches CUDA.
+//! tenso-cuda: the only crate that touches CUDA.
 //!
-//! The CUDA runtime (`libcudart`) is loaded at runtime via `libloading`/dlopen —
-//! there is NO link-time dependency on the CUDA toolkit, so this crate (and the
-//! whole workspace) builds on macOS / aarch64 without a toolkit installed and
-//! only fails at runtime when no driver is present. Real driver calls are gated
-//! behind the `cuda` feature; without it, `CudaBackend::open` returns
-//! `Err(CudaLoadError::FeatureDisabled)` and `CudaBackend::available()` is
-//! `false`, so callers on toolkit-less hosts degrade gracefully.
+//! `libcudart` is dlopen'd at runtime (no link-time toolkit dependency), so the
+//! workspace builds on toolkit-less hosts. Driver calls are gated behind `cuda`;
+//! without it `open` returns `FeatureDisabled` and `available()` is `false`.
 //!
-//! `CudaBackend` implements `tenso_device::DeviceBackend`, so it slots into
-//! `GpuCodec` exactly like the Cpu/Mock backends.
-//!
-//! DESIGN: this file is deliberately BORING. It is FFI shims only — thin wrappers
-//! over `cudaMalloc`/`cudaFree`/`cudaMemcpy`/`cudaHostAlloc`/
-//! `cudaIpcGetMemHandle`/`cudaIpcOpenMemHandle`/`cudaIpcCloseMemHandle` and a
-//! couple of device-attribute queries. There is ZERO offset/packet/wire math
-//! here — all of that lives above the `DeviceBackend` trait in `tenso-device`'s
-//! `GpuCodec`. We only move bytes between host and device and hand out opaque
-//! handles.
-//!
-//! TESTABILITY: everything below the trait requires a real CUDA device to
-//! exercise. The host-only unit tests at the bottom verify the
-//! graceful-degradation contract (`available()`, `open()` error mapping, struct
-//! layouts) and never call into the driver. Tests that need a GPU are marked
-//! `#[ignore]`, gated behind `cuda`, and run on a real Linux + NVIDIA box with
-//! `cargo test -p tenso-cuda --features cuda -- --ignored` (with libcudart on
-//! the loader path, or `TENSO_CUDART_PATH` set).
+//! `CudaBackend` implements `tenso_device::DeviceBackend` (slots into `GpuCodec`
+//! like the Cpu/Mock backends). FFI shims only — no offset/packet/wire math
+//! (that lives in `GpuCodec` above the trait); we just move bytes and hand out
+//! opaque IPC handles. Host-only unit tests verify graceful degradation; GPU
+//! tests are `#[ignore]`d (run with `--features cuda -- --ignored`).
 
 #![allow(dead_code, unused)]
 
@@ -36,15 +19,12 @@ use tenso_device::{DevErr, DevPtr, DeviceBackend, IpcHandle, PinnedBuf};
 pub enum CudaLoadError {
     /// The crate was built without the `cuda` feature.
     FeatureDisabled,
-    /// `libcudart` could not be dlopen'd at runtime. Carries a diagnostic listing
-    /// how many candidates were tried and the last underlying dlopen error, so a
-    /// runtime that is present-but-off-the-loader-path (fix with `TENSO_CUDART_PATH`
-    /// or `LD_LIBRARY_PATH`) is debuggable rather than an opaque "not found".
+    /// `libcudart` could not be dlopen'd. Carries a diagnostic (attempts + last
+    /// dlopen error) so a present-but-off-loader-path runtime is debuggable.
     DriverNotFound(String),
     /// A required symbol was missing from the runtime library.
     MissingSymbol(&'static str),
-    /// A runtime call failed (carries the `cudaError_t` code + the runtime's
-    /// `cudaGetErrorString` text, when it could be resolved).
+    /// A runtime call failed (carries the `cudaError_t` + `cudaGetErrorString` text).
     Driver(i32, String),
 }
 
@@ -52,10 +32,8 @@ pub enum CudaLoadError {
 // CUDA runtime FFI surface (only compiled with the `cuda` feature)
 // =============================================================================
 //
-// We bind only the handful of `libcudart` entry points we need. All signatures
-// follow the C `cudaError_t cudaXxx(...)` convention (0 == cudaSuccess). Pointer
-// arguments are `*mut c_void` etc.; we never dereference CUDA-owned memory on the
-// host. Keeping the set tiny keeps the ABI surface stable across CUDA versions.
+// Binds only the entry points we need; all follow `cudaError_t cudaXxx(...)`
+// (0 == cudaSuccess). We never deref CUDA-owned memory on the host.
 #[cfg(feature = "cuda")]
 mod ffi {
     use core::ffi::{c_char, c_void};
@@ -65,33 +43,26 @@ mod ffi {
     pub type CudaError = i32;
     pub const CUDA_SUCCESS: CudaError = 0;
 
-    // cudaMemcpyKind enum values (stable across CUDA versions).
+    // cudaMemcpyKind enum values.
     pub const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
     pub const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
     pub const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
-    // cudaHostAlloc flags. We allocate plain page-locked host memory
-    // (cudaHostAllocDefault == 0); we do NOT request the Mapped flag because the
-    // contract's PinnedBuf only carries a Vec<u8> (see alloc_pinned for the seam).
+    // cudaHostAllocDefault: plain page-locked memory, no Mapped flag (PinnedBuf
+    // only carries a Vec<u8>; see alloc_pinned for the seam).
     pub const CUDA_HOST_ALLOC_DEFAULT: u32 = 0;
 
-    // cudaDeviceAttr values we query. Stable in the runtime ABI.
-    //   cudaDevAttrIntegrated = 18  (1 on Tegra / Jetson iGPUs; 0 on discrete)
+    // cudaDevAttrIntegrated = 18 (1 on Tegra/Jetson iGPUs; 0 on discrete).
     pub const CUDA_DEV_ATTR_INTEGRATED: i32 = 18;
 
-    // cudaIpcMemHandle_t is an opaque 64-byte reserved POD blob; we treat it as
-    // [u8; 64]. CUDA_IPC_HANDLE_SIZE == 64 == tenso_core::IPC_REF_HANDLE_LEN.
+    // cudaIpcMemHandle_t size: opaque 64-byte blob == tenso_core::IPC_REF_HANDLE_LEN.
     pub const CUDA_IPC_HANDLE_BYTES: usize = 64;
 
     // cudaIpcMemLazyEnablePeerAccess = 1 (the only documented OpenMemHandle flag).
     pub const CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS: u32 = 1;
 
-    // A cudaIpcMemHandle_t is `struct { char reserved[64]; }`. We model it as a
-    // 64-byte POD array. cudaIpcOpenMemHandle takes it BY VALUE; on the SysV
-    // x86-64 ABI a 64-byte aggregate passed by value is passed in memory (the
-    // caller materialises it and passes a hidden pointer per the struct-by-value
-    // rule), which is exactly what `extern "C" fn(..., handle: CudaIpcMemHandle,
-    // ...)` lowers to for a `#[repr(C)]` 64-byte array wrapper.
+    // cudaIpcMemHandle_t is `struct { char reserved[64]; }`. cudaIpcOpenMemHandle
+    // takes it BY VALUE; a `#[repr(C)]` 64-byte array wrapper matches that ABI.
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct CudaIpcMemHandle(pub [u8; CUDA_IPC_HANDLE_BYTES]);
@@ -110,12 +81,10 @@ mod ffi {
     pub type FnHostAlloc =
         unsafe extern "C" fn(p_host: *mut *mut c_void, size: usize, flags: u32) -> CudaError;
     pub type FnFreeHost = unsafe extern "C" fn(ptr: *mut c_void) -> CudaError;
-    // cudaIpcGetMemHandle(cudaIpcMemHandle_t* handle, void* devPtr): the handle
-    // is an OUT param, so it is passed by pointer.
+    // cudaIpcGetMemHandle: handle is an OUT param (by pointer).
     pub type FnIpcGetMemHandle =
         unsafe extern "C" fn(handle: *mut CudaIpcMemHandle, dev_ptr: *mut c_void) -> CudaError;
-    // cudaIpcOpenMemHandle(void** devPtr, cudaIpcMemHandle_t handle, unsigned
-    // flags): the handle is passed BY VALUE (a 64-byte struct).
+    // cudaIpcOpenMemHandle: handle passed BY VALUE (64-byte struct).
     pub type FnIpcOpenMemHandle = unsafe extern "C" fn(
         dev_ptr: *mut *mut c_void,
         handle: CudaIpcMemHandle,
@@ -128,9 +97,8 @@ mod ffi {
         unsafe extern "C" fn(pci_bus_id: *mut c_char, len: i32, device: i32) -> CudaError;
     pub type FnGetErrorString = unsafe extern "C" fn(error: i32) -> *const c_char;
 
-    /// Owns the dlopen'd library plus all resolved symbols. Symbols are raw fn
-    /// pointers copied out of the `Library` at load time; we keep `_lib` alive
-    /// for the lifetime of the backend so the pointers stay valid.
+    /// Owns the dlopen'd library + resolved fn pointers. `_lib` is kept alive so
+    /// the pointers stay valid.
     pub struct Runtime {
         _lib: Library,
         pub set_device: FnSetDevice,
@@ -148,27 +116,21 @@ mod ffi {
         pub get_error_string: FnGetErrorString,
     }
 
-    /// Candidate sonames for the CUDA runtime across platforms / CUDA majors.
-    /// We try them in order; the first that dlopen's wins. On the target Linux +
-    /// NVIDIA box the bare `libcudart.so` (toolkit) or `libcudart.so.12` /
-    /// `.so.13` (redistributable) is present.
+    /// Candidate `libcudart` sonames across platforms/majors, tried in order.
     const CANDIDATES: &[&str] = &[
         "libcudart.so",
         "libcudart.so.12",
         "libcudart.so.13",
         "libcudart.so.11.0",
         "libcudart.so.11",
-        // Windows / macOS fallbacks (rarely a real CUDA host, but cheap to try).
+        // Windows / macOS fallbacks.
         "cudart64_12.dll",
         "cudart64_110.dll",
         "libcudart.dylib",
     ];
 
-    /// Standard install directories that may hold `libcudart` even when it is not
-    /// on the dynamic loader path. Searched (joined with each soname) only after
-    /// bare-soname resolution fails. This catches a system CUDA toolkit; a pip
-    /// `nvidia-cuda-runtime-cu12` wheel lives in a venv site-packages whose path
-    /// is not fixed, so that case is handled by `TENSO_CUDART_PATH` / `LD_LIBRARY_PATH`.
+    /// Standard install dirs (joined with each soname), searched only after
+    /// bare-soname resolution fails. pip-wheel installs go via `TENSO_CUDART_PATH`.
     const CANDIDATE_DIRS: &[&str] = &[
         "/usr/local/cuda/lib64",
         "/usr/local/cuda/targets/x86_64-linux/lib",
@@ -180,13 +142,9 @@ mod ffi {
         "/opt/cuda/lib64",
     ];
 
-    /// Find and dlopen `libcudart`, in order:
-    ///   1. `$TENSO_CUDART_PATH` (an explicit soname or absolute path), if set.
-    ///   2. Bare sonames, resolved via the system loader path (LD_LIBRARY_PATH /
-    ///      ldconfig).
-    ///   3. Each `CANDIDATE_DIRS` entry joined with each soname.
-    /// On total failure returns `DriverNotFound` with a diagnostic (count of
-    /// attempts + last underlying dlopen error) so the cause is debuggable.
+    /// Find + dlopen `libcudart`: `$TENSO_CUDART_PATH`, then bare sonames (loader
+    /// path), then `CANDIDATE_DIRS`×sonames. On failure returns `DriverNotFound`
+    /// with a diagnostic (attempts + last dlopen error).
     fn open_cudart() -> Result<Library, super::CudaLoadError> {
         let mut paths: Vec<String> = Vec::new();
         if let Ok(p) = std::env::var("TENSO_CUDART_PATH") {
@@ -205,8 +163,7 @@ mod ffi {
 
         let mut last_err: Option<String> = None;
         for path in &paths {
-            // SAFETY: loading a shared library by name/path. Its symbols are
-            // resolved and type-checked against the CUDA C ABI in `load()`.
+            // SAFETY: dlopen by name/path; symbols type-checked vs CUDA ABI in load().
             match unsafe { Library::new(path) } {
                 Ok(l) => return Ok(l),
                 Err(e) => last_err = Some(format!("{path}: {e}")),
@@ -227,23 +184,16 @@ mod ffi {
     }
 
     impl Runtime {
-        /// dlopen libcudart and resolve every symbol we use. Returns
-        /// `DriverNotFound` if no candidate library loads, `MissingSymbol` if a
-        /// needed entry point is absent.
+        /// dlopen libcudart and resolve every symbol. `DriverNotFound` if nothing
+        /// loads, `MissingSymbol` if an entry point is absent.
         pub fn load() -> Result<Self, super::CudaLoadError> {
-            // Find + dlopen libcudart (env override, then loader path, then
-            // standard install dirs). The library is the CUDA runtime; its symbols
-            // match the C signatures bound above and `lib` is moved into the
-            // returned Runtime so the resolved fn pointers stay valid.
+            // `lib` is moved into the returned Runtime so the fn pointers stay valid.
             let lib = open_cudart()?;
 
-            // Resolve a symbol, mapping absence to MissingSymbol. The returned
-            // raw fn pointer is `Copy`; we read `*sym` while `lib` outlives us
-            // (it is moved into the returned Runtime alongside the pointers).
+            // Resolve a symbol, mapping absence to MissingSymbol.
             macro_rules! sym {
                 ($name:literal, $ty:ty) => {{
-                    // SAFETY: the named symbol, if present, has the C signature
-                    // declared by $ty (verified against the CUDA runtime API).
+                    // SAFETY: the named symbol, if present, has the C signature $ty.
                     let s: Symbol<$ty> = unsafe { lib.get($name) }.map_err(|_| {
                         super::CudaLoadError::MissingSymbol(
                             // strip the trailing NUL for the message
@@ -286,12 +236,10 @@ mod ffi {
             })
         }
 
-        /// Resolve a `cudaError_t` to its human-readable string via the runtime's
-        /// `cudaGetErrorString`. Never panics: falls back to "<unknown>" if the
-        /// runtime returns NULL or a non-UTF8 string.
+        /// Resolve a `cudaError_t` to text via `cudaGetErrorString`. Never panics
+        /// (falls back on NULL / non-UTF8).
         pub fn error_string(&self, code: CudaError) -> String {
-            // SAFETY: cudaGetErrorString returns a pointer to a static C string
-            // owned by the runtime (valid for the process lifetime) or NULL.
+            // SAFETY: returns a static runtime-owned C string (process lifetime) or NULL.
             let ptr = unsafe { (self.get_error_string)(code) };
             if ptr.is_null() {
                 return String::from("<null cudaGetErrorString>");
@@ -309,11 +257,8 @@ mod ffi {
 // CudaBackend
 // =============================================================================
 
-/// A handle to a CUDA device backed by the dlopen'd runtime.
-///
-/// Construction (`open`) loads `libcudart`, selects the device, and caches the
-/// integrated/unified flag and the device UUID derived from the PCI bus id. All
-/// `DeviceBackend` methods are thin shims over the resolved runtime symbols.
+/// A handle to a CUDA device backed by the dlopen'd runtime. `open` selects the
+/// device and caches the unified flag + UUID (from the PCI bus id).
 pub struct CudaBackend {
     #[cfg(feature = "cuda")]
     rt: ffi::Runtime,
@@ -323,18 +268,15 @@ pub struct CudaBackend {
     unified: bool,
     #[cfg(feature = "cuda")]
     uuid: [u8; 16],
-    // Without the `cuda` feature the struct is uninhabited in practice
-    // (`open` never returns Ok), but it must still be nameable.
+    // Without `cuda` the struct is uninhabited (`open` never returns Ok) but
+    // must still be nameable.
     #[cfg(not(feature = "cuda"))]
     _never: core::convert::Infallible,
 }
 
 impl CudaBackend {
-    /// True if the CUDA runtime could be dlopen'd on this host (and the `cuda`
-    /// feature is enabled). Lets callers probe for GPU-direct support without
-    /// committing to a device or handling an error path.
-    ///
-    /// Always `false` when built without the `cuda` feature.
+    /// True if `libcudart` could be dlopen'd (and `cuda` is enabled); lets callers
+    /// probe for GPU support. Always `false` without the `cuda` feature.
     pub fn available() -> bool {
         #[cfg(not(feature = "cuda"))]
         {
@@ -346,13 +288,9 @@ impl CudaBackend {
         }
     }
 
-    /// Load the CUDA runtime and bind to `device_ordinal`.
-    ///
-    /// Without the `cuda` feature this always returns
-    /// `Err(CudaLoadError::FeatureDisabled)` so callers on toolkit-less hosts
-    /// can degrade gracefully. With the feature, it dlopen's `libcudart`,
-    /// selects the device, and caches the integrated (unified-memory) flag and
-    /// a stable 16-byte device UUID derived from the PCI bus id.
+    /// Load the runtime and bind to `device_ordinal`. Without `cuda` returns
+    /// `FeatureDisabled`; otherwise selects the device and caches the unified
+    /// flag + a stable 16-byte UUID from the PCI bus id.
     pub fn open(device_ordinal: i32) -> Result<Self, CudaLoadError> {
         let _ = device_ordinal;
         #[cfg(not(feature = "cuda"))]
@@ -365,17 +303,15 @@ impl CudaBackend {
 
             let rt = ffi::Runtime::load()?;
 
-            // Bind the current thread/context to the requested device. A nonzero
-            // cudaError_t here means the ordinal is invalid or no device exists.
+            // Bind to the requested device (nonzero rc = bad ordinal / no device).
             // SAFETY: resolved C entry point, plain i32 argument.
             let rc = unsafe { (rt.set_device)(device_ordinal) };
             if rc != ffi::CUDA_SUCCESS {
                 return Err(CudaLoadError::Driver(rc, rt.error_string(rc)));
             }
 
-            // Query the integrated attribute (1 on Jetson/Tegra iGPUs, 0 on a
-            // discrete part like the RTX 5070 Ti). On integrated parts host and
-            // device share physical memory, enabling the zero-copy mapped path.
+            // Integrated attr: 1 on Jetson/Tegra iGPUs (shared memory, zero-copy
+            // path), 0 on discrete parts.
             let mut integrated: i32 = 0;
             // SAFETY: out-param is a valid &mut i32; attr/device are scalars.
             let rc = unsafe {
@@ -390,13 +326,9 @@ impl CudaBackend {
             }
             let unified = integrated != 0;
 
-            // Device UUID: the runtime exposes a stable, human-readable PCI bus
-            // id ("0000:65:00.0") via cudaDeviceGetPCIBusId. We derive a stable
-            // 16-byte id from it (see `pci_bus_id_to_uuid`) rather than decoding
-            // the large, version-fragile `cudaDeviceProp` struct (which carries
-            // the real UUID but bloats the ABI surface). The bus id is stable for
-            // the same physical slot across processes on one node, so it is a
-            // sound key for CUDA IPC's "same device" rule.
+            // Derive a 16-byte UUID from the PCI bus id ("0000:65:00.0") rather
+            // than the version-fragile `cudaDeviceProp`. The bus id is stable per
+            // slot across processes, a sound key for IPC's "same device" rule.
             let mut buf = [0i8; 32];
             // SAFETY: buf is 32 writable bytes; len matches; device is a scalar.
             let rc = unsafe {
@@ -416,13 +348,12 @@ impl CudaBackend {
         }
     }
 
-    /// True if the device exposes unified (integrated/Tegra) memory. On the
-    /// discrete RTX 5070 Ti this is `false`. Mirror of the trait method for
-    /// callers who hold a concrete `CudaBackend`.
+    /// True if the device exposes unified (integrated/Tegra) memory. Mirror of
+    /// the trait method for callers holding a concrete `CudaBackend`.
     pub fn is_unified(&self) -> bool {
         #[cfg(not(feature = "cuda"))]
         {
-            // Unreachable: a CudaBackend cannot be constructed without `cuda`.
+            // Unreachable: CudaBackend cannot be constructed without `cuda`.
             match self._never {}
         }
         #[cfg(feature = "cuda")]
@@ -432,12 +363,9 @@ impl CudaBackend {
     }
 }
 
-/// Derive a stable 16-byte device id from a NUL-terminated PCI bus id C string
-/// (e.g. b"0000:65:00.0"). We copy the bus-id bytes verbatim into the first 16
-/// bytes (truncating / zero-padding), which is deterministic, collision-free for
-/// distinct slots on a node, and matches CUDA IPC's "handles only resolve on the
-/// same physical device" rule. Defined unconditionally so the host-only unit
-/// tests can exercise it without the `cuda` feature.
+/// Derive a stable 16-byte device id from a NUL-terminated PCI bus id (e.g.
+/// b"0000:65:00.0"): bytes copied verbatim, truncated/zero-padded to 16.
+/// Deterministic, collision-free per slot. Unconditional so host-only tests run.
 fn pci_bus_id_to_uuid(bus_id: &[i8]) -> [u8; 16] {
     let mut uuid = [0u8; 16];
     for (i, &c) in bus_id.iter().enumerate() {
@@ -453,10 +381,8 @@ fn pci_bus_id_to_uuid(bus_id: &[i8]) -> [u8; 16] {
 // DeviceBackend impl — FFI shims only, no packet/offset math
 // =============================================================================
 //
-// Every method below requires a real CUDA device to do anything. We move raw
-// bytes between host slices and device pointers and hand out opaque IPC handles.
-// `DevPtr(usize)` carries the raw `void*` returned by `cudaMalloc`, reinterpreted
-// as a `usize`. Every fallible call checks the cudaError_t.
+// `DevPtr(usize)` carries the raw `void*` from `cudaMalloc`. Every fallible call
+// checks the cudaError_t.
 
 impl DeviceBackend for CudaBackend {
     fn alloc(&self, n: usize) -> Result<DevPtr, DevErr> {
@@ -468,8 +394,7 @@ impl DeviceBackend for CudaBackend {
         #[cfg(feature = "cuda")]
         {
             use core::ffi::c_void;
-            // cudaMalloc(0) is allowed and returns NULL; treat a zero-byte alloc
-            // as a benign null DevPtr rather than an error.
+            // cudaMalloc(0) returns NULL; treat as a benign null DevPtr.
             if n == 0 {
                 return Ok(DevPtr(0));
             }
@@ -477,7 +402,7 @@ impl DeviceBackend for CudaBackend {
             // SAFETY: out-param is a valid &mut *mut c_void; n is the byte count.
             let rc = unsafe { (self.rt.malloc)(&mut ptr, n) };
             if rc != ffi::CUDA_SUCCESS || ptr.is_null() {
-                // cudaMalloc fails almost exclusively with OOM; surface that.
+                // cudaMalloc fails almost exclusively with OOM.
                 return Err(DevErr::OutOfMemory);
             }
             Ok(DevPtr(ptr as usize))
@@ -496,8 +421,8 @@ impl DeviceBackend for CudaBackend {
             if p.0 == 0 {
                 return;
             }
-            // SAFETY: p.0 came from cudaMalloc on this backend. Errors are
-            // swallowed to match the infallible `free` signature.
+            // SAFETY: p.0 came from cudaMalloc on this backend; errors swallowed
+            // to match the infallible `free` signature.
             let _ = unsafe { (self.rt.free)(p.0 as *mut c_void) };
         }
     }
@@ -514,9 +439,8 @@ impl DeviceBackend for CudaBackend {
             if src.is_empty() {
                 return;
             }
-            // SAFETY: dst.0 is a device pointer with >= src.len() bytes (caller
-            // contract); src is a valid host slice. Kind=1 selects HostToDevice.
-            // On the discrete 5070 Ti this is a real PCIe DMA.
+            // SAFETY: dst.0 has >= src.len() bytes (caller contract); src is a
+            // valid host slice; Kind=1 = HostToDevice.
             let rc = unsafe {
                 (self.rt.memcpy)(
                     dst.0 as *mut c_void,
@@ -525,9 +449,7 @@ impl DeviceBackend for CudaBackend {
                     ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
                 )
             };
-            // The trait's copy is infallible, but a nonzero cudaError_t means the
-            // transfer did NOT happen (dst left stale). Surface it loudly in
-            // debug/test builds so a bad copy can't pass silently.
+            // Nonzero rc means the copy did not happen (dst stale); fail loudly in debug.
             debug_assert!(
                 rc == ffi::CUDA_SUCCESS,
                 "cudaMemcpy H2D failed: {} ({rc})",
@@ -548,8 +470,8 @@ impl DeviceBackend for CudaBackend {
             if dst.is_empty() {
                 return;
             }
-            // SAFETY: src.0 is a device pointer with >= dst.len() bytes (caller
-            // contract); dst is a valid mutable host slice. Kind=2 = DeviceToHost.
+            // SAFETY: src.0 has >= dst.len() bytes (caller contract); dst is a
+            // valid mutable host slice; Kind=2 = DeviceToHost.
             let rc = unsafe {
                 (self.rt.memcpy)(
                     dst.as_mut_ptr() as *mut c_void,
@@ -558,8 +480,7 @@ impl DeviceBackend for CudaBackend {
                     ffi::CUDA_MEMCPY_DEVICE_TO_HOST,
                 )
             };
-            // A nonzero cudaError_t means dst was NOT filled from device memory
-            // (left zeroed/stale). Surface it loudly in debug/test builds.
+            // Nonzero rc means dst was not filled (stale); fail loudly in debug.
             debug_assert!(
                 rc == ffi::CUDA_SUCCESS,
                 "cudaMemcpy D2H failed: {} ({rc})",
@@ -577,27 +498,18 @@ impl DeviceBackend for CudaBackend {
         #[cfg(feature = "cuda")]
         {
             use core::ffi::c_void;
-            // Allocate page-locked host memory via cudaHostAlloc with the Default
-            // flag (0), then immediately free it via cudaFreeHost. The contract's
-            // PinnedBuf only carries a Vec<u8>, so we COPY the (zeroed) region
-            // into a Vec for the caller.
-            //
-            // SEAM: this loses the genuine page-locked property the moment we copy
-            // into a Vec — the Vec is ordinary pageable host memory. To expose
-            // true pinned buffers (and a device pointer for the zero-copy path),
-            // `PinnedBuf` in tenso-device would need to carry the raw host pointer
-            // + a backend-owned deleter that calls cudaFreeHost on Drop. We still
-            // exercise cudaHostAlloc/cudaFreeHost here so the GPU integration test
-            // proves the pinned-alloc path works on real hardware. For now this
-            // gives a correctly-sized host buffer.
+            // SEAM: cudaHostAlloc + immediate cudaFreeHost, copying into a Vec<u8>
+            // (all PinnedBuf carries). The Vec is pageable, so the pinned property
+            // is lost; true pinned buffers would need PinnedBuf to hold the raw
+            // host ptr + a cudaFreeHost-on-Drop deleter. We still exercise the
+            // alloc/free pair so the GPU test proves it works on real hardware.
             let mut host: *mut c_void = core::ptr::null_mut();
             // SAFETY: out-param valid; n is the byte count; flag is a valid mask.
             let rc = unsafe { (self.rt.host_alloc)(&mut host, n, ffi::CUDA_HOST_ALLOC_DEFAULT) };
             if rc != ffi::CUDA_SUCCESS || host.is_null() {
                 return Err(DevErr::OutOfMemory);
             }
-            // Copy the (zeroed-by-us) region into a Vec and release the pinned
-            // allocation. cudaHostAlloc does not zero, so we zero-init the Vec.
+            // cudaHostAlloc does not zero, so zero-init the Vec.
             let mut bytes = vec![0u8; n];
             // SAFETY: host points to >= n readable bytes; bytes has n bytes.
             unsafe {
@@ -617,25 +529,21 @@ impl DeviceBackend for CudaBackend {
         #[cfg(feature = "cuda")]
         {
             use core::ffi::c_void;
-            // Integrated (unified) GPUs do not support classic CUDA IPC mem
-            // handles — the iGPU shares system memory and IPC export is rejected
-            // by the driver. Surface that as IpcUnsupported rather than a raw
-            // code. On the discrete 5070 Ti this branch is skipped.
+            // Integrated GPUs reject CUDA IPC mem handles (shared system memory);
+            // surface as IpcUnsupported rather than a raw code.
             if self.unified {
                 return Err(DevErr::IpcUnsupported);
             }
             let mut handle = ffi::CudaIpcMemHandle([0u8; ffi::CUDA_IPC_HANDLE_BYTES]);
-            // SAFETY: handle is a 64-byte cudaIpcMemHandle_t out-param; p.0 is a
-            // device pointer returned by cudaMalloc on this backend.
+            // SAFETY: handle is a 64-byte cudaIpcMemHandle_t out-param; p.0 came
+            // from cudaMalloc on this backend.
             let rc = unsafe { (self.rt.ipc_get_mem_handle)(&mut handle, p.0 as *mut c_void) };
             if rc != ffi::CUDA_SUCCESS {
-                // Surface the real cudaError_t instead of a blanket IpcUnsupported,
-                // which previously hid the driver's actual reason.
+                // Surface the real cudaError_t, not a blanket IpcUnsupported.
                 return Err(DevErr::Device(rc));
             }
-            // We fill only the opaque handle blob and the device UUID. byte_offset
-            // and nbytes are wire-framing concerns owned by GpuCodec above the
-            // trait, so we leave them zero here (BORING: no packet math).
+            // Fill only the handle blob + UUID; byte_offset/nbytes are GpuCodec
+            // wire-framing concerns, left zero here.
             Ok(IpcHandle {
                 bytes: handle.0,
                 byte_offset: 0,
@@ -657,17 +565,15 @@ impl DeviceBackend for CudaBackend {
             if self.unified {
                 return Err(DevErr::IpcUnsupported);
             }
-            // Device-UUID validation (reject mismatches) is also a GpuCodec-level
-            // rule; we defensively reject a cross-device handle when our cached
-            // UUID is known (nonzero) and disagrees.
+            // Defensively reject a cross-device handle when our cached UUID is
+            // known (nonzero) and disagrees (UUID validation is a GpuCodec rule).
             if self.uuid != [0u8; 16] && h.device_uuid != self.uuid {
                 return Err(DevErr::DeviceUuidMismatch);
             }
             let mut ptr: *mut c_void = core::ptr::null_mut();
             let handle = ffi::CudaIpcMemHandle(h.bytes);
             // SAFETY: out-param valid; `handle` is a 64-byte cudaIpcMemHandle_t
-            // passed BY VALUE (matches the C signature). The flag is the only
-            // documented one (LazyEnablePeerAccess = 1).
+            // passed BY VALUE (matches C); flag is LazyEnablePeerAccess = 1.
             let rc = unsafe {
                 (self.rt.ipc_open_mem_handle)(
                     &mut ptr,
@@ -676,19 +582,14 @@ impl DeviceBackend for CudaBackend {
                 )
             };
             if rc != ffi::CUDA_SUCCESS {
-                // Surface the real cudaError_t. The most common case here is the
-                // documented same-process restriction: importing a handle exported
-                // by the calling process returns 201 (cudaErrorDeviceUninitialized
-                // / "invalid device context"). CUDA IPC is a cross-process
-                // mechanism; see the cross-process integration test.
+                // Surface the real cudaError_t. CUDA IPC is cross-process only:
+                // same-process import returns 201 (cudaErrorDeviceUninitialized).
                 return Err(DevErr::Device(rc));
             }
             if ptr.is_null() {
                 return Err(DevErr::IpcUnsupported);
             }
-            // Honor byte_offset so a sub-buffer IPC reference resolves to the right
-            // address within the imported mapping (the field is 0 today, so this is
-            // a safe no-op until offset export is wired up).
+            // Honor byte_offset for sub-buffer refs (0 today, so a no-op).
             Ok(DevPtr(ptr as usize + h.byte_offset as usize))
         }
     }
@@ -716,11 +617,8 @@ impl DeviceBackend for CudaBackend {
     }
 }
 
-/// Close a device pointer that was obtained via `import_ipc` (i.e. mapped from a
-/// foreign `cudaIpcMemHandle_t`). This is NOT `free`: an imported pointer must be
-/// released with `cudaIpcCloseMemHandle`, never `cudaFree`. Exposed so callers /
-/// tests that import an IPC handle can correctly tear it down. No-op (and
-/// uninhabited) without the `cuda` feature.
+/// Release a pointer from `import_ipc` via `cudaIpcCloseMemHandle` (NOT `free` /
+/// `cudaFree`). No-op (uninhabited) without the `cuda` feature.
 impl CudaBackend {
     pub fn close_ipc(&self, p: DevPtr) -> Result<(), DevErr> {
         #[cfg(not(feature = "cuda"))]
@@ -737,8 +635,7 @@ impl CudaBackend {
             // SAFETY: p.0 was returned by cudaIpcOpenMemHandle on this backend.
             let rc = unsafe { (self.rt.ipc_close_mem_handle)(p.0 as *mut c_void) };
             if rc != ffi::CUDA_SUCCESS {
-                // Surface the real cudaError_t (e.g. the handle was already gone /
-                // invalid for this context).
+                // Surface the real cudaError_t (e.g. handle already gone/invalid).
                 return Err(DevErr::Device(rc));
             }
             Ok(())
@@ -747,20 +644,17 @@ impl CudaBackend {
 }
 
 // =============================================================================
-// Tests — host-only / compile-time smoke tests + #[ignore] GPU integration
+// Tests — host-only smoke tests + #[ignore] GPU integration
 // =============================================================================
 //
-// The non-ignored tests NEVER touch a CUDA device. They verify the
-// graceful-degradation contract and basic invariants so CI on macOS/aarch64 (no
-// toolkit) stays green. The `#[ignore]`d tests genuinely exercise the driver;
-// run them on a real Linux + NVIDIA box with:
+// Non-ignored tests never touch a device (verify graceful degradation, keeping
+// toolkit-less CI green). `#[ignore]`d tests need a real Linux + NVIDIA box:
 //   cargo test -p tenso-cuda --features cuda -- --ignored --nocapture
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Without the `cuda` feature, `open` must report FeatureDisabled and the
-    /// backend must advertise itself as unavailable. This is the host-CI path.
+    /// Without `cuda`: `open` reports FeatureDisabled and `available()` is false.
     #[test]
     #[cfg(not(feature = "cuda"))]
     fn open_without_feature_is_feature_disabled() {
@@ -772,10 +666,8 @@ mod tests {
         }
     }
 
-    /// With the `cuda` feature but no driver present (typical dev box / CI),
-    /// `available()` is false and `open` fails with DriverNotFound. On a real
-    /// CUDA host this test would instead see a backend open successfully, so it
-    /// only asserts the negative when no runtime is loadable.
+    /// With `cuda` but no driver: `available()` false and `open` fails with
+    /// DriverNotFound. Only asserts the negative when no runtime is loadable.
     #[test]
     #[cfg(feature = "cuda")]
     fn open_with_feature_but_no_driver() {
@@ -789,8 +681,7 @@ mod tests {
         }
     }
 
-    /// The IpcHandle blob must be exactly the CUDA cudaIpcMemHandle_t size so our
-    /// export/import shims copy the right number of bytes.
+    /// IpcHandle blob must be exactly cudaIpcMemHandle_t size (64 bytes).
     #[test]
     fn ipc_handle_blob_is_64_bytes() {
         assert_eq!(tenso_core::IPC_REF_HANDLE_LEN, 64);
@@ -804,9 +695,7 @@ mod tests {
         assert_eq!(h.device_uuid.len(), 16);
     }
 
-    /// The CudaIpcMemHandle FFI struct must be exactly 64 bytes (==
-    /// CUDA_IPC_HANDLE_SIZE == IPC_REF_HANDLE_LEN) so passing it by value matches
-    /// the C `cudaIpcMemHandle_t` ABI.
+    /// CudaIpcMemHandle must be 64 bytes so by-value passing matches the C ABI.
     #[test]
     #[cfg(feature = "cuda")]
     fn cuda_ipc_handle_struct_is_64_bytes() {
@@ -814,11 +703,10 @@ mod tests {
         assert_eq!(ffi::CUDA_IPC_HANDLE_BYTES, tenso_core::IPC_REF_HANDLE_LEN);
     }
 
-    /// `pci_bus_id_to_uuid` copies the bus-id bytes verbatim, stops at the NUL,
-    /// and zero-pads to 16 bytes. Distinct bus ids yield distinct uuids.
+    /// `pci_bus_id_to_uuid` copies bytes verbatim, stops at NUL, zero-pads to 16;
+    /// distinct bus ids yield distinct uuids.
     #[test]
     fn pci_bus_id_uuid_is_stable_and_distinct() {
-        // C string b"0000:65:00.0\0..."
         let mut a = [0i8; 32];
         for (i, &b) in b"0000:65:00.0".iter().enumerate() {
             a[i] = b as i8;
@@ -837,13 +725,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // GPU integration tests — REQUIRE a real Linux + NVIDIA device.
-    // Gated #[ignore] so they only run with `--ignored`.
+    // GPU integration tests — require a real Linux + NVIDIA device (#[ignore]d).
     // -------------------------------------------------------------------------
 
-    /// (a) Device round-trip through the wire codec: host tensor -> alloc +
-    /// copy_h2d -> GpuCodec::encode_from_device -> decode_into_device -> copy_d2h
-    /// -> assert bytes equal. Proves the discrete H2D/D2H + encode/decode path.
+    /// (a) Device round-trip through the codec: h2d -> encode_from_device ->
+    /// decode_into_device -> d2h -> assert equal.
     #[test]
     #[ignore = "requires a real Linux + NVIDIA CUDA device"]
     #[cfg(feature = "cuda")]
@@ -854,7 +740,7 @@ mod tests {
         let be = CudaBackend::open(0).expect("CUDA device 0 must be present");
         let codec = GpuCodec::new(&be);
 
-        // 16 f32 elements, shape [4,4] -> 64 bytes of body.
+        // 16 f32, shape [4,4] -> 64 bytes.
         let values: Vec<f32> = (0..16).map(|i| i as f32 * 1.5).collect();
         let mut body = vec![0u8; values.len() * 4];
         for (i, v) in values.iter().enumerate() {
@@ -888,16 +774,11 @@ mod tests {
         be.free(dst);
     }
 
-    /// (b) IPC round-trip ACROSS PROCESSES — the only configuration CUDA IPC
-    /// supports. `cudaIpcOpenMemHandle` is a cross-process mechanism; importing a
-    /// handle in the SAME process that exported it is rejected by the driver
-    /// (returns cudaErrorDeviceUninitialized = 201 on the 5070 Ti — see test
-    /// `gpu_ipc_same_process_import_is_rejected`). So this test exports in the
-    /// parent, writes the 64-byte handle + device UUID to a temp file, then
-    /// re-execs THIS test binary as an importer child. The child opens its own
-    /// CUDA context, imports the handle, reads the aliased VRAM back, and asserts
-    /// byte-equality, exiting 0 on success. The parent holds the allocation and
-    /// its CUDA context alive (it blocks on the child) for the whole import.
+    /// (b) IPC round-trip ACROSS PROCESSES (the only config CUDA IPC supports;
+    /// same-process import returns 201). Parent exports + writes handle+UUID to a
+    /// temp file, then re-execs this binary as an importer child that maps the
+    /// handle, reads the aliased VRAM, and asserts byte-equality. Parent blocks on
+    /// the child, keeping the allocation + context alive.
     #[test]
     #[ignore = "requires a real Linux + NVIDIA CUDA device"]
     #[cfg(feature = "cuda")]
@@ -906,9 +787,8 @@ mod tests {
 
         const PAYLOAD: [u8; 16] = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3];
 
-        // Importer child arm: re-exec'd with TENSO_IPC_CHILD set to the handle
-        // file. Reads [handle:64][uuid:16], imports, verifies, and exits the
-        // process directly (so libtest semantics never apply to the child).
+        // Importer child arm (re-exec'd with TENSO_IPC_CHILD = handle file):
+        // reads [handle:64][uuid:16], imports, verifies, exits directly.
         if let Ok(path) = std::env::var("TENSO_IPC_CHILD") {
             let mut buf = Vec::new();
             std::fs::File::open(&path)
@@ -994,11 +874,8 @@ mod tests {
         );
     }
 
-    /// (b2) Same-process IPC import MUST be rejected by CUDA. This documents and
-    /// regression-tests the restriction that forces (b) to be cross-process:
-    /// `cudaIpcOpenMemHandle` on a handle exported by the calling process returns
-    /// an error (201 / cudaErrorDeviceUninitialized on the 5070 Ti), now surfaced
-    /// as `DevErr::Device(code)` instead of a blanket `IpcUnsupported`.
+    /// (b2) Same-process IPC import must be rejected (201 / DeviceUninitialized),
+    /// surfaced as `DevErr::Device(code)`. This is why (b) must be cross-process.
     #[test]
     #[ignore = "requires a real Linux + NVIDIA CUDA device"]
     #[cfg(feature = "cuda")]
@@ -1022,9 +899,7 @@ mod tests {
         be.free(p);
     }
 
-    /// (c) The discrete RTX 5070 Ti must report `is_unified_memory() == false`
-    /// (cudaDevAttrIntegrated == 0). Only an integrated Tegra/Jetson part is
-    /// unified. Also sanity-checks the derived UUID is nonzero.
+    /// (c) A discrete GPU reports `is_unified_memory() == false` and a nonzero UUID.
     #[test]
     #[ignore = "requires a real Linux + NVIDIA CUDA device"]
     #[cfg(feature = "cuda")]

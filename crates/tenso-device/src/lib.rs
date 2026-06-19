@@ -1,13 +1,8 @@
-//! tenso-device: the mockable device-backend layer.
+//! tenso-device: mockable device-backend layer (no real GPU needed).
 //!
-//! Defines the `DeviceBackend` trait, a real-host `CpuBackend`, a `MockBackend`
-//! (Vec<u8> "VRAM" with op recording + fault injection + configurable
-//! unified-memory flag), and a `GpuCodec` that orchestrates tenso-core
-//! encode/decode against a backend and handles GPU IPC reference framing.
-//!
-//! No real GPU is required: `CpuBackend` treats host memory as "device memory"
-//! and implements IPC via a process-local registry so the GPU-direct paths
-//! (Jetson unified memory + CUDA IPC) are fully exercisable on macOS/CI.
+//! `DeviceBackend` trait, `CpuBackend` (host mem as device mem, IPC via a
+//! process-local registry), `MockBackend` (Vec<u8> VRAM + op log + fault
+//! injection), and `GpuCodec` (tenso-core encode/decode + IPC framing).
 
 #![allow(dead_code, unused)]
 
@@ -21,9 +16,7 @@ use tenso_core::{
     IPC_REF_PACKET_LEN, MAGIC, VERSION,
 };
 
-// =============================================================================
-// Device handle / error types
-// =============================================================================
+// ---- Device handle / error types ----
 
 /// Opaque device pointer (offset/handle into a backend's address space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +24,7 @@ pub struct DevPtr(pub usize);
 
 /// A pinned host buffer suitable for fast H2D/D2H transfers.
 pub struct PinnedBuf {
-    /// Host-visible bytes. For the mock/cpu backends this is just a Vec.
+    /// Host-visible bytes (a plain Vec for the mock/cpu backends).
     pub bytes: Vec<u8>,
 }
 
@@ -53,17 +46,13 @@ pub enum DevErr {
     DeviceUuidMismatch,
     FaultInjected,
     Core(TensoError),
-    /// A backend-specific driver call failed, carrying the native status code
-    /// (e.g. a CUDA `cudaError_t`). Distinct from `IpcUnsupported`, which means
-    /// the device/platform fundamentally cannot do IPC; `Device(code)` means a
-    /// call was attempted and the driver rejected it with `code`.
+    /// Driver call failed with native status `code` (e.g. CUDA `cudaError_t`);
+    /// distinct from `IpcUnsupported` (platform cannot do IPC at all).
     Device(i32),
     Other(&'static str),
 }
 
-// =============================================================================
-// DeviceBackend trait
-// =============================================================================
+// ---- DeviceBackend trait ----
 
 pub trait DeviceBackend {
     fn alloc(&self, n: usize) -> Result<DevPtr, DevErr>;
@@ -77,23 +66,14 @@ pub trait DeviceBackend {
     fn device_uuid(&self) -> [u8; 16];
 }
 
-// =============================================================================
-// CpuBackend (real host memory; IPC via a process-local registry)
-// =============================================================================
+// ---- CpuBackend (host memory; IPC via a process-local registry) ----
 //
-// "Device memory" is an ordinary heap allocation (a boxed Vec<u8>). A DevPtr is
-// the raw host address of that buffer's first byte. We track live allocations
-// (addr -> (Box, len)) in a global registry so free() can reclaim them and so
-// copy/IPC can validate the pointer and length.
-//
-// IPC is modelled with a process-local handle registry: export_ipc records the
-// (addr, len) under a freshly generated 64-byte handle key + the backend's UUID;
-// import_ipc looks the handle up and re-validates the UUID. This is testable on
-// macOS (no shm, no GPU) while preserving the cross-process semantics: a handle
-// only resolves on a backend whose UUID matches the exporter.
+// "Device memory" is a boxed Vec<u8>; DevPtr is its first byte's host address.
+// IPC is a process-local handle registry: a handle only resolves on a backend
+// whose UUID matches the exporter (preserves cross-process semantics on CI).
 
 struct CpuAlloc {
-    // Kept boxed so the backing storage address is stable for the DevPtr.
+    // Boxed so the backing address stays stable for the DevPtr.
     storage: Box<[u8]>,
     len: usize,
 }
@@ -103,7 +83,7 @@ struct CpuRegistry {
     live: HashMap<usize, CpuAlloc>,
     // handle bytes -> (addr, len, exporter uuid)
     ipc: HashMap<[u8; IPC_REF_HANDLE_LEN], (usize, usize, [u8; IPC_REF_DEVICE_UUID_LEN])>,
-    // monotonically increasing seed for synthesising IPC handle bytes
+    // seed for synthesising IPC handle bytes
     handle_seed: u64,
 }
 
@@ -122,16 +102,14 @@ fn cpu_registry() -> &'static Mutex<CpuRegistry> {
     REG.get_or_init(|| Mutex::new(CpuRegistry::new()))
 }
 
-/// Host-memory backend: "device memory" is ordinary host memory, transfers are
-/// memcpy, IPC is a process-local handle registry. Reports unified memory.
+/// Host-memory backend: memcpy transfers, process-local IPC, unified memory.
 pub struct CpuBackend {
     uuid: [u8; IPC_REF_DEVICE_UUID_LEN],
 }
 
 impl CpuBackend {
     pub fn new() -> Self {
-        // Distinct, stable per-process UUID so import_ipc can reject handles
-        // exported by a backend with a different UUID.
+        // Distinct per-process UUID so import_ipc rejects foreign handles.
         static CTR: AtomicU64 = AtomicU64::new(1);
         let id = CTR.fetch_add(1, Ordering::Relaxed);
         let mut uuid = [0u8; IPC_REF_DEVICE_UUID_LEN];
@@ -189,8 +167,7 @@ impl DeviceBackend for CpuBackend {
         reg.handle_seed += 1;
         let seed = reg.handle_seed;
         let mut bytes = [0u8; IPC_REF_HANDLE_LEN];
-        // Encode the host address + a uniquifying seed into the opaque handle so
-        // the registry lookup is deterministic and collision-free in-process.
+        // Address + uniquifying seed => collision-free in-process handle key.
         bytes[0..8].copy_from_slice(&(p.0 as u64).to_le_bytes());
         bytes[8..16].copy_from_slice(&seed.to_le_bytes());
         reg.ipc.insert(bytes, (p.0, len, self.uuid));
@@ -223,9 +200,7 @@ impl DeviceBackend for CpuBackend {
     }
 }
 
-// =============================================================================
-// MockBackend (Vec<u8> "VRAM", op recording, fault injection)
-// =============================================================================
+// ---- MockBackend (Vec<u8> VRAM, op recording, fault injection) ----
 
 /// Records each backend operation for assertions in tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,29 +215,28 @@ pub enum MockOp {
 }
 
 struct MockSlab {
-    // Each allocation is a self-contained Vec acting as fake VRAM.
+    // One Vec per allocation = fake VRAM.
     data: Vec<u8>,
 }
 
 struct MockState {
-    // DevPtr.0 is a synthetic 1-based id; the slab map holds the bytes.
+    // DevPtr.0 is a synthetic 1-based id into the slab map.
     slabs: HashMap<usize, MockSlab>,
     next_id: usize,
     log: Vec<MockOp>,
-    // op counter; when it equals `fault_at` the next faultable op fails once.
+    // when op_counter == fault_at, the next faultable op fails once.
     op_counter: usize,
     fault_at: Option<usize>,
     // exported handles: handle bytes -> (id, len, uuid)
     ipc: HashMap<[u8; IPC_REF_HANDLE_LEN], (usize, usize, [u8; IPC_REF_DEVICE_UUID_LEN])>,
     handle_seed: u64,
-    // configurable capacity (None = unbounded); total bytes currently allocated
+    // capacity (None = unbounded) and current bytes in use
     capacity: Option<usize>,
     in_use: usize,
 }
 
-/// Mock GPU backend: VRAM is a Vec<u8>, ops are recorded, faults can be
-/// injected, and the unified-memory flag is configurable so Jetson-style
-/// zero-copy paths are testable without a GPU.
+/// Mock GPU backend: Vec<u8> VRAM, op log, fault injection, configurable
+/// unified-memory flag (for Jetson zero-copy paths without a GPU).
 pub struct MockBackend {
     state: Mutex<MockState>,
     unified: bool,
@@ -322,9 +296,8 @@ impl MockBackend {
         self.alignment
     }
 
-    /// Inject a fault on the Nth (zero-based) faultable operation. The op
-    /// counter increments once per faultable backend call (alloc / copy_h2d /
-    /// copy_d2h / alloc_pinned / export_ipc / import_ipc).
+    /// Inject a one-shot fault on the Nth (zero-based) faultable op (alloc /
+    /// copy_h2d / copy_d2h / alloc_pinned / export_ipc / import_ipc).
     pub fn inject_fault_at(&self, op_index: usize) {
         let mut st = self.state.lock().unwrap();
         st.fault_at = Some(op_index);
@@ -341,7 +314,7 @@ impl MockBackend {
         st.slabs.get(&p.0).map(|s| s.data.clone())
     }
 
-    // Returns true (and consumes the fault) if this faultable op should fail.
+    // True (and consumes the fault) if this faultable op should fail.
     fn check_fault(st: &mut MockState) -> bool {
         let trip = st.fault_at == Some(st.op_counter);
         st.op_counter += 1;
@@ -385,8 +358,8 @@ impl DeviceBackend for MockBackend {
             dst,
             len: src.len(),
         });
-        // Faults on void-returning copies are recorded but cannot surface an
-        // error through the trait signature; they leave the slab untouched.
+        // Faults on void-returning copies can't surface an error; the slab is
+        // left untouched.
         if Self::check_fault(&mut st) {
             return;
         }
@@ -461,11 +434,10 @@ impl DeviceBackend for MockBackend {
                 if exp_uuid != self.uuid {
                     Err(DevErr::DeviceUuidMismatch)
                 } else if h.byte_offset as usize > len {
-                    // A sub-buffer offset past the allocation is invalid.
+                    // Offset past the allocation is invalid.
                     Err(DevErr::InvalidPointer)
                 } else {
-                    // Honor byte_offset so a sub-buffer IPC reference resolves to
-                    // base + offset, not the base pointer (matches the wire field).
+                    // Honor byte_offset: sub-buffer resolves to base + offset.
                     Ok(DevPtr(id + h.byte_offset as usize))
                 }
             }
@@ -482,20 +454,13 @@ impl DeviceBackend for MockBackend {
     }
 }
 
-// =============================================================================
-// IpcRef packet framing (device-local mirror of tenso-core's wire layout)
-// =============================================================================
+// ---- IpcRef packet framing (mirror of tenso-core's wire layout) ----
 //
-// We build/parse the 106-byte IpcRef packet directly here from tenso-core's
-// framing constants so the device crate's IPC paths are self-contained and do
-// not depend on tenso-core's (separately-owned) `write_ipc_ref`/`parse_ipc_ref`
-// bodies being filled in. The byte layout is identical, so packets round-trip
-// through tenso-core's `parse_ipc_ref`/`decode` and vice-versa.
-//
-// Layout (all integers little-endian):
-//   header[0..10]  = v4 header: magic, ver=4, flags=FLAG_GPU_IPC_REF,
-//                    dtype_code=Bytes, ndim=0, reserved=IPC_REF_DISCRIMINATOR
-//   body[10..106]  = handle[64], byte_offset:u64, nbytes:u64, device_uuid[16]
+// Builds/parses the 106-byte IpcRef packet from tenso-core's framing constants,
+// byte-identical to tenso-core so packets round-trip through its parse/decode.
+// Layout (LE): header[0..10] = magic, ver=4, flags=FLAG_GPU_IPC_REF, dtype=0,
+// ndim=0, IPC_REF_DISCRIMINATOR; body[10..106] = handle[64], byte_offset:u64,
+// nbytes:u64, device_uuid[16].
 
 fn build_ipc_packet(ipc: &IpcRef) -> Vec<u8> {
     let mut out = vec![0u8; IPC_REF_PACKET_LEN];
@@ -503,11 +468,10 @@ fn build_ipc_packet(ipc: &IpcRef) -> Vec<u8> {
     out[0..4].copy_from_slice(&MAGIC);
     out[4] = VERSION;
     out[5..7].copy_from_slice(&FLAG_GPU_IPC_REF.to_le_bytes());
-    // dtype_code byte (offset 7) is 0 for an IpcRef: tenso-core's authoritative
-    // `write_ipc_ref` writes 0 here (via write_v4_header(.., dtype=0, ..)), so we
-    // match it byte-for-byte. An IpcRef carries no element dtype of its own.
+    // dtype_code (offset 7) = 0: matches tenso-core's write_ipc_ref; an IpcRef
+    // has no element dtype.
     out[7] = 0;
-    out[8] = 0; // ndim: an IpcRef carries no inline shape
+    out[8] = 0; // ndim: no inline shape
     out[9] = IPC_REF_DISCRIMINATOR;
     // body
     let b = HEADER_BASE_V4;
@@ -533,7 +497,7 @@ fn parse_ipc_packet(bytes: &[u8]) -> Result<IpcRef, TensoError> {
     if flags & FLAG_GPU_IPC_REF == 0 {
         return Err(TensoError::Malformed);
     }
-    // Rule: an IpcRef must never carry an integrity footer.
+    // An IpcRef must never carry an integrity footer.
     if flags & FLAG_INTEGRITY != 0 {
         return Err(TensoError::Malformed);
     }
@@ -556,20 +520,17 @@ fn parse_ipc_packet(bytes: &[u8]) -> Result<IpcRef, TensoError> {
     })
 }
 
-// =============================================================================
-// GpuCodec (orchestration over tenso-core)
-// =============================================================================
+// ---- GpuCodec (orchestration over tenso-core) ----
 
 /// Result of decoding into device memory.
 pub struct DecodeResult {
     pub ptr: DevPtr,
     pub nbytes: usize,
-    /// True when unified memory let us avoid an H2D copy.
+    /// True when unified memory avoided an H2D copy.
     pub zero_copy: bool,
 }
 
-/// Drives tenso-core encode/decode against a `DeviceBackend`, including IPC
-/// reference framing (using tenso-core's IpcRef wire layout).
+/// Drives tenso-core encode/decode against a `DeviceBackend`, incl. IPC framing.
 pub struct GpuCodec<'b, B: DeviceBackend> {
     pub backend: &'b B,
 }
@@ -579,12 +540,8 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
         GpuCodec { backend }
     }
 
-    /// Encode a tensor whose body currently lives in device memory.
-    ///
-    /// Stages the device bytes back to host (D2H) and feeds them to
-    /// tenso-core's dense encoder. Under unified memory the D2H is still
-    /// performed for the host-side encoder, but the backend may treat it as a
-    /// no-cost view.
+    /// Encode a tensor whose body lives in device memory (stages D2H, then
+    /// runs tenso-core's dense encoder; D2H may be a no-cost view if unified).
     pub fn encode_from_device(
         &self,
         ptr: DevPtr,
@@ -609,10 +566,8 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
         Ok(out)
     }
 
-    /// Decode a packet's dense body straight into a caller-provided device
-    /// pointer of `dst_capacity` bytes, returning the number of body bytes
-    /// written. Errors with `OutOfMemory` if the decoded body would exceed
-    /// `dst_capacity` rather than silently truncating (or overflowing real VRAM).
+    /// Decode a packet's dense body into a caller-provided device pointer of
+    /// `dst_capacity` bytes; errors `OutOfMemory` rather than truncate.
     pub fn decode_into_device(
         &self,
         bytes: &[u8],
@@ -627,29 +582,22 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
         Ok(body.len())
     }
 
-    /// Decode a packet, allocating device memory (or, under unified memory,
-    /// aliasing host memory) and reporting whether the path was zero-copy.
-    ///
-    /// Under unified memory we still materialise the bytes in a device slab so
-    /// the returned `DevPtr` is usable, but flag `zero_copy = true` to reflect
-    /// that no discrete H2D staging copy was required on real unified hardware.
+    /// Decode a packet into device memory, reporting whether the path was
+    /// zero-copy (true under unified memory, where no H2D staging is needed).
     pub fn decode_to_device(&self, bytes: &[u8]) -> Result<DecodeResult, DevErr> {
         let body = self.decode_dense_body(bytes)?;
         self.place_body_on_device(body)
     }
 
-    /// Allocate a device slab for `body` and stage it, reporting `zero_copy`
-    /// according to the backend's unified-memory flag. Factored out so the
-    /// unified-vs-staged decision is testable without tenso-core's decode body.
+    /// Allocate a device slab for `body` and stage it; `zero_copy` follows the
+    /// backend's unified-memory flag. Factored out for testability.
     fn place_body_on_device(&self, body: &[u8]) -> Result<DecodeResult, DevErr> {
         let nbytes = body.len();
         let ptr = self.backend.alloc(nbytes)?;
         let zero_copy = self.backend.is_unified_memory();
-        // On real unified hardware the decoded host body and device memory
-        // share an address space, so no staging DMA is required; on a discrete
-        // device an explicit H2D is needed. In both cases we mirror the bytes
-        // into the (mock) slab so the returned DevPtr is dereferenceable, but
-        // the `zero_copy` flag records which physical path real hardware takes.
+        // Unified hardware needs no staging DMA; discrete needs an H2D. We
+        // always mirror into the (mock) slab so the DevPtr is dereferenceable;
+        // zero_copy records which physical path real hardware would take.
         self.backend.copy_h2d(ptr, body);
         Ok(DecodeResult {
             ptr,
@@ -664,7 +612,7 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
         let ipc = IpcRef {
             handle: h.bytes,
             byte_offset: h.byte_offset,
-            // Prefer the caller-stated size; fall back to the handle's nbytes.
+            // Prefer caller-stated size; fall back to the handle's nbytes.
             nbytes: if nbytes as u64 != 0 {
                 nbytes as u64
             } else {
@@ -679,8 +627,7 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
     /// this backend before resolving the handle to a device pointer.
     pub fn import_ipc(&self, bytes: &[u8]) -> Result<DecodeResult, DevErr> {
         let ipc = parse_ipc_packet(bytes).map_err(DevErr::Core)?;
-        // Rule: reject device_uuid mismatch at the codec layer too (defence in
-        // depth; the backend also re-checks).
+        // Reject UUID mismatch here too (defence in depth; backend re-checks).
         if ipc.device_uuid != self.backend.device_uuid() {
             return Err(DevErr::DeviceUuidMismatch);
         }
@@ -694,28 +641,23 @@ impl<'b, B: DeviceBackend> GpuCodec<'b, B> {
         Ok(DecodeResult {
             ptr,
             nbytes: ipc.nbytes as usize,
-            // An imported IPC reference is inherently zero-copy: the memory is
-            // shared, never staged.
+            // Imported IPC is inherently zero-copy: shared, never staged.
             zero_copy: true,
         })
     }
 
-    /// Decode `bytes` and borrow the dense body, mapping non-dense / IPC
-    /// packets to a device error. Shared by the decode_* paths.
+    /// Decode `bytes` and borrow the dense body; non-dense/IPC packets error.
     fn decode_dense_body<'p>(&self, bytes: &'p [u8]) -> Result<&'p [u8], DevErr> {
         match tenso_core::decode(bytes).map_err(DevErr::Core)? {
             Decoded::Dense(view) => Ok(view.body),
-            // GpuCodec's device decode paths only handle dense bodies; an
-            // IpcRef must go through import_ipc, and structured packets aren't
-            // a single contiguous device body.
+            // Only dense bodies here; IpcRef goes through import_ipc, structured
+            // packets aren't a single contiguous device body.
             _ => Err(DevErr::Other("expected dense packet for device decode")),
         }
     }
 }
 
-// =============================================================================
-// Tests (run with NO GPU; exercise CpuBackend, MockBackend, and the IPC frame)
-// =============================================================================
+// ---- Tests (no GPU: CpuBackend, MockBackend, IPC frame) ----
 
 #[cfg(test)]
 mod tests {
@@ -959,12 +901,8 @@ mod tests {
     }
 
     // ---- GpuCodec: decode_to_device unified-vs-staged branch ----
-    //
-    // We exercise the codec's place-on-device step directly (the same call
-    // `decode_to_device` makes after tenso-core decode yields a dense body), so
-    // the unified-vs-staged decision is verified at runtime WITHOUT depending on
-    // tenso-core's (separately-owned) `decode` body being filled in. The
-    // contract is: DecodeResult.zero_copy == backend.is_unified_memory().
+    // Exercises place_body_on_device directly. Contract:
+    // DecodeResult.zero_copy == backend.is_unified_memory().
 
     #[test]
     fn decode_branch_unified_reports_zero_copy() {

@@ -1,21 +1,12 @@
-//! tenso-ffi: stable C ABI over tenso-core.
+//! tenso-ffi: stable C ABI over tenso-core (`extern "C"`, `tenso_`-prefixed).
 //!
-//! All exported functions are `extern "C"`, `#[no_mangle]`, snake_case with a
-//! `tenso_` prefix. Only opaque handles cross the boundary. Buffer ownership:
-//!   - Mode A (caller-allocates): `tenso_dense_required_size` + `tenso_encode_dense_into`.
-//!   - Mode B (core-allocates):   `tenso_decode` returns an opaque `TensoView`
-//!     handle, freed by `tenso_view_free`. (There is no raw-byte-buffer Mode B
-//!     output, hence no `tenso_bytes_free`.)
+//! Mode A (caller-allocates): `tenso_dense_required_size` + `..encode_dense_into`.
+//! Mode B (core-allocates): `tenso_decode` returns an opaque `TensoView` freed
+//! by `tenso_view_free`. cbindgen regenerates `include/tenso.h` from these sigs.
 //!
-//! `cbindgen` regenerates `include/tenso.h` from these signatures (see
-//! `build.rs` + `cbindgen.toml`).
-//!
-//! Safety contract: every incoming pointer is treated as untrusted. Null
-//! pointers and zero-with-nonnull / nonzero-with-null `(ptr, len)` mismatches
-//! are rejected with a `TENSO_ERR_NULL` status (or NULL return for
-//! pointer-returning entry points) and a thread-local error message. No panic
-//! is ever allowed to unwind across the FFI boundary: the decode/encode calls
-//! into `tenso-core` are wrapped in `catch_unwind`.
+//! Safety: incoming pointers are untrusted; null / `(ptr,len)` mismatches yield
+//! `TENSO_ERR_NULL` (or NULL) + a thread-local message. No panic crosses the
+//! boundary — core calls are wrapped in `catch_unwind`.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -28,9 +19,7 @@ use std::ptr;
 use tenso_core::{decode, dense_required_size, encode_dense_into, parse_header};
 use tenso_core::{ArraySpec, Decoded, Dtype, EncodeOpts, TensoError};
 
-// =============================================================================
-// Status codes (returned by integer-returning entry points)
-// =============================================================================
+// ---- Status codes (returned by integer-returning entry points) ----
 
 pub const TENSO_OK: c_int = 0;
 pub const TENSO_ERR_TOO_SHORT: c_int = -1;
@@ -45,22 +34,18 @@ pub const TENSO_ERR_LZ4: c_int = -9;
 pub const TENSO_ERR_BUFFER_TOO_SMALL: c_int = -10;
 pub const TENSO_ERR_NULL: c_int = -11;
 pub const TENSO_ERR_MALFORMED: c_int = -12;
-/// A Rust panic was caught at the boundary (should not normally happen).
+/// A Rust panic was caught at the boundary.
 pub const TENSO_ERR_PANIC: c_int = -13;
-/// The decoded packet is structured (bundle/sparse) and has no flat dense body;
-/// use a structured decode path instead of `tenso_view_*`.
+/// Packet is structured (no flat dense body); use a structured decode path.
 pub const TENSO_ERR_UNSUPPORTED_KIND: c_int = -14;
 
-// =============================================================================
-// Thread-local last-error
-// =============================================================================
+// ---- Thread-local last-error ----
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-/// Store a message for `tenso_last_error()` on this thread. NUL bytes in the
-/// message are stripped so `CString::new` cannot fail.
+/// Store a message for `tenso_last_error()`; NUL bytes are stripped.
 fn set_last_error(msg: &str) {
     let sanitized: String = msg.chars().filter(|&c| c != '\0').collect();
     let c = CString::new(sanitized).unwrap_or_else(|_| CString::new("tenso: error").unwrap());
@@ -98,12 +83,9 @@ fn report_error(err: &TensoError) -> c_int {
     code
 }
 
-// =============================================================================
-// Opaque handles
-// =============================================================================
+// ---- Opaque handles ----
 
-/// Header view, returned by value through an out-pointer. `#[repr(C)]` so the
-/// layout is stable across the boundary; this is NOT opaque.
+/// Header view returned through an out-pointer. `#[repr(C)]`, NOT opaque.
 #[repr(C)]
 pub struct TensoHeader {
     pub version: u8,
@@ -113,22 +95,15 @@ pub struct TensoHeader {
     pub base_size: u32,
 }
 
-/// Opaque decoded-view handle. Internals are private to the ffi crate.
-///
-/// We own the packet bytes for the view's lifetime and pre-extract the owned
-/// `shape`/`dtype`/`body` so accessor pointers stay stable and valid until
-/// `tenso_view_free`. `body` is a fresh allocation (owned), which keeps the
-/// pointer valid even when the underlying decode produced an owned (e.g.
-/// decompressed) buffer.
+/// Opaque decoded-view handle. Owns `shape`/`dtype`/`body` so accessor
+/// pointers stay valid until `tenso_view_free` (`body` is a fresh allocation).
 pub struct TensoView {
     dtype_code: u8,
     shape: Vec<u32>,
     body: Vec<u8>,
 }
 
-// =============================================================================
-// Header
-// =============================================================================
+// ---- Header ----
 
 /// Parse a packet header into `out`. Returns a TENSO_* status code.
 ///
@@ -154,8 +129,7 @@ pub unsafe extern "C" fn tenso_parse_header(
     let result = catch_unwind(AssertUnwindSafe(|| parse_header(bytes)));
     match result {
         Ok(Ok(h)) => {
-            // ndim/base_size are bounded (MAX_NDIM, header sizes); the casts to
-            // u32 are lossless in practice but saturate defensively.
+            // ndim/base_size are bounded; casts saturate defensively.
             let hdr = TensoHeader {
                 version: h.version,
                 flags: h.flags,
@@ -174,17 +148,13 @@ pub unsafe extern "C" fn tenso_parse_header(
     }
 }
 
-// =============================================================================
-// Dense encode (Mode A: caller-allocates)
-// =============================================================================
+// ---- Dense encode (Mode A: caller-allocates) ----
 
-/// Build an `ArraySpec`/`EncodeOpts` from C args, validating pointers.
-///
-/// Returns `Err(status)` on any pointer/dtype problem (with the thread-local
-/// error already set), or `Ok((spec, opts))` on success.
+/// Build an `ArraySpec`/`EncodeOpts` from C args (sets thread-local error on
+/// `Err`).
 ///
 /// # Safety
-/// Callers guarantee `data`/`shape` point to `data_len`/`ndim` valid elements.
+/// `data`/`shape` must point to `data_len`/`ndim` valid elements.
 unsafe fn build_spec_opts<'a>(
     data: *const u8,
     data_len: usize,
@@ -202,9 +172,7 @@ unsafe fn build_spec_opts<'a>(
     let data_slice = slice_from_raw(data, data_len)?;
     let shape_slice = slice_from_raw_t::<u32>(shape, ndim)?;
 
-    // Default alignment (0) falls back to the protocol default; otherwise it
-    // must be a power of two. tenso-core re-validates, but a clear message here
-    // helps callers.
+    // alignment 0 => protocol default; else power-of-two (core re-validates).
     let alignment = if alignment == 0 {
         tenso_core::ALIGNMENT
     } else {
@@ -227,8 +195,7 @@ unsafe fn build_spec_opts<'a>(
 /// Compute the required output size for a dense encode into `*out_size`.
 ///
 /// # Safety
-/// `data` must point to `data_len` readable bytes; `shape` to `ndim` u32s;
-/// `out_size` must be a valid, writable `usize`.
+/// `data`: `data_len` readable bytes; `shape`: `ndim` u32s; `out_size` writable.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_dense_required_size(
     data: *const u8,
@@ -335,22 +302,14 @@ pub unsafe extern "C" fn tenso_encode_dense_into(
     }
 }
 
-// =============================================================================
-// Decode (Mode B: core-allocates an opaque view)
-// =============================================================================
+// ---- Decode (Mode B: core-allocates an opaque view) ----
 
-/// Decode a packet, returning an opaque `TensoView*` (NULL on error; check
-/// `tenso_last_error`). Free with `tenso_view_free`.
-///
-/// Only flat dense and quantized tensors expose a single body through the
-/// `tenso_view_*` accessors. Bundles, sparse, string, ragged, and IPC-ref
-/// packets decode successfully in core but have no single flat body; this entry
-/// point reports `TENSO_ERR_UNSUPPORTED_KIND` for them (via `tenso_last_error`)
-/// and returns NULL.
+/// Decode a packet to an opaque `TensoView*` (NULL on error; check
+/// `tenso_last_error`). Free with `tenso_view_free`. Only flat dense/quantized
+/// expose a body; structured kinds yield `TENSO_ERR_UNSUPPORTED_KIND` + NULL.
 ///
 /// # Safety
-/// `data` must point to `len` readable bytes. The returned view owns its own
-/// copy of the relevant body, so it stays valid after `data` is freed.
+/// `data` must point to `len` readable bytes; the view owns its body copy.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_decode(data: *const u8, len: usize) -> *mut TensoView {
     clear_last_error();
@@ -359,16 +318,14 @@ pub unsafe extern "C" fn tenso_decode(data: *const u8, len: usize) -> *mut Tenso
         Err(_) => return ptr::null_mut(),
     };
 
-    // Copy the packet so the borrowed `Decoded` cannot outlive `data`, and so
-    // the eventual view is fully self-owned.
+    // Copy the packet so the view is fully self-owned (outlives `data`).
     let owned: Vec<u8> = bytes.to_vec();
 
     let result = catch_unwind(AssertUnwindSafe(|| build_view(&owned)));
     match result {
         Ok(Ok(view)) => Box::into_raw(Box::new(view)),
         Ok(Err(code)) => {
-            // build_view already set the thread-local message for the success-
-            // but-unsupported case; map_decode_err set it for core errors.
+            // build_view / report_error already set the thread-local message.
             let _ = code;
             ptr::null_mut()
         }
@@ -391,8 +348,7 @@ fn build_view(owned: &[u8]) -> Result<TensoView, c_int> {
         Decoded::Quantized(q) => Ok(TensoView {
             dtype_code: q.dtype.code(),
             shape: q.shape,
-            // Quantized "body" surfaced through the flat accessors is the packed
-            // payload. Richer scale/zero-point access is a future structured FFI.
+            // Flat body = packed payload; scale/zero-point is a future API.
             body: q.packed.to_vec(),
         }),
         Decoded::Bundle(_)
@@ -409,10 +365,10 @@ fn build_view(owned: &[u8]) -> Result<TensoView, c_int> {
     }
 }
 
-/// Borrow a `&TensoView` from a raw pointer, returning `None` on null.
+/// Borrow a `&TensoView` from a raw pointer (`None` on null).
 ///
 /// # Safety
-/// `view` must be a live pointer from `tenso_decode` or null.
+/// `view` must be live from `tenso_decode` or null.
 unsafe fn view_ref<'a>(view: *const TensoView) -> Option<&'a TensoView> {
     if view.is_null() {
         None
@@ -424,7 +380,7 @@ unsafe fn view_ref<'a>(view: *const TensoView) -> Option<&'a TensoView> {
 /// Dtype code of a decoded view (0 if `view` is null).
 ///
 /// # Safety
-/// `view` must be a live pointer from `tenso_decode` or null.
+/// `view` must be live from `tenso_decode` or null.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_view_dtype(view: *const TensoView) -> u8 {
     match view_ref(view) {
@@ -436,7 +392,7 @@ pub unsafe extern "C" fn tenso_view_dtype(view: *const TensoView) -> u8 {
 /// Number of dimensions of a decoded view (0 if `view` is null).
 ///
 /// # Safety
-/// `view` must be a live pointer from `tenso_decode` or null.
+/// `view` must be live from `tenso_decode` or null.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_view_ndim(view: *const TensoView) -> usize {
     match view_ref(view) {
@@ -446,13 +402,10 @@ pub unsafe extern "C" fn tenso_view_ndim(view: *const TensoView) -> usize {
 }
 
 /// Pointer to the view's shape array (`tenso_view_ndim` u32 entries), or NULL.
-///
-/// For a 0-d (scalar) tensor `ndim == 0` and this may return a non-null but
-/// zero-length pointer; callers must gate on `tenso_view_ndim`.
+/// For 0-d tensors may be non-null but zero-length; gate on `tenso_view_ndim`.
 ///
 /// # Safety
-/// `view` must be a live pointer from `tenso_decode` or null. The returned
-/// pointer is valid until `tenso_view_free(view)`.
+/// `view` must be live from `tenso_decode` or null; valid until `tenso_view_free`.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_view_shape(view: *const TensoView) -> *const u32 {
     match view_ref(view) {
@@ -464,8 +417,7 @@ pub unsafe extern "C" fn tenso_view_shape(view: *const TensoView) -> *const u32 
 /// Pointer to the view's body bytes, or NULL.
 ///
 /// # Safety
-/// `view` must be a live pointer from `tenso_decode` or null. The returned
-/// pointer is valid until `tenso_view_free(view)`.
+/// `view` must be live from `tenso_decode` or null; valid until `tenso_view_free`.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_view_body_ptr(view: *const TensoView) -> *const u8 {
     match view_ref(view) {
@@ -477,7 +429,7 @@ pub unsafe extern "C" fn tenso_view_body_ptr(view: *const TensoView) -> *const u
 /// Length in bytes of the view's body (0 if `view` is null).
 ///
 /// # Safety
-/// `view` must be a live pointer from `tenso_decode` or null.
+/// `view` must be live from `tenso_decode` or null.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_view_body_len(view: *const TensoView) -> usize {
     match view_ref(view) {
@@ -489,8 +441,7 @@ pub unsafe extern "C" fn tenso_view_body_len(view: *const TensoView) -> usize {
 /// Free a view returned by `tenso_decode`. No-op on null.
 ///
 /// # Safety
-/// `view` must be a pointer from `tenso_decode`, freed at most once. After this
-/// call the pointer and any accessor results derived from it are dangling.
+/// `view` from `tenso_decode`, freed at most once; dangling afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn tenso_view_free(view: *mut TensoView) {
     if !view.is_null() {
@@ -498,21 +449,14 @@ pub unsafe extern "C" fn tenso_view_free(view: *mut TensoView) {
     }
 }
 
-// NOTE: there is intentionally no `tenso_bytes_free`. The only Mode B
-// (core-allocates) path is `tenso_decode`, which returns an opaque `TensoView`
-// handle freed by `tenso_view_free`; no exported function hands a raw
-// `(ptr, len)` byte buffer to the caller. A free fn with no matching allocator
-// is dead and a latent-UB footgun (`Vec::from_raw_parts` requires a global-
-// allocator `Vec<u8>` with `capacity == len`), so it was removed.
+// No `tenso_bytes_free`: no exported fn hands the caller a raw `(ptr, len)`
+// buffer (Mode B returns an opaque `TensoView`), so a free fn would be dead and
+// a latent-UB footgun (`Vec::from_raw_parts` needs capacity == len).
 
-// =============================================================================
-// Error reporting
-// =============================================================================
+// ---- Error reporting ----
 
-/// Return a pointer to a thread-local, NUL-terminated description of the last
-/// error on this thread (valid until the next ffi call on the same thread).
-///
-/// Returns an empty string `""` (not NULL) when there is no recorded error.
+/// Pointer to a thread-local NUL-terminated description of the last error
+/// (valid until the next ffi call on this thread); empty `""` (not NULL) if none.
 #[no_mangle]
 pub extern "C" fn tenso_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| match slot.borrow().as_ref() {
@@ -524,15 +468,10 @@ pub extern "C" fn tenso_last_error() -> *const c_char {
 /// Static empty C string used when no error is set.
 static EMPTY: [u8; 1] = [0];
 
-// =============================================================================
-// Pointer/slice guards (untrusted inputs)
-// =============================================================================
+// ---- Pointer/slice guards (untrusted inputs) ----
 
-/// Build a `&[u8]` from a raw pointer + length, rejecting null/len mismatches.
-///
-/// - `(null, 0)` -> empty slice (legal: a zero-length input).
-/// - `(null, n>0)` -> `TENSO_ERR_NULL`.
-/// - `(nonnull, 0)` -> empty slice (we never deref).
+/// `&[u8]` from a raw ptr + len: `(null,0)`/`(nonnull,0)` => empty,
+/// `(null,n>0)` => `TENSO_ERR_NULL`.
 ///
 /// # Safety
 /// If non-null, `data` must be readable for `len` bytes.

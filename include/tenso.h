@@ -37,30 +37,23 @@
 #define TENSO_ERR_MALFORMED -12
 
 /**
- * A Rust panic was caught at the boundary (should not normally happen).
+ * A Rust panic was caught at the boundary.
  */
 #define TENSO_ERR_PANIC -13
 
 /**
- * The decoded packet is structured (bundle/sparse) and has no flat dense body;
- * use a structured decode path instead of `tenso_view_*`.
+ * Packet is structured (no flat dense body); use a structured decode path.
  */
 #define TENSO_ERR_UNSUPPORTED_KIND -14
 
 /**
- * Opaque decoded-view handle. Internals are private to the ffi crate.
- *
- * We own the packet bytes for the view's lifetime and pre-extract the owned
- * `shape`/`dtype`/`body` so accessor pointers stay stable and valid until
- * `tenso_view_free`. `body` is a fresh allocation (owned), which keeps the
- * pointer valid even when the underlying decode produced an owned (e.g.
- * decompressed) buffer.
+ * Opaque decoded-view handle. Owns `shape`/`dtype`/`body` so accessor
+ * pointers stay valid until `tenso_view_free` (`body` is a fresh allocation).
  */
 typedef struct TensoView TensoView;
 
 /**
- * Header view, returned by value through an out-pointer. `#[repr(C)]` so the
- * layout is stable across the boundary; this is NOT opaque.
+ * Header view returned through an out-pointer. `#[repr(C)]`, NOT opaque.
  */
 typedef struct {
     uint8_t version;
@@ -87,8 +80,7 @@ extern "C" {
  * Compute the required output size for a dense encode into `*out_size`.
  *
  * # Safety
- * `data` must point to `data_len` readable bytes; `shape` to `ndim` u32s;
- * `out_size` must be a valid, writable `usize`.
+ * `data`: `data_len` readable bytes; `shape`: `ndim` u32s; `out_size` writable.
  */
 
 int tenso_dense_required_size(const uint8_t *data,
@@ -124,18 +116,12 @@ int tenso_encode_dense_into(const uint8_t *data,
 ;
 
 /**
- * Decode a packet, returning an opaque `TensoView*` (NULL on error; check
- * `tenso_last_error`). Free with `tenso_view_free`.
- *
- * Only flat dense and quantized tensors expose a single body through the
- * `tenso_view_*` accessors. Bundles, sparse, string, ragged, and IPC-ref
- * packets decode successfully in core but have no single flat body; this entry
- * point reports `TENSO_ERR_UNSUPPORTED_KIND` for them (via `tenso_last_error`)
- * and returns NULL.
+ * Decode a packet to an opaque `TensoView*` (NULL on error; check
+ * `tenso_last_error`). Free with `tenso_view_free`. Only flat dense/quantized
+ * expose a body; structured kinds yield `TENSO_ERR_UNSUPPORTED_KIND` + NULL.
  *
  * # Safety
- * `data` must point to `len` readable bytes. The returned view owns its own
- * copy of the relevant body, so it stays valid after `data` is freed.
+ * `data` must point to `len` readable bytes; the view owns its body copy.
  */
  TensoView *tenso_decode(const uint8_t *data, uintptr_t len) ;
 
@@ -143,7 +129,7 @@ int tenso_encode_dense_into(const uint8_t *data,
  * Dtype code of a decoded view (0 if `view` is null).
  *
  * # Safety
- * `view` must be a live pointer from `tenso_decode` or null.
+ * `view` must be live from `tenso_decode` or null.
  */
  uint8_t tenso_view_dtype(const TensoView *view) ;
 
@@ -151,19 +137,16 @@ int tenso_encode_dense_into(const uint8_t *data,
  * Number of dimensions of a decoded view (0 if `view` is null).
  *
  * # Safety
- * `view` must be a live pointer from `tenso_decode` or null.
+ * `view` must be live from `tenso_decode` or null.
  */
  uintptr_t tenso_view_ndim(const TensoView *view) ;
 
 /**
  * Pointer to the view's shape array (`tenso_view_ndim` u32 entries), or NULL.
- *
- * For a 0-d (scalar) tensor `ndim == 0` and this may return a non-null but
- * zero-length pointer; callers must gate on `tenso_view_ndim`.
+ * For 0-d tensors may be non-null but zero-length; gate on `tenso_view_ndim`.
  *
  * # Safety
- * `view` must be a live pointer from `tenso_decode` or null. The returned
- * pointer is valid until `tenso_view_free(view)`.
+ * `view` must be live from `tenso_decode` or null; valid until `tenso_view_free`.
  */
  const uint32_t *tenso_view_shape(const TensoView *view) ;
 
@@ -171,8 +154,7 @@ int tenso_encode_dense_into(const uint8_t *data,
  * Pointer to the view's body bytes, or NULL.
  *
  * # Safety
- * `view` must be a live pointer from `tenso_decode` or null. The returned
- * pointer is valid until `tenso_view_free(view)`.
+ * `view` must be live from `tenso_decode` or null; valid until `tenso_view_free`.
  */
  const uint8_t *tenso_view_body_ptr(const TensoView *view) ;
 
@@ -180,7 +162,7 @@ int tenso_encode_dense_into(const uint8_t *data,
  * Length in bytes of the view's body (0 if `view` is null).
  *
  * # Safety
- * `view` must be a live pointer from `tenso_decode` or null.
+ * `view` must be live from `tenso_decode` or null.
  */
  uintptr_t tenso_view_body_len(const TensoView *view) ;
 
@@ -188,16 +170,13 @@ int tenso_encode_dense_into(const uint8_t *data,
  * Free a view returned by `tenso_decode`. No-op on null.
  *
  * # Safety
- * `view` must be a pointer from `tenso_decode`, freed at most once. After this
- * call the pointer and any accessor results derived from it are dangling.
+ * `view` from `tenso_decode`, freed at most once; dangling afterwards.
  */
  void tenso_view_free(TensoView *view) ;
 
 /**
- * Return a pointer to a thread-local, NUL-terminated description of the last
- * error on this thread (valid until the next ffi call on the same thread).
- *
- * Returns an empty string `""` (not NULL) when there is no recorded error.
+ * Pointer to a thread-local NUL-terminated description of the last error
+ * (valid until the next ffi call on this thread); empty `""` (not NULL) if none.
  */
  const char *tenso_last_error(void) ;
 

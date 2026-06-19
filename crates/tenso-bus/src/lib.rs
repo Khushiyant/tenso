@@ -1,42 +1,9 @@
-//! tenso-bus: a shared-memory tensor bus built over tenso-core.
+//! tenso-bus: a shared-memory tensor bus over tenso-core (wire = tenso-core packets).
 //!
-//! Two transport shapes, both designed for the robotics hot path:
-//!
-//!   - [`LatestValueBus`] — a triple-buffered **seqlock** single-slot buffer for
-//!     telemetry-style publish/subscribe. A single writer publishes; any number
-//!     of readers always observe the newest *complete* frame with a lock-free,
-//!     wait-free (bounded-retry) read. No torn reads.
-//!
-//!   - [`RingBus`] — an **SPMC** ring of fixed-stride slots with a configurable
-//!     [`OverflowPolicy`] (`DropOldest`, `Block`, `Error`). One producer writes,
-//!     many consumers each track their own read cursor and can detect lag.
-//!
-//! Packets on the wire are exactly tenso-core packets, so any reader (Rust,
-//! C/C++, ROS2) decodes them with `tenso_core::decode`. Every packet is
-//! validated with `tenso_core::parse_header` before it is accepted.
-//!
-//! ## Synchronization model
-//!
-//! The fast paths are lock-free:
-//!   - latest-value uses a seqlock (odd sequence ⇒ write in progress) plus a
-//!     triple-buffer index so the writer never blocks readers and readers never
-//!     block the writer.
-//!   - the ring uses a monotonically increasing write index with per-slot
-//!     publication sequence numbers (a slot-local seqlock) so readers detect a
-//!     half-written or overwritten slot.
-//!
-//! A robust POSIX `pthread_mutex` (see the [`shm_mutex`] module) lives in the
-//! header for the **slow path only**: serializing multiple *publishers* /
-//! *producers* across processes and recovering (on Linux) from a producer that
-//! crashed mid-publish. On macOS the robust attribute is unavailable, so the
-//! mutex degrades to a plain process-shared mutex (no `EOWNERDEAD` recovery) and
-//! the seqlock alone still prevents torn reads.
-//!
-//! ## Instrumentation
-//!
-//! Both buses keep [`BusStats`] counters (`copies`, `drops`, `lag_events`,
-//! `recoveries`) in the shared header so producers and consumers in any process
-//! can observe throughput/loss.
+//! [`LatestValueBus`]: triple-buffered seqlock single-slot pub/sub (1 writer, N lock-free readers, no torn reads).
+//! [`RingBus`]: SPMC ring of fixed-stride slots with an [`OverflowPolicy`] (1 producer, N cursor-tracking consumers).
+//! Fast paths are lock-free; a robust POSIX `pthread_mutex` ([`shm_mutex`]) serializes cross-process writers
+//! on the slow path and (Linux only) recovers a crashed mid-publish writer. [`BusStats`] counters live in the header.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -44,8 +11,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tenso_core::TensoError;
 
-/// 64-byte SIMD/cache-line alignment used for all slot bodies (matches the
-/// tenso-core wire alignment so a decoded body is itself well-aligned).
+/// 64-byte SIMD/cache-line alignment for all slot bodies (matches tenso-core wire alignment).
 pub const ALIGNMENT: usize = 64;
 
 /// Errors from bus operations.
@@ -75,29 +41,16 @@ impl From<TensoError> for BusError {
 
 /// Overflow behaviour for [`RingBus::push`] when the ring is full.
 ///
-/// BACKPRESSURE LIMITATION: `Block` and `Error` decide "is a slot still unread?"
-/// from the PRODUCER handle's own `read_cursor`, which the producer only advances
-/// when it also consumes (loopback). In a true SPMC topology (one producer handle,
-/// separate consumer handles/processes) the producer cannot see the independent
-/// consumer cursors — there is no shared minimum-consumer-cursor in the ring
-/// header — so `Block` can never observe a slot being freed and will busy-wait to
-/// the lock timeout and then return `Full`, and `Error` reports `Full` purely from
-/// the producer's own non-advancing cursor. Use `Block`/`Error` only in a
-/// single-handle (loopback) configuration; for multi-process consumers use the
-/// default `DropOldest`.
+/// BACKPRESSURE LIMITATION: `Block`/`Error` judge fullness from the producer's own `read_cursor`
+/// (advanced only in loopback), not the independent SPMC consumer cursors, so in true SPMC they
+/// just time out / report `Full`. Use them only single-handle; for multi-process consumers use `DropOldest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowPolicy {
-    /// Overwrite the oldest unread slot (lossy, never blocks the producer).
-    /// This is the default for the telemetry hot path and the only policy that
-    /// behaves correctly for multi-process SPMC consumers.
+    /// Overwrite oldest unread slot (lossy, never blocks); default and only correct policy for SPMC.
     DropOldest,
-    /// Block (busy-wait with a short backoff) until a consumer frees a slot.
-    /// Only effective in a single-handle/loopback config (see the type-level
-    /// BACKPRESSURE LIMITATION note); in true SPMC it times out and returns `Full`.
+    /// Busy-wait until a consumer frees a slot; effective only loopback (see BACKPRESSURE LIMITATION).
     Block,
-    /// Return [`BusError::Full`] immediately when the producer's own cursor shows
-    /// the ring is full. See the type-level BACKPRESSURE LIMITATION note: this is
-    /// meaningful only in a single-handle/loopback config.
+    /// Return [`BusError::Full`] when the producer's own cursor shows full; meaningful only loopback.
     Error,
 }
 
@@ -111,10 +64,7 @@ impl Default for OverflowPolicy {
 pub struct BusConfig<'a> {
     /// POSIX shm name (e.g. "/tenso_bus_camera"). Must start with '/'.
     pub name: &'a str,
-    /// Capacity hint.
-    ///
-    /// - For [`RingBus`] this is the number of slots.
-    /// - For [`LatestValueBus`] it is ignored (always triple-buffered).
+    /// Capacity hint: slot count for [`RingBus`]; ignored by [`LatestValueBus`] (always triple-buffered).
     pub capacity: usize,
     /// Create (true) vs attach to an existing segment (false).
     pub create: bool,
@@ -146,20 +96,14 @@ pub struct BusStats {
 
 // =============================================================================
 // Cross-process robust mutex (POSIX pthread_mutex in shared memory)
-//
-// Ported from the root crate's `shm_mutex` module (src/lib.rs). Used here only
-// for the slow path: serializing multiple writers/publishers across processes
-// and recovering from a writer that died mid-critical-section.
+// Slow path only: serialize cross-process writers + recover a writer that died mid-section.
 // =============================================================================
 
 #[cfg(unix)]
 pub mod shm_mutex {
     use core::time::Duration;
 
-    /// Bytes reserved for one `pthread_mutex_t` in shared memory.
-    ///
-    /// On macOS a `pthread_mutex_t` is 64 bytes; on Linux it is 40. We reserve
-    /// 64 unconditionally so the header layout is identical across platforms.
+    /// Bytes reserved for one `pthread_mutex_t` (64 = macOS size; over-reserved on Linux for layout parity).
     pub const MUTEX_SIZE: usize = 64;
 
     extern "C" {
@@ -187,11 +131,10 @@ pub mod shm_mutex {
         fn pthread_mutex_consistent(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
     }
 
-    /// Initialize a process-shared mutex at the given memory location.
+    /// Initialize a process-shared mutex at `ptr`.
     ///
     /// # Safety
-    /// `ptr` must point to at least [`MUTEX_SIZE`] bytes of zeroed shared memory
-    /// that outlives every user of the mutex.
+    /// `ptr` must point to >= [`MUTEX_SIZE`] zeroed shared bytes outliving all users.
     pub unsafe fn init_mutex(ptr: *mut u8) -> Result<(), &'static str> {
         let mutex = ptr as *mut libc::pthread_mutex_t;
         let mut attr: libc::pthread_mutexattr_t = core::mem::zeroed();
@@ -204,9 +147,7 @@ pub mod shm_mutex {
             return Err("pthread_mutexattr_setpshared failed");
         }
 
-        // On Linux, enable a robust mutex so we can recover from crashed holders.
-        // macOS lacks PTHREAD_MUTEX_ROBUST; it gracefully degrades to a plain
-        // process-shared mutex.
+        // Linux: robust mutex for crashed-holder recovery; macOS lacks it and degrades to plain.
         #[cfg(target_os = "linux")]
         {
             if pthread_mutexattr_setrobust(&mut attr, libc::PTHREAD_MUTEX_ROBUST) != 0 {
@@ -223,13 +164,10 @@ pub mod shm_mutex {
         Ok(())
     }
 
-    /// Lock the mutex with a timeout.
-    ///
-    /// Returns `Ok(true)` if the lock was acquired after recovering from a dead
-    /// owner (Linux robust mutex), `Ok(false)` on a normal acquisition.
+    /// Lock with a timeout; `Ok(true)` = acquired after dead-owner recovery, `Ok(false)` = normal.
     ///
     /// # Safety
-    /// `ptr` must reference a mutex previously initialized with [`init_mutex`].
+    /// `ptr` must reference a mutex initialized with [`init_mutex`].
     pub unsafe fn lock_mutex(ptr: *mut u8, timeout: Duration) -> Result<bool, &'static str> {
         let mutex = ptr as *mut libc::pthread_mutex_t;
         let deadline = std::time::Instant::now() + timeout;
@@ -261,8 +199,7 @@ pub mod shm_mutex {
 
     /// Unlock the mutex.
     ///
-    /// # Safety
-    /// `ptr` must reference a mutex this thread currently holds.
+    /// # Safety: `ptr` must reference a mutex this thread holds.
     pub unsafe fn unlock_mutex(ptr: *mut u8) -> Result<(), &'static str> {
         let mutex = ptr as *mut libc::pthread_mutex_t;
         if pthread_mutex_unlock(mutex) != 0 {
@@ -273,8 +210,7 @@ pub mod shm_mutex {
 
     /// Destroy the mutex.
     ///
-    /// # Safety
-    /// `ptr` must reference a mutex no other thread/process is using.
+    /// # Safety: `ptr` must reference a mutex no other thread/process is using.
     pub unsafe fn destroy_mutex(ptr: *mut u8) -> Result<(), &'static str> {
         let mutex = ptr as *mut libc::pthread_mutex_t;
         if pthread_mutex_destroy(mutex) != 0 {
@@ -292,11 +228,7 @@ pub mod shm_mutex {
 mod shm {
     use super::BusError;
 
-    /// An mmap'd POSIX shared-memory segment.
-    ///
-    /// Owns the mapping; unmaps on drop. The backing shm object is *not*
-    /// unlinked on drop (the bus may outlive a single process), but the creator
-    /// can call [`Segment::unlink`] explicitly.
+    /// An mmap'd POSIX shm segment; unmaps on drop but does not unlink (use [`Segment::unlink`]).
     pub struct Segment {
         ptr: *mut u8,
         len: usize,
@@ -304,17 +236,12 @@ mod shm {
         creator: bool,
     }
 
-    // The mapping is process-shared; raw pointer access is synchronized by the
-    // bus's seqlock/mutex discipline, not by the type system.
+    // Process-shared mapping; pointer access synchronized by the bus seqlock/mutex, not the type system.
     unsafe impl Send for Segment {}
     unsafe impl Sync for Segment {}
 
     impl Segment {
-        /// Create or attach a shm segment of exactly `len` bytes.
-        ///
-        /// When `create` is true the object is created (or truncated to `len`)
-        /// and zero-filled by the kernel. When false it is attached read/write
-        /// and must already be at least `len` bytes.
+        /// Create or attach a shm segment of `len` bytes (create => zero-filled; attach => must be >= `len`).
         pub fn open(name: &str, len: usize, create: bool) -> Result<Self, BusError> {
             if len == 0 {
                 return Err(BusError::Shm("zero-length segment"));
@@ -417,11 +344,7 @@ mod shm {
 /// Magic stamped at the front of a bus segment so attachers can sanity-check.
 const BUS_MAGIC: u32 = u32::from_le_bytes(*b"TBUS");
 
-/// Layout of the latest-value (triple-buffer seqlock) segment header.
-///
-/// `#[repr(C)]` so the layout is stable across processes/architectures of the
-/// same ABI. All multi-process mutable fields are atomics so the compiler does
-/// not assume exclusive access.
+/// Latest-value (triple-buffer seqlock) header. `#[repr(C)]` for cross-process layout; mutable fields are atomics.
 #[repr(C)]
 struct LvbHeader {
     magic: AtomicU32,
@@ -473,8 +396,7 @@ struct RingHeader {
 struct SlotMeta {
     /// Slot-local seqlock: even = stable, odd = write in progress.
     seq: AtomicU64,
-    /// Absolute write index of the packet currently in this slot (for lag
-    /// detection: a reader knows the slot was reused if this advanced).
+    /// Absolute write index of the packet in this slot (lag detection: reader sees reuse if it advanced).
     write_index: AtomicU64,
     /// Payload byte length.
     len: AtomicU32,
@@ -496,18 +418,16 @@ const fn aligned_hdr(n: usize) -> usize {
 // LatestValueBus — triple-buffered seqlock (lock-free reader, single writer)
 // =============================================================================
 
-/// A shared-memory single-slot buffer where the newest packet wins.
+/// Shared-memory single-slot buffer where the newest packet wins.
 ///
-/// Triple-buffered: the writer always writes into the buffer that is neither the
-/// current `front` nor the one a reader could currently be reading, then flips
-/// `front`. Readers use the seqlock to retry if a publish raced with their read,
-/// guaranteeing tear-free reads without ever blocking the writer.
+/// Triple-buffered: writer fills a buffer that is neither `front` nor a reader's, then flips `front`;
+/// readers retry via the seqlock for tear-free reads without ever blocking the writer.
 pub struct LatestValueBus {
     #[cfg(unix)]
     seg: shm::Segment,
-    /// Cached pointers/strides resolved from the header at open time.
+    /// Stride resolved from the header at open time.
     slot_stride: usize,
-    /// Default timeout for the slow-path publisher mutex.
+    /// Slow-path publisher mutex timeout.
     lock_timeout: core::time::Duration,
 }
 
@@ -522,24 +442,18 @@ impl LatestValueBus {
         Self::header_bytes() + 3 * align_up(slot_stride, ALIGNMENT)
     }
 
-    /// Create or attach a latest-value bus.
-    ///
-    /// `cfg.capacity` is interpreted as the maximum payload bytes per frame
-    /// (the slot stride). It is rounded up to 64 bytes. A floor of 64 bytes
-    /// applies so tiny configs still hold a header-only packet.
+    /// Create or attach a latest-value bus. `cfg.capacity` = max payload bytes/frame, rounded up to >= 64.
     #[cfg(unix)]
     pub fn open(cfg: &BusConfig) -> Result<Self, BusError> {
         let slot_stride = align_up(cfg.capacity.max(ALIGNMENT), ALIGNMENT);
         let size = Self::segment_size(slot_stride);
         let seg = shm::Segment::open(cfg.name, size, cfg.create)?;
 
-        // Safety: segment is at least `size` bytes; LvbHeader fits at offset 0.
+        // SAFETY: segment is >= `size` bytes; LvbHeader fits at offset 0.
         let hdr = unsafe { &*(seg.as_ptr() as *const LvbHeader) };
 
         if cfg.create {
-            // Zero-filled by the kernel. Initialize the mutex first, then the
-            // header fields; `magic_init` publishes `magic` last so an attacher
-            // that observes the magic also observes a ready mutex + fields.
+            // Init mutex first; magic_init publishes `magic` last so attachers seeing it see ready fields.
             unsafe {
                 let mptr = seg.as_ptr().add(Self::mutex_offset());
                 shm_mutex::init_mutex(mptr).map_err(BusError::Shm)?;
@@ -560,7 +474,7 @@ impl LatestValueBus {
     #[cfg(unix)]
     #[inline]
     fn mutex_offset() -> usize {
-        // The mutex is the trailing field of LvbHeader.
+        // Mutex is the trailing field of LvbHeader.
         core::mem::size_of::<LvbHeader>() - shm_mutex::MUTEX_SIZE
     }
 
@@ -581,9 +495,7 @@ impl LatestValueBus {
         }
     }
 
-    /// Atomically replace the stored packet with `packet` (single writer).
-    ///
-    /// The packet must be a valid tenso-core packet and fit in the slot stride.
+    /// Atomically replace the stored packet (single writer); must be a valid tenso-core packet that fits the stride.
     #[cfg(unix)]
     pub fn publish(&self, packet: &[u8]) -> Result<(), BusError> {
         // Validate the wire packet before accepting it.
@@ -594,24 +506,15 @@ impl LatestValueBus {
 
         let hdr = self.header();
 
-        // Slow path: serialize concurrent publishers across processes. With a
-        // single writer this is uncontended; with several it provides ordering
-        // and (on Linux) crash recovery.
+        // Slow path: serialize concurrent cross-process publishers (uncontended for a lone writer).
         unsafe {
             let mptr = self.seg.as_ptr().add(Self::mutex_offset());
             match shm_mutex::lock_mutex(mptr, self.lock_timeout) {
                 Ok(recovered) => {
                     if recovered {
                         hdr.recoveries.fetch_add(1, Ordering::Relaxed);
-                        // A writer died mid-publish (EOWNERDEAD) holding the lock,
-                        // possibly leaving the seqlock ODD ("write in progress").
-                        // Each publish adds 2 (parity-preserving), so an odd seq
-                        // would wedge every reader's tear-check FOREVER. Restore
-                        // even parity by completing the abandoned increment before
-                        // republishing. `front` already points at a fully-written
-                        // buffer (the dead writer copied + stored len before going
-                        // odd, and either had not flipped front or flipped it to
-                        // that complete buffer), so readers observe an intact frame.
+                        // Crashed writer may leave seq ODD, wedging every reader's tear-check; finish the
+                        // abandoned increment to restore even parity (`front` still points at an intact frame).
                         if hdr.seq.load(Ordering::Acquire) & 1 == 1 {
                             hdr.seq.fetch_add(1, Ordering::AcqRel); // odd -> even
                         }
@@ -621,9 +524,7 @@ impl LatestValueBus {
             }
         }
 
-        // Pick a back buffer: anything that is not the current front. With three
-        // buffers a reader can hold at most one (the front it latched), so the
-        // writer always has a free buffer that no reader is touching.
+        // Pick a back buffer (not front): with 3 buffers a reader holds at most one, so one is always free.
         let front = hdr.front.load(Ordering::Acquire) as usize;
         let back = match front {
             0 => 1,
@@ -653,22 +554,13 @@ impl LatestValueBus {
 
     /// Read the latest packet into `out` (tear-free), returning its length.
     ///
-    /// Lock-free, bounded-retry. Returns [`BusError::Empty`] if nothing has been
-    /// published yet, [`BusError::OutputTooSmall`] if `out` cannot hold the
-    /// frame.
-    ///
-    /// **Seqlock guarantee:** the writer rotates through 3 buffers, so it cannot
-    /// reuse the buffer this read latched until two further publishes occur.
-    /// The post-copy `seq` re-check discards any copy that overlapped a publish,
-    /// so a *torn* frame is never returned. A reader stalled across two-plus
-    /// publishes simply retries and observes the newest stable frame.
+    /// Lock-free bounded-retry; [`BusError::Empty`] if nothing published, [`BusError::OutputTooSmall`] if `out` too small.
+    /// Seqlock guarantee: 3-buffer rotation + post-copy `seq` re-check discards any copy overlapping a publish.
     #[cfg(unix)]
     pub fn read_latest(&self, out: &mut [u8]) -> Result<usize, BusError> {
         let hdr = self.header();
 
-        // Bounded retry: a publish is two atomic increments, so a reader can be
-        // starved only by an adversarial publish storm. 1024 attempts is far
-        // beyond any real scheduling window.
+        // Bounded retry: only an adversarial publish storm starves a reader; 1024 >> any scheduling window.
         for _ in 0..1024 {
             let s0 = hdr.seq.load(Ordering::Acquire);
             if s0 & 1 == 1 {
@@ -683,8 +575,7 @@ impl LatestValueBus {
             let len = hdr.lens[front].load(Ordering::Acquire) as usize;
 
             if len > out.len() {
-                // Re-check the seqlock so we don't surface a length from a torn
-                // read; if stable, the length is real and the buffer is small.
+                // Re-check seq so we don't surface a length from a torn read.
                 if hdr.seq.load(Ordering::Acquire) == s0 {
                     return Err(BusError::OutputTooSmall);
                 }
@@ -696,18 +587,11 @@ impl LatestValueBus {
                 core::ptr::copy_nonoverlapping(self.buffer_ptr(front), out.as_mut_ptr(), len);
             }
 
-            // Acquire fence between the (plain, non-atomic) payload copy above and
-            // the validating seq load below. An Acquire *load* alone would not stop
-            // the data reads from being sunk past it, so on a weakly-ordered target
-            // (ARM/aarch64) the tear-check could pass while bytes were sampled after
-            // a concurrent publish. The standalone fence pins the data reads before
-            // the re-read of `seq`, which is the canonical seqlock reader barrier.
+            // Acquire fence pins the payload copy before the seq re-read (canonical seqlock barrier);
+            // an Acquire load alone lets weakly-ordered targets sink the data reads past the tear-check.
             core::sync::atomic::fence(Ordering::Acquire);
 
-            // Validate the seqlock did not move (no concurrent publish flipped
-            // the buffer under us). Triple-buffering means the front we read was
-            // not the writer's target, but a fresh publish could have advanced
-            // `front`; retry to always return the newest stable frame.
+            // Validate seq did not move; a fresh publish may have advanced `front`, so retry for the newest frame.
             let s1 = hdr.seq.load(Ordering::Acquire);
             if s1 == s0 {
                 hdr.copies.fetch_add(1, Ordering::Relaxed);
@@ -761,10 +645,9 @@ impl LvbHeader {
     fn magic_init(&self, slot_stride: u32) {
         self.slot_stride.store(slot_stride, Ordering::Release);
         self.front.store(0, Ordering::Release);
-        // seq starts at 0 (== "nothing published"); first publish leaves it == 2.
+        // seq 0 == nothing published; first publish leaves it == 2.
         self.seq.store(0, Ordering::Release);
-        // Store `magic` last (Release) so an attacher that observes the magic
-        // with an Acquire load also observes the initialized fields above.
+        // Store magic last (Release) so attachers observing it also observe the fields above.
         self.magic.store(BUS_MAGIC, Ordering::Release);
     }
 }
@@ -773,12 +656,8 @@ impl LvbHeader {
 // RingBus — SPMC ring with OverflowPolicy
 // =============================================================================
 
-/// A shared-memory ring of Tenso packets (single producer, multiple consumers).
-///
-/// Each consumer should hold its own [`RingBus`] handle and call [`pop`] which
-/// advances a *per-handle* read cursor. The producer calls [`push`]. Slots are
-/// 64-byte aligned; each carries a slot-local seqlock so a consumer can detect a
-/// half-written or recycled slot and report [`BusError::Lagged`].
+/// Shared-memory SPMC ring of Tenso packets: each consumer holds its own handle and [`pop`]s
+/// (advancing a per-handle cursor); slot-local seqlocks let a consumer detect a recycled slot ([`BusError::Lagged`]).
 ///
 /// [`pop`]: RingBus::pop
 pub struct RingBus {
@@ -787,10 +666,7 @@ pub struct RingBus {
     capacity: usize,
     slot_stride: usize,
     policy: OverflowPolicy,
-    /// Per-handle (per-consumer) read cursor. Interior-mutable (atomic) so `pop`
-    /// keeps the contract's `&self` signature while the handle stays `Send +
-    /// Sync` (each consumer still owns its own handle; the atomic just avoids
-    /// `Cell`'s `!Sync`).
+    /// Per-handle read cursor; atomic so `pop` keeps `&self` while the handle stays `Send + Sync`.
     read_cursor: AtomicU64,
     lock_timeout: core::time::Duration,
 }
@@ -814,11 +690,8 @@ impl RingBus {
     /// Default per-slot payload stride when attaching needs a fallback.
     const DEFAULT_SLOT_STRIDE: usize = 1 << 20; // 1 MiB
 
-    /// Create or attach a ring bus with the default [`OverflowPolicy`].
-    ///
-    /// `cfg.capacity` is the number of slots. The per-slot payload stride is
-    /// derived: when creating we use [`DEFAULT_SLOT_STRIDE`]; see
-    /// [`RingBus::open_with`] for explicit control.
+    /// Create or attach a ring bus with the default [`OverflowPolicy`]; `cfg.capacity` = slot count,
+    /// stride = [`DEFAULT_SLOT_STRIDE`] (see [`RingBus::open_with`] for explicit control).
     ///
     /// [`DEFAULT_SLOT_STRIDE`]: RingBus::DEFAULT_SLOT_STRIDE
     #[cfg(unix)]
@@ -848,8 +721,7 @@ impl RingBus {
                 let mptr = seg.as_ptr().add(Self::mutex_offset());
                 shm_mutex::init_mutex(mptr).map_err(BusError::Shm)?;
             }
-            // Store magic last (Release) so attachers observing it also observe
-            // the initialized capacity/stride/write_index above.
+            // Store magic last (Release) so attachers observing it also observe the fields above.
             hdr.magic.store(BUS_MAGIC, Ordering::Release);
         } else if hdr.magic.load(Ordering::Acquire) != BUS_MAGIC {
             return Err(BusError::Shm("not a tenso ring bus"));
@@ -857,8 +729,7 @@ impl RingBus {
 
         let resolved_cap = hdr.capacity.load(Ordering::Acquire) as usize;
         let resolved_stride = hdr.slot_stride.load(Ordering::Acquire) as usize;
-        // Attaching consumers start reading from the current head so they only
-        // see frames published after they joined (telemetry semantics).
+        // Attaching consumers start at the current head: only frames published after joining (telemetry).
         let start = hdr.write_index.load(Ordering::Acquire);
 
         Ok(RingBus {
@@ -925,7 +796,7 @@ impl RingBus {
 
         let hdr = self.header();
 
-        // Serialize concurrent producers (slow path / crash recovery).
+        // Slow path: serialize concurrent producers + crash recovery.
         unsafe {
             let mptr = self.seg.as_ptr().add(Self::mutex_offset());
             match shm_mutex::lock_mutex(mptr, self.lock_timeout) {
@@ -951,11 +822,8 @@ impl RingBus {
     fn push_locked(&self, hdr: &RingHeader, packet: &[u8]) -> Result<(), BusError> {
         let widx = hdr.write_index.load(Ordering::Acquire);
 
-        // Capacity check: a slot is "occupied/unread" when the oldest in-flight
-        // index (widx - capacity) has not yet been consumed. We can't know every
-        // consumer's cursor across processes cheaply, so the policy governs how
-        // we treat a full ring. For DropOldest we simply overwrite (each
-        // consumer detects the overwrite via the slot's write_index jump).
+        // Full-ring handling per policy; we can't see all cross-process consumer cursors cheaply.
+        // DropOldest just overwrites (each consumer detects it via the slot's write_index jump).
         match self.policy {
             OverflowPolicy::DropOldest => {
                 if widx >= self.capacity as u64 {
@@ -963,10 +831,7 @@ impl RingBus {
                 }
             }
             OverflowPolicy::Error => {
-                // "Full" only ever matters relative to *this* handle's own
-                // consumption; with a global producer and independent consumers
-                // we approximate full as: the slot we are about to stomp still
-                // holds an unread index for this handle.
+                // "Full" only relative to this handle: the slot we'd stomp still holds an unread index.
                 let slot = (widx as usize) % self.capacity;
                 let meta = self.slot_meta(slot);
                 let occupant = meta.write_index.load(Ordering::Acquire);
@@ -980,17 +845,19 @@ impl RingBus {
                 let slot = (widx as usize) % self.capacity;
                 let meta = self.slot_meta(slot);
                 let deadline = std::time::Instant::now() + self.lock_timeout;
-                while widx >= self.capacity as u64 {
-                    let occupant = meta.write_index.load(Ordering::Acquire);
-                    // Free once the prospective occupant has been read by this
-                    // handle (best-effort single-host backpressure).
-                    if occupant + 1 <= self.read_cursor.load(Ordering::Relaxed) {
-                        break;
+                // `widx` is fixed; spin only if at capacity (clippy: if+loop, not while).
+                if widx >= self.capacity as u64 {
+                    loop {
+                        let occupant = meta.write_index.load(Ordering::Acquire);
+                        // Free once this handle has read the occupant (best-effort backpressure).
+                        if occupant + 1 <= self.read_cursor.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(BusError::Full);
+                        }
+                        std::thread::sleep(core::time::Duration::from_micros(50));
                     }
-                    if std::time::Instant::now() >= deadline {
-                        return Err(BusError::Full);
-                    }
-                    std::thread::sleep(core::time::Duration::from_micros(50));
                 }
             }
         }
@@ -1012,12 +879,8 @@ impl RingBus {
         Ok(())
     }
 
-    /// Pop the next packet (relative to this handle's read cursor) into `out`,
-    /// returning its byte length, or [`BusError::Empty`].
-    ///
-    /// If the producer has lapped this consumer, advances the cursor to the
-    /// oldest still-available frame and returns [`BusError::Lagged`] so the
-    /// caller knows it missed frames; the next `pop` then succeeds.
+    /// Pop the next packet (per this handle's cursor) into `out`, returning its length or [`BusError::Empty`].
+    /// If lapped, skips the cursor to the oldest available frame and returns [`BusError::Lagged`] (next `pop` succeeds).
     #[cfg(unix)]
     pub fn pop(&self, out: &mut [u8]) -> Result<usize, BusError> {
         let hdr = self.header();
@@ -1028,9 +891,7 @@ impl RingBus {
             return Err(BusError::Empty);
         }
 
-        // Lag check: if the producer has advanced more than `capacity` past our
-        // cursor, the slot we want has been overwritten. Skip to the oldest
-        // available frame.
+        // Lag check: producer >capacity past us means our slot was overwritten; skip to oldest available.
         let oldest = widx.saturating_sub(self.capacity as u64);
         if cursor < oldest {
             self.read_cursor.store(oldest, Ordering::Relaxed);
@@ -1050,8 +911,7 @@ impl RingBus {
             }
             let occupant = meta.write_index.load(Ordering::Acquire);
             if occupant != cursor {
-                // Slot was recycled out from under us between the widx check and
-                // here: we lagged. Resync and report.
+                // Slot recycled under us since the widx check: lagged; resync and report.
                 let widx2 = hdr.write_index.load(Ordering::Acquire);
                 let oldest2 = widx2.saturating_sub(self.capacity as u64);
                 self.read_cursor
@@ -1069,10 +929,7 @@ impl RingBus {
             unsafe {
                 core::ptr::copy_nonoverlapping(self.slot_payload(slot), out.as_mut_ptr(), len);
             }
-            // Acquire fence pinning the payload copy above before the validating
-            // seq re-read below (see read_latest for the full rationale): without
-            // it, a weakly-ordered target could sink the data reads past the check
-            // and return a torn frame.
+            // Acquire fence pins the payload copy before the seq re-read (see read_latest); else a weak target tears.
             core::sync::atomic::fence(Ordering::Acquire);
             if meta.seq.load(Ordering::Acquire) == s0 {
                 self.read_cursor.store(cursor + 1, Ordering::Relaxed);
@@ -1081,8 +938,7 @@ impl RingBus {
             }
             core::hint::spin_loop();
         }
-        // Producer kept the slot churning long enough that we never got a stable
-        // read; treat as lag.
+        // Slot churned too long to get a stable read; treat as lag.
         hdr.lag_events.fetch_add(1, Ordering::Relaxed);
         Err(BusError::Lagged)
     }
@@ -1139,9 +995,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// Build a minimal valid v4 dense f32 packet (header + shape + body), so
-    /// `tenso_core::parse_header` accepts what we push. We don't need a fully
-    /// round-trippable body for transport tests — only a valid header/shape.
+    /// Build a minimal valid v4 dense f32 packet (header+shape+body) that `parse_header` accepts.
     fn make_packet(payload_marker: u8, n_elems: u32) -> Vec<u8> {
         // v4 header is 10 bytes; shape is ndim * u32; body is n_elems * 4 (f32).
         let ndim: u8 = 1;
@@ -1166,11 +1020,7 @@ mod tests {
     }
 
     fn unique_name(tag: &str) -> String {
-        // POSIX shm names are capped at 31 chars on macOS (PSHMNAMLEN), incl.
-        // the leading '/'. We fold the tag + pid + a monotonic counter + a
-        // process-start nanos seed into a short hex token so collisions across
-        // concurrent tests / re-runs are astronomically unlikely while staying
-        // comfortably under the limit. `tag` is ignored for length but mixed in.
+        // macOS caps shm names at 31 chars; fold tag+pid+counter+nanos into a short hex token to avoid collisions.
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let pid = std::process::id() as u64;
@@ -1179,7 +1029,7 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
         let ctr = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // 64-bit FNV-1a over the entropy sources + tag bytes.
+        // FNV-1a over the entropy sources + tag bytes.
         let mut h: u64 = 0xcbf29ce484222325;
         for b in tag
             .as_bytes()
@@ -1260,9 +1110,7 @@ mod tests {
 
     #[test]
     fn lvb_concurrent_seqlock_no_tearing() {
-        // Single writer, many readers; readers must never see a torn frame.
-        // We encode the marker into every body byte, so a torn read (mixing two
-        // publishes) would show two distinct marker values.
+        // 1 writer, N readers: marker in every body byte, so a torn read shows mixed marker values.
         let name = unique_name("lvb_seq");
         let cfg = BusConfig::new(&name, 8192, true);
         let writer = Arc::new(LatestValueBus::open(&cfg).unwrap());
@@ -1291,12 +1139,7 @@ mod tests {
                             reads += 1;
                         }
                         Err(BusError::Empty) => {}
-                        // A reader can legitimately fall behind a publish storm
-                        // and get Lagged (the bounded seqlock retry gave up). That
-                        // is NOT a torn read, so it must not fail this no-tearing
-                        // test -- otherwise the test is flaky on slow/contended CI
-                        // (e.g. the macOS runner). The Ok branch still asserts no
-                        // tearing on every frame that is read successfully.
+                        // Lagged is legitimate under a publish storm (not a torn read), so don't fail here.
                         Err(BusError::Lagged) => {}
                         Err(e) => panic!("reader error: {:?}", e),
                     }
@@ -1335,9 +1178,7 @@ mod tests {
 
     #[test]
     fn lvb_single_host_latency() {
-        // Smoke latency test (runs on macOS): publish->read round trip should be
-        // sub-millisecond in the common case. We only assert it completes and
-        // report the median via stats; no hard threshold to avoid CI flakiness.
+        // Smoke latency test: publish->read should be sub-ms; generous ceiling to avoid CI flakiness.
         let name = unique_name("lvb_lat");
         let cfg = BusConfig::new(&name, 4096, true);
         let bus = LatestValueBus::open(&cfg).unwrap();
@@ -1404,8 +1245,7 @@ mod tests {
         )
         .unwrap();
 
-        // Push 8 into a 4-slot ring; consumer joined at head so it sees frames
-        // 0..8 but lags: oldest available is 4..8.
+        // Push 8 into a 4-slot ring; consumer lags, oldest available is 4..8.
         for i in 0..8u8 {
             prod.push(&make_packet(i + 1, 4)).unwrap();
         }
@@ -1439,8 +1279,7 @@ mod tests {
         let name = unique_name("ring_err");
         let cfg = BusConfig::new(&name, 2, true);
         let prod = RingBus::open_with(&cfg, 256, OverflowPolicy::Error).unwrap();
-        // Producer's own cursor never advances (it doesn't consume), so after
-        // filling capacity the next push that would stomp an unread slot errors.
+        // Producer cursor never advances, so the push past capacity stomping an unread slot errors.
         prod.push(&make_packet(1, 2)).unwrap();
         prod.push(&make_packet(2, 2)).unwrap();
         let r = prod.push(&make_packet(3, 2));
@@ -1454,8 +1293,7 @@ mod tests {
 
     #[test]
     fn ring_spmc_concurrent() {
-        // One producer, several consumers; each consumer reads an independent
-        // stream. With DropOldest no data race / torn read may occur.
+        // 1 producer, N consumers each on an independent stream; DropOldest must never tear.
         let name = unique_name("ring_spmc");
         let cfg = BusConfig::new(&name, 256, true);
         let prod = Arc::new(RingBus::open_with(&cfg, 256, OverflowPolicy::DropOldest).unwrap());
@@ -1508,11 +1346,8 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(200));
-        // Stop the PRODUCER first and join it, then give the consumers a short
-        // uncontended window to drain the now-static ring before stopping them.
-        // Under DropOldest a perpetually-lagged consumer can otherwise read
-        // nothing on a slow/contended runner (legitimate drop behavior, not a
-        // torn read), which made `total > 0` flaky on the macOS CI runner.
+        // Stop producer first, then give consumers an uncontended window to drain the static ring;
+        // else a perpetually-lagged DropOldest consumer reads nothing on slow CI, making `total > 0` flaky.
         prod_stop.store(true, O::Relaxed);
         let pushed = pt.join().unwrap();
         std::thread::sleep(Duration::from_millis(50));
@@ -1578,14 +1413,10 @@ mod linux_robust_tests {
     use super::*;
     use std::time::Duration;
 
-    /// A child process locks a shared, robust mutex and then `_exit`s while
-    /// holding it (simulating a crashed writer). The parent must then acquire
-    /// the mutex and observe the `recovered == true` signal (EOWNERDEAD ->
-    /// pthread_mutex_consistent).
+    /// Child locks a robust mutex then `_exit`s holding it; parent must acquire and see `recovered == true`.
     #[test]
     fn robust_mutex_recovers_from_dead_owner() {
-        // Place the mutex in an anonymous MAP_SHARED region so the fork child
-        // shares it.
+        // Anonymous MAP_SHARED region so the fork child shares the mutex.
         let len = shm_mutex::MUTEX_SIZE;
         let ptr = unsafe {
             libc::mmap(

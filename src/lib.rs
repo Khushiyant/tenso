@@ -1,22 +1,10 @@
-// This crate targets the PyO3 0.22 `gil-refs` API. Migrating to the `Bound`
-// API is tracked separately (it touches every binding); until then, silence
-// the deprecation warnings so `clippy -D warnings` stays meaningful for real
-// issues. `clippy::useless_conversion` is allowed for the same reason: it fires
-// on PyErr->PyErr conversions inside `#[pyfunction]` macro-generated code, which
-// we don't control until the Bound migration. The pure-Rust engine
-// (crates/tenso-core) is gil-refs-free and keeps the full strict lint set.
+// PyO3 0.22 gil-refs API; Bound migration pending. Deprecation +
+// useless_conversion (fires in macro-generated code) silenced until then.
 #![allow(deprecated, clippy::useless_conversion)]
 
-//! Thin PyO3 binding over `tenso-core`.
-//!
-//! This crate owns ONLY the Python-facing concerns:
-//!   * numpy extraction (dtype/ptr/shape) and Python object construction,
-//!   * dispatch between dense / bundle / sparse on the Python side,
-//!   * true zero-copy `loads` via `numpy.frombuffer(offset=...)`,
-//!   * the POSIX shared-memory mutex helpers (`shm_mutex`).
-//!
-//! ALL wire-format codec is delegated to `tenso_core` (the authoritative
-//! engine). There is no duplicated header/dense/bundle/sparse logic here.
+//! Thin PyO3 binding over `tenso-core`. Owns only Python-facing concerns
+//! (numpy extraction, object construction, dense/bundle/sparse dispatch,
+//! zero-copy `loads`, shm_mutex); all wire-format codec lives in `tenso_core`.
 
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
@@ -40,8 +28,7 @@ use tenso_core::{
 // Error mapping + small extraction helpers
 // -----------------------------------------------------------------------------
 
-/// Map a `tenso_core::TensoError` to a Python exception, matching the messages
-/// the previous in-crate codec raised where they were observable.
+/// Map a `TensoError` to a Python exception (messages match the old codec).
 fn map_err(e: TensoError) -> PyErr {
     let msg = match e {
         TensoError::TooShort => "Packet too short".to_string(),
@@ -63,10 +50,8 @@ fn map_err(e: TensoError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(msg)
 }
 
-/// Convert numpy shape dims (`usize`) to the wire format's `u32` dims, rejecting
-/// any dimension that would not fit. The wire format stores each dim as a 32-bit
-/// integer, so a silent `as u32` truncation here would corrupt the array on
-/// reserialization (see issue #4).
+/// Convert shape dims to wire-format `u32`, rejecting oversized dims (a silent
+/// `as u32` truncation would corrupt the array on reserialization, issue #4).
 fn shape_to_u32(dims: &[usize]) -> PyResult<Vec<u32>> {
     dims.iter()
         .map(|&d| {
@@ -110,9 +95,8 @@ fn dtype_from_name(name: &str) -> PyResult<Dtype> {
     Ok(d)
 }
 
-/// Extracted view of a numpy array: dtype + raw little-endian body bytes + shape
-/// as u32 dims. The returned `&[u8]` borrows the array's backing buffer for the
-/// lifetime of `array`; the caller must keep the GIL held while it is used.
+/// View of a numpy array: dtype + LE body bytes + u32 shape. `data` borrows the
+/// array's buffer for `array`'s lifetime; caller must hold the GIL while used.
 struct NumpyView<'a> {
     dtype: Dtype,
     data: &'a [u8],
@@ -124,14 +108,9 @@ fn extract_numpy<'a>(array: &'a PyAny) -> PyResult<NumpyView<'a>> {
     let name: String = dtype_obj.getattr("name")?.extract()?;
     let dtype = dtype_from_name(&name)?;
 
-    // Reject non-C-contiguous arrays. We read `nbytes` raw bytes starting at
-    // `ctypes.data` assuming row-major order, which is WRONG for a strided /
-    // transposed / Fortran-order view: a forward-strided view yields the wrong
-    // bytes, and a reverse-strided view puts `ctypes.data` at the last element so
-    // `data_ptr + nbytes` overruns the parent buffer (an out-of-bounds read in the
-    // `from_raw_parts` below). The Python wrapper coerces with ascontiguousarray,
-    // but `dumps_rs` is an exported pyfunction, so enforce the invariant here too
-    // (mirrors the check in `dump_to_fd_rs`).
+    // Require C-contiguous: we read `nbytes` from `ctypes.data` row-major, which
+    // is wrong (and can OOB) for strided/transposed/Fortran views. dumps_rs is
+    // exported, so enforce here too (Python wrapper also coerces).
     let c_contiguous: bool = array.getattr("flags")?.getattr("c_contiguous")?.extract()?;
     if !c_contiguous {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -144,14 +123,13 @@ fn extract_numpy<'a>(array: &'a PyAny) -> PyResult<NumpyView<'a>> {
     let shape_usize: Vec<usize> = array.getattr("shape")?.extract()?;
     let shape = shape_to_u32(&shape_usize)?;
 
-    // Safety: C-contiguity was verified above, so numpy guarantees `data_ptr`
-    // points to `nbytes` of contiguous little-endian array memory while the GIL
-    // is held and `array` is alive.
+    // SAFETY: C-contiguous (checked above), so `data_ptr` covers `nbytes` of LE
+    // array memory while the GIL is held and `array` is alive.
     let data = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, nbytes) };
     Ok(NumpyView { dtype, data, shape })
 }
 
-/// Build the `EncodeOpts` the core expects from the Python-facing flags.
+/// Build `EncodeOpts` from the Python-facing flags.
 fn opts(check_integrity: bool, compress: bool, alignment: usize) -> EncodeOpts {
     EncodeOpts {
         check_integrity,
@@ -164,8 +142,8 @@ fn opts(check_integrity: bool, compress: bool, alignment: usize) -> EncodeOpts {
 // Container helpers (bundle / sparse) — collect bytes, then delegate to core
 // -----------------------------------------------------------------------------
 
-/// Recursively serialize each dict value to a packet via `dumps_rs`, returning
-/// `(key_utf8, value_packet)` pairs whose bytes outlive the encode call.
+/// Recursively serialize each dict value via `dumps_rs` into owned
+/// `(key, value_packet)` pairs that outlive the encode call.
 fn collect_bundle_entries(
     py: Python,
     dict: &PyDict,
@@ -190,12 +168,12 @@ fn collect_bundle_entries(
     Ok(entries)
 }
 
-/// Resolve a sparse tensor's format flag + the three component arrays (made
-/// C-contiguous if needed) and their owned little-endian body bytes.
+/// Sparse tensor's format flag + its three component arrays (coerced
+/// C-contiguous) with owned LE body bytes.
 struct SparseComponents {
     format: SparseFormat,
     shape: Vec<u32>,
-    // Each component: (dtype, owned body bytes, shape).
+    // (dtype, owned body bytes, shape) per component.
     comps: Vec<(Dtype, Vec<u8>, Vec<u32>)>,
 }
 
@@ -304,8 +282,7 @@ fn dumps_rs<'py>(
 
     if compress {
         // Compressed size is an upper bound; encode into scratch and copy out
-        // the exact bytes so the returned packet has no trailing slack (slack
-        // would push the integrity footer off the end on read).
+        // the exact bytes (trailing slack would break the integrity footer).
         let mut scratch = vec![0u8; size];
         let actual = encode_dense_into(&spec, &mut scratch, &o).map_err(map_err)?;
         Ok(PyBytes::new(py, &scratch[..actual]))
@@ -319,8 +296,7 @@ fn dumps_rs<'py>(
 }
 
 // -----------------------------------------------------------------------------
-// dumps_quantized_rs / dumps_string_rs — encode the non-dense Python types via
-// tenso-core (so there is a single Rust implementation of every wire format).
+// dumps_quantized_rs / dumps_string_rs — encode non-dense Python types via core.
 // -----------------------------------------------------------------------------
 
 /// Encode a `QuantizedTensor` (extracted field-by-field) via `tenso-core`.
@@ -346,7 +322,7 @@ fn dumps_quantized_rs<'py>(
     let axis = (axis_i & 0xFF) as u8;
     let shape_usize: Vec<usize> = qt.getattr("shape")?.extract()?;
     let shape = shape_to_u32(&shape_usize)?;
-    // scales / zero_points / data are numpy arrays -> raw little-endian bytes.
+    // scales / zero_points / data: numpy arrays -> raw LE bytes.
     let scales: Vec<u8> = qt.getattr("scales")?.call_method0("tobytes")?.extract()?;
     let zero_points: Vec<u8> = qt
         .getattr("zero_points")?
@@ -372,8 +348,7 @@ fn dumps_quantized_rs<'py>(
     })
 }
 
-/// Encode a `StringTensor` from its raw `offsets` ((count+1) u64 LE bytes) and
-/// `payload` bytes via `tenso-core`.
+/// Encode a `StringTensor` from raw `offsets` ((count+1) u64 LE) + `payload`.
 #[pyfunction]
 #[pyo3(signature = (offsets, payload, count, check_integrity=false))]
 fn dumps_string_rs<'py>(
@@ -399,9 +374,8 @@ fn dumps_string_rs<'py>(
     })
 }
 
-/// Frame already-encoded `(key, value_packet)` entries into a bundle packet via
-/// `tenso-core`. Lets the Python layer orchestrate recursion (e.g. bundles that
-/// contain quantized/string values) while the bundle wire frame stays in Rust.
+/// Frame already-encoded `(key, value_packet)` entries into a bundle packet,
+/// letting Python orchestrate recursion while the wire frame stays in Rust.
 #[pyfunction]
 fn encode_bundle_rs<'py>(
     py: Python<'py>,
@@ -441,9 +415,8 @@ fn dump_to_buffer_rs<'py>(
 
     let buf_len = py_buf.len_bytes();
     let buf_ptr = py_buf.buf_ptr() as *mut u8;
-    // Safety: PyBuffer guarantees `buf_ptr` is valid for `buf_len` writable
-    // bytes while the GIL is held; for the SHM use case `array` and `buffer`
-    // are distinct allocations.
+    // SAFETY: PyBuffer guarantees `buf_ptr` is writable for `buf_len` bytes
+    // while the GIL is held; `array` and `buffer` are distinct allocations.
     let target = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) };
 
     if !alignment.is_power_of_two() {
@@ -525,9 +498,8 @@ fn dump_to_fd_rs<'py>(
     };
     let o = opts(check_integrity, compress, alignment);
 
-    // Encode into an owned buffer (core handles header/padding/body/integrity),
-    // then stream it to the fd without the GIL held. Trim to the exact length
-    // because the compressed-size estimate is an upper bound.
+    // Encode into an owned buffer, then stream to the fd without the GIL.
+    // Trim to actual length (compressed-size estimate is an upper bound).
     let size = dense_required_size(&spec, &o).map_err(map_err)?;
     let mut packet = vec![0u8; size];
     let actual = encode_dense_into(&spec, &mut packet, &o).map_err(map_err)?;
@@ -538,7 +510,7 @@ fn dump_to_fd_rs<'py>(
         let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd)) };
         #[cfg(windows)]
         let mut file = unsafe {
-            // Convert C runtime fd to Windows HANDLE.
+            // C runtime fd -> Windows HANDLE.
             extern "C" {
                 fn _get_osfhandle(fd: i32) -> isize;
             }
@@ -555,10 +527,8 @@ fn dump_to_fd_rs<'py>(
 // loads_rs — decode via tenso_core, zero-copy into the original Python buffer
 // -----------------------------------------------------------------------------
 
-/// Build a numpy array view over `view`, mapping its body back into `root_data`
-/// at the right absolute offset for true zero-copy. The body slice is always a
-/// borrow of `base` (the original packet buffer) since `decode` is zero-copy for
-/// dense bodies, so the offset is `body_ptr - base_ptr`.
+/// Build a zero-copy numpy view over the dense body, mapped into `root_data`
+/// at offset `body_ptr - base_ptr` (decode borrows the body from the packet).
 fn dense_to_numpy<'py>(
     py: Python<'py>,
     root_data: &'py PyAny,
@@ -585,9 +555,8 @@ fn dense_to_numpy<'py>(
     Ok(reshaped.into())
 }
 
-/// Convert a `Decoded` into a Python object, recursing for bundles. Returns
-/// `Ok(None)` for any kind the Python layer's fallback owns (sparse, quantized,
-/// string, ragged, IpcRef) — preserving the previous supported-set semantics.
+/// Convert a `Decoded` to a Python object, recursing for bundles. `Ok(None)`
+/// signals a kind the Python fallback owns (ragged, IpcRef).
 fn decoded_to_py<'py>(
     py: Python<'py>,
     root_data: &'py PyAny,
@@ -608,16 +577,14 @@ fn decoded_to_py<'py>(
             for (key, val) in entries {
                 match decoded_to_py(py, root_data, base_ptr, val)? {
                     Some(obj) => res.set_item(key, obj)?,
-                    // A nested unsupported kind makes the whole packet a
-                    // Python-fallback case, matching the old behavior.
+                    // A nested unsupported kind makes the whole packet fall back.
                     None => return Ok(None),
                 }
             }
             Ok(Some(res.into()))
         }
         Decoded::Quantized(q) => {
-            // Build a QuantizedTensor from the Rust-parsed fields. Rust owns the
-            // byte parsing; Python only assembles the object.
+            // Assemble a QuantizedTensor from the Rust-parsed fields.
             let np = py.import("numpy")?;
             let qcls = py.import("tenso.quantize")?.getattr("QuantizedTensor")?;
             let data = np
@@ -646,7 +613,7 @@ fn decoded_to_py<'py>(
             offsets,
             payload,
         } => {
-            // Build a StringTensor via its raw-field classmethod.
+            // StringTensor via its raw-field classmethod.
             let np = py.import("numpy")?;
             let scls = py.import("tenso.ragged")?.getattr("StringTensor")?;
             let offs = np
@@ -691,8 +658,7 @@ fn decoded_to_py<'py>(
             };
             Ok(Some(obj.into()))
         }
-        // Ragged is produced as a bundle in practice; IpcRef stays a Python
-        // concern. Signal fallback for those.
+        // Ragged is a bundle in practice; IpcRef stays a Python concern.
         _ => Ok(None),
     }
 }
@@ -701,15 +667,13 @@ fn decoded_to_py<'py>(
 fn loads_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<Option<PyObject>> {
     let buffer: PyBuffer<u8> = PyBuffer::get(data)?;
     let base_ptr = buffer.buf_ptr() as usize;
-    // Safety: PyBuffer keeps `data` alive and the buffer readable for
-    // `len_bytes()` while the GIL is held.
+    // SAFETY: PyBuffer keeps `data` readable for `len_bytes()` under the GIL.
     let bytes =
         unsafe { std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes()) };
 
     match decode(bytes) {
         Ok(decoded) => decoded_to_py(py, data, base_ptr, decoded),
-        // Compressed dense: decode + decompress via the owning core path and
-        // build an (owned) numpy array. No Python fallback needed.
+        // Compressed dense: decompress via core, build an owned numpy array.
         Err(TensoError::Lz4(_)) => {
             let (dtype, shape, owned) =
                 tenso_core::decode_dense_to_owned(bytes).map_err(map_err)?;
@@ -745,15 +709,13 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
     dict.set_item("integrity_protected", (hdr.flags & FLAG_INTEGRITY) != 0)?;
 
     if hdr.flags & FLAG_BUNDLE != 0 {
-        // For a bundle, `ndim` is the ENTRY COUNT and the post-header bytes are
-        // key-length prefixes, not dimensions. Report the entry count and an
-        // empty shape rather than the meaningless dims a naive read would yield.
+        // For a bundle, `ndim` is the entry count and post-header bytes are
+        // key-length prefixes, not dims. Report entry count + empty shape.
         dict.set_item("entry_count", hdr.ndim)?;
         dict.set_item("shape", PyTuple::empty(py))?;
         dict.set_item("total_elements", 0usize)?;
     } else {
-        // dense / sparse / quantized / string: `ndim` is the dimension count and
-        // the post-header bytes are the shape.
+        // dense / sparse / quantized / string: post-header bytes are the shape.
         let shape_end = hdr.base_size + (hdr.ndim * 4);
         if bytes.len() < shape_end {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -772,9 +734,8 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
             shape.push(dim);
             cursor += 4;
         }
-        // Saturating product: dims are attacker-controlled u32s, so the plain
-        // product can overflow usize and wrap; saturate instead. (decode()
-        // separately enforces MAX_NDIM / MAX_ELEMENTS.)
+        // Saturating product: dims are attacker-controlled, so a plain product
+        // could wrap. (decode() separately enforces MAX_NDIM / MAX_ELEMENTS.)
         let total_elements: usize = shape.iter().fold(1usize, |acc, &d| acc.saturating_mul(d));
         dict.set_item("total_elements", total_elements)?;
         dict.set_item("shape", PyTuple::new(py, shape))?;
@@ -791,8 +752,7 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
 mod shm_mutex {
     use std::time::Duration;
 
-    // Layout placed in shared memory: pthread_mutex_t (platform-dependent size)
-    // On macOS: 64 bytes, on Linux: 40 bytes. We reserve 64 bytes.
+    // pthread_mutex_t in shared memory (macOS 64B, Linux 40B); reserve 64.
     pub const MUTEX_SIZE: usize = 64;
 
     extern "C" {
@@ -812,7 +772,7 @@ mod shm_mutex {
         fn pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
         fn pthread_mutex_destroy(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
 
-        // Robust mutex support (Linux)
+        // Robust mutex (Linux)
         #[cfg(target_os = "linux")]
         fn pthread_mutexattr_setrobust(
             attr: *mut libc::pthread_mutexattr_t,
@@ -822,9 +782,7 @@ mod shm_mutex {
         fn pthread_mutex_consistent(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
     }
 
-    /// Initialize a process-shared mutex at the given memory location.
-    /// The caller must ensure `ptr` points to at least MUTEX_SIZE bytes of
-    /// zeroed shared memory.
+    /// Init a process-shared mutex at `ptr` (>= MUTEX_SIZE zeroed shm bytes).
     pub unsafe fn init_mutex(ptr: *mut u8) -> Result<(), String> {
         let mutex = ptr as *mut libc::pthread_mutex_t;
         let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
@@ -837,7 +795,7 @@ mod shm_mutex {
             return Err("pthread_mutexattr_setpshared failed".into());
         }
 
-        // On Linux, enable robust mutex so we can recover from crashed holders
+        // Linux: robust mutex to recover from crashed holders.
         #[cfg(target_os = "linux")]
         {
             if pthread_mutexattr_setrobust(&mut attr, libc::PTHREAD_MUTEX_ROBUST) != 0 {
@@ -854,8 +812,7 @@ mod shm_mutex {
         Ok(())
     }
 
-    /// Lock the mutex with a timeout. Returns Ok(true) if lock was acquired
-    /// after recovering from a dead owner (Linux robust mutex).
+    /// Lock with timeout. `Ok(true)` if recovered from a dead owner (Linux).
     pub unsafe fn lock_mutex(ptr: *mut u8, timeout: Duration) -> Result<bool, String> {
         let mutex = ptr as *mut libc::pthread_mutex_t;
         let deadline = std::time::Instant::now() + timeout;
@@ -863,10 +820,10 @@ mod shm_mutex {
         loop {
             let rc = pthread_mutex_trylock(mutex);
             if rc == 0 {
-                return Ok(false); // normal acquisition
+                return Ok(false); // normal
             }
 
-            // EOWNERDEAD: previous holder crashed (Linux robust mutex)
+            // EOWNERDEAD: prior holder crashed (Linux robust mutex)
             #[cfg(target_os = "linux")]
             if rc == libc::EOWNERDEAD {
                 pthread_mutex_consistent(mutex);
@@ -905,9 +862,8 @@ mod shm_mutex {
     }
 }
 
-/// Initialize a POSIX process-shared mutex at a given offset in a buffer.
-/// The buffer must be backed by shared memory and have at least 64 bytes
-/// available at the given offset.
+/// Init a POSIX process-shared mutex at `offset` in a shm-backed buffer
+/// (needs >= 64 bytes there).
 #[cfg(unix)]
 #[pyfunction]
 fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
@@ -934,8 +890,7 @@ fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
     }
 }
 
-/// Lock a POSIX process-shared mutex. Returns True if the lock was recovered
-/// from a dead owner (Linux robust mutex), False otherwise.
+/// Lock a POSIX process-shared mutex. True if recovered from a dead owner.
 #[cfg(unix)]
 #[pyfunction]
 #[pyo3(signature = (buffer, offset, timeout_secs=5.0))]
@@ -1018,11 +973,8 @@ fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
 }
 
 // -----------------------------------------------------------------------------
-// Fuzzing shims (only compiled when `--cfg fuzzing` is set, e.g. by cargo-fuzz)
-//
-// These expose a minimal byte-in / Result-out API over `tenso_core` so that
-// fuzz targets in `fuzz/` can drive the header + shape parse without pulling in
-// PyO3. They MUST NOT be used by production code or tests.
+// Fuzzing shims (only under `--cfg fuzzing`): byte-in/Result-out API over
+// tenso_core so fuzz targets can parse without PyO3. Not for prod/tests.
 // -----------------------------------------------------------------------------
 
 #[cfg(fuzzing)]
@@ -1046,13 +998,9 @@ pub mod fuzz_api {
         Ok((h.flags, h.dtype_code, h.ndim, h.base_size))
     }
 
-    /// Parse header + per-dim shape entries (the dense pre-body decode that
-    /// `get_packet_info_rs` and `decode` both share). Mirrors the Python-free
-    /// portion of the dense decode path, delegating to `tenso_core`.
-    ///
-    /// TODO(fuzz): the rest of the decode (LZ4, integrity, numpy hand-off) is
-    /// either inside `tenso_core::decode` (fuzzed separately as the engine
-    /// grows fuzz targets) or behind PyO3.
+    /// Parse header + per-dim shape (the dense pre-body decode), delegating
+    /// to `tenso_core`.
+    /// TODO(fuzz): rest of decode (LZ4/integrity/numpy) is in core or PyO3.
     pub fn fuzz_parse_header_and_shape(bytes: &[u8]) -> Result<ParsedShape, TensoError> {
         let h = parse_header(bytes)?;
         let shape_end = h

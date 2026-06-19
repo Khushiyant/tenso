@@ -47,10 +47,7 @@ try:
 except ImportError:
     HAS_LZ4 = False
 
-# --- RUST CORE INTEGRATION ---
-# The compiled Rust extension is REQUIRED: it is the single source of truth for
-# the wire format. The pure-Python codec fallback was removed, so a missing
-# extension is a hard error rather than a silent (and now divergent) fallback.
+# Rust extension is REQUIRED: single source of truth for the wire format.
 try:
     from .tenso_rs import (
         dumps_rs,
@@ -68,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         "removed in favor of a single Rust core."
     ) from exc
 
-# Retained (always True) so internal call sites that branch on it keep working.
+# Always True; kept so call sites that branch on it keep working.
 HAS_RUST = True
 
 IS_LITTLE_ENDIAN = sys.byteorder == "little"
@@ -76,7 +73,7 @@ IS_LITTLE_ENDIAN = sys.byteorder == "little"
 _QUANTIZED_CODES = (QDTYPE_QINT8, QDTYPE_QUINT8, QDTYPE_QINT4, QDTYPE_QUINT4)
 _4BIT_CODES = (QDTYPE_QINT4, QDTYPE_QUINT4)
 
-# The wire format encodes each dimension as a 32-bit integer.
+# Wire format encodes each dimension as u32.
 _MAX_DIM = 0xFFFFFFFF
 
 
@@ -128,7 +125,7 @@ def _ensure_aligned(obj, alignment: int, copy: bool):
         out[...] = obj
         out.flags.writeable = copy
         return out
-    # sparse matrices, QuantizedTensor, etc. handle their own copy semantics.
+    # sparse, QuantizedTensor, etc. handle their own copy semantics.
     return obj
 
 
@@ -182,7 +179,7 @@ def _read_into_buffer(
     if n == 0:
         return True
 
-    # Cache method lookups outside the loop for performance
+    # Cache method lookups outside the loop.
     readinto = getattr(source, "readinto", None)
     recv_into = getattr(source, "recv_into", None)
     recv = getattr(source, "recv", None)
@@ -323,7 +320,7 @@ def _read_full_packet(source: Any) -> Optional[bytearray]:
                 raise EOFError(f"Stream ended during {what}")
         return bytes(b)
 
-    # Bundle: ndim is the entry count; entries are length-prefixed (opaque here).
+    # Bundle: ndim is the entry count; entries are length-prefixed.
     if flags & FLAG_BUNDLE:
         for _ in range(ndim):
             k_len_b = _take(4)
@@ -355,8 +352,7 @@ def _read_full_packet(source: Any) -> Optional[bytearray]:
     footer_len = 8 if (flags & FLAG_INTEGRITY) else 0
 
     if dtype_code in _QUANTIZED_CODES:
-        # Quant metadata: scheme(1)+axis(1)+group_size(4)+num_scales(4), then
-        # scales + zero_points.
+        # Quant metadata: scheme(1)+axis(1)+group_size(4)+num_scales(4), then scales+zero_points.
         meta = _take(10)
         buf += meta
         num_scales = struct.unpack("<I", meta[6:10])[0]
@@ -524,14 +520,11 @@ def dumps(
     if not (alignment > 0 and (alignment & (alignment - 1) == 0)):
         raise ValueError("Alignment must be a power of two")
 
-    # Reject oversized dims up front so the error is a clean ValueError on both
-    # the Rust and Python paths instead of a silent truncation (issue #4).
+    # Reject oversized dims up front: clean ValueError instead of u32 truncation (issue #4).
     if isinstance(tensor, np.ndarray):
         _validate_dims(tensor.shape)
-        # Also reject an oversized element COUNT here, BEFORE any contiguity
-        # coercion: a huge broadcast/strided view (e.g. shape (0xFFFFFFFF,)) would
-        # otherwise force a multi-GB ascontiguousarray allocation just to be
-        # rejected by the element cap downstream (OOM on small machines).
+        # Reject oversized element COUNT before contiguity coercion, else a huge
+        # strided view forces a multi-GB ascontiguousarray just to be rejected (OOM).
         if int(np.prod(tensor.shape, dtype=object)) > MAX_ELEMENTS:
             raise ValueError(
                 f"Packet exceeds maximum elements ({int(np.prod(tensor.shape, dtype=object))} "
@@ -540,8 +533,7 @@ def dumps(
     elif hasattr(tensor, "shape") and not isinstance(tensor, dict):
         _validate_dims(tensor.shape)
 
-    # All wire-format encoding goes through the Rust core (the single source of
-    # truth). The compiled extension is required (imported at module load).
+    # All wire-format encoding goes through the Rust core.
     if isinstance(tensor, QuantizedTensor):
         return memoryview(
             dumps_quantized_rs(tensor, check_integrity=check_integrity, alignment=alignment)
@@ -551,10 +543,8 @@ def dumps(
     is_sparse = hasattr(tensor, "format") and not is_numpy
     is_dict = isinstance(tensor, dict)
 
-    # A bundle holding a QuantizedTensor can't go through dumps_rs's dict path
-    # (its recursion only handles numpy/sparse), so encode each value here
-    # (recursion routes quantized/string to their own Rust encoders) and frame
-    # the bundle via encode_bundle_rs — every byte still comes from the core.
+    # dumps_rs's dict path only handles numpy/sparse, so encode each value here
+    # (routes quantized/string to Rust) and frame the bundle via encode_bundle_rs.
     if is_dict and _bundle_contains_quantized(tensor):
         if len(tensor) > 255:
             raise ValueError(
@@ -572,8 +562,8 @@ def dumps(
             if strict:
                 raise ValueError("Tensor is not C-Contiguous")
             tensor = np.ascontiguousarray(tensor)
-        # Normalize nested bundle arrays to C-order so the Rust dense path reads
-        # correct bytes (it copies from ctypes.data assuming C-contiguity).
+        # Normalize nested bundle arrays to C-order (Rust dense path copies from
+        # ctypes.data assuming C-contiguity).
         if is_dict:
             tensor = _bundle_make_contiguous(tensor, strict)
         # dumps_rs handles Dense, Sparse, and Bundles (compressed or not).
@@ -611,10 +601,8 @@ def loads(
     """
     mv = memoryview(data)
 
-    # Resolve the alignment the packet promises so it can be guaranteed on the
-    # returned arrays regardless of which decode path runs (issue #5). A
-    # zero-copy view only inherits the transport buffer's alignment, which Tenso
-    # does not control, so the guarantee is enforced after decoding.
+    # Resolve the promised alignment so it can be enforced on returned arrays
+    # after decode (a zero-copy view only inherits the transport buffer's). Issue #5.
     try:
         _hdr = _parse_header(mv)
         alignment = _target_alignment(mv, _hdr[1], _hdr[4], _hdr[3])
@@ -622,14 +610,11 @@ def loads(
         _hdr = None
         alignment = _ALIGNMENT
 
-    # All decoding goes through the Rust core (the single source of truth). It
-    # handles every kind: dense, bundle, sparse, quantized, string, and
-    # compressed packets, and raises ValueError on a malformed/integrity-failed
-    # packet.
+    # All decoding goes through the Rust core; it raises ValueError on a
+    # malformed/integrity-failed packet.
     res = loads_rs(data)
     if res is None:
-        # The only kind the core does not surface to Python is a GPU IpcRef
-        # packet (decoded on the device, never produced by dumps()).
+        # Core does not surface GPU IpcRef packets (decoded on device).
         raise ValueError(
             "Unsupported tenso packet (e.g. a GPU IPC reference, which is "
             "decoded on the device rather than via loads())"
@@ -665,26 +650,22 @@ def dump(
     -------
     None
     """
-    # 0. FAST PATH: ZERO-ALLOCATION STREAMING (RUST)
+    # Fast path: zero-allocation streaming to the FD via Rust.
     if HAS_RUST and hasattr(fp, "fileno"):
         try:
             fd = fp.fileno()
-            # Ensure contiguous for Rust
             if not tensor.flags["C_CONTIGUOUS"]:
                 if strict:
                     raise ValueError("Tensor is not C-Contiguous")
-                # Note: ascontiguousarray makes a copy, but it's unavoidable if data is not contiguous
                 tensor = np.ascontiguousarray(tensor)
-            
-            # Write directly to FD without allocating PyBytes
+
             dump_to_fd_rs(tensor, fd, check_integrity=check_integrity)
             return
         except (ValueError, TypeError, AttributeError, OSError):
-            # Fallback if fileno() is unavailable/invalid (e.g. BytesIO) or Rust fails
+            # fileno() unavailable/invalid (e.g. BytesIO) or Rust failed.
             pass
 
-    # Use dumps() to create complete packet, then single write
-    # This is 6x faster than chunked writes for large arrays
+    # Single write of the complete packet (~6x faster than chunked for large arrays).
     packet = dumps(tensor, strict=strict, check_integrity=check_integrity)
     fp.write(packet)
 

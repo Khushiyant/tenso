@@ -1,19 +1,9 @@
 //! tenso-core: pure-Rust engine for the Tenso tensor wire format.
 //!
-//! This crate is `no_std + alloc` friendly. The `std` feature gates the
-//! streaming writer paths and compression (lz4_flex). It MUST NOT depend on
-//! pyo3, numpy, or libc.
-//!
-//! Byte-level authority for this implementation lives in the project root:
-//!   - `src/lib.rs`            (Rust v4 encoder/decoder + header parser)
-//!   - `src/tenso/config.py`   (constants)
-//!   - `src/tenso/core.py`     (dense/sparse/bundle/quantized layouts)
-//!   - `src/tenso/quantize.py` (quant packing)
-//!   - `src/tenso/ragged.py`   (string + ragged layouts)
-//!
-//! The protocol constants, `Dtype`, `Header`, `parse_header`, `write_v4_header`
-//! and the IpcRef framing constants are load-bearing across crates and must
-//! stay byte-identical to the authority files above.
+//! `no_std + alloc` friendly; `std` feature gates streaming writers + lz4_flex. No pyo3/numpy/libc.
+//! Byte-level authority: root `src/lib.rs`, `src/tenso/{config,core,quantize,ragged}.py`.
+//! Protocol constants, `Dtype`, `Header`, `parse_header`, `write_v4_header` and IpcRef framing
+//! are load-bearing across crates and must stay byte-identical to those files.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(dead_code, unused)]
@@ -22,7 +12,7 @@ extern crate alloc;
 
 use alloc::string::String;
 #[allow(unused_imports)]
-use alloc::vec; // brings the `vec!` macro into scope under no_std
+use alloc::vec; // `vec!` macro under no_std
 use alloc::vec::Vec;
 
 // =============================================================================
@@ -94,14 +84,9 @@ const LZ4_FRAME_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
 // GPU IpcRef framing constants (REAL — load-bearing across crates)
 // =============================================================================
 //
-// A GPU IpcRef packet is a v4 header with FLAG_GPU_IPC_REF set and the reserved
-// byte (offset 9) used as a discriminator == 1. The body is a fixed 96-byte
-// struct, all integers little-endian:
-//   handle[64], byte_offset:u64, nbytes:u64, device_uuid[16]
-//
-// Rules:
-//   - never combine with FLAG_INTEGRITY or an inline body
-//   - reject device_uuid mismatch on import
+// v4 header with FLAG_GPU_IPC_REF + reserved byte (offset 9) == discriminator 1, then a
+// fixed 96-byte LE body: handle[64], byte_offset:u64, nbytes:u64, device_uuid[16].
+// Never combine with FLAG_INTEGRITY or an inline body; reject device_uuid mismatch on import.
 
 /// Value placed in the v4 reserved byte (offset 9) to mark an IpcRef packet.
 pub const IPC_REF_DISCRIMINATOR: u8 = 1;
@@ -209,8 +194,7 @@ impl Dtype {
         }
     }
 
-    /// Fixed per-element byte size, or `None` for variable-length / sub-byte
-    /// dtypes (4-bit quant types pack 2 per byte; string/bytes are variable).
+    /// Fixed per-element byte size, or `None` for sub-byte (4-bit) / variable-length dtypes.
     pub fn item_size(&self) -> Option<usize> {
         let s = match self {
             Dtype::F32 => 4,
@@ -230,7 +214,7 @@ impl Dtype {
             Dtype::BF16 => 2,
             Dtype::QInt8 => 1,
             Dtype::QUInt8 => 1,
-            // sub-byte packed: 2 elements per byte -> no whole-byte item size
+            // sub-byte packed (2 per byte): no whole-byte item size
             Dtype::QInt4 => return None,
             Dtype::QUInt4 => return None,
             // variable-length
@@ -295,8 +279,7 @@ pub struct Header {
     pub base_size: usize,
 }
 
-/// Parse a v3 or v4 packet header. REAL implementation (mirrors root src/lib.rs
-/// `parse_packet_header_raw`) so all downstream crates agree on byte offsets.
+/// Parse a v3/v4 packet header (mirrors root `parse_packet_header_raw`).
 pub fn parse_header(bytes: &[u8]) -> Result<Header, TensoError> {
     if bytes.len() < HEADER_BASE_V3 {
         return Err(TensoError::TooShort);
@@ -329,8 +312,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, TensoError> {
     }
 }
 
-/// Write a v4 header into `out[0..10]`. REAL implementation (mirrors root
-/// src/lib.rs `write_v4_header`).
+/// Write a v4 header into `out[0..10]` (mirrors root `write_v4_header`).
 pub fn write_v4_header(out: &mut [u8], flags: u16, dtype_code: u8, ndim: u8) {
     out[0..4].copy_from_slice(&MAGIC);
     out[4] = VERSION;
@@ -344,9 +326,7 @@ pub fn write_v4_header(out: &mut [u8], flags: u16, dtype_code: u8, ndim: u8) {
 // Internal helpers
 // =============================================================================
 
-/// Padding bytes needed to advance `pos` up to the next `alignment` boundary.
-/// `alignment` of 0 or 1 yields zero padding. Mirrors the Python
-/// `(alignment - remainder) % alignment` math.
+/// Padding to advance `pos` to the next `alignment` boundary (0/1 => no padding).
 #[inline]
 fn padding_for(pos: usize, alignment: usize) -> usize {
     if alignment <= 1 {
@@ -360,8 +340,7 @@ fn padding_for(pos: usize, alignment: usize) -> usize {
     }
 }
 
-/// Product of shape dims as u64, guarding against overflow (treated as
-/// `TooManyElements`).
+/// Product of shape dims as u64; overflow => `TooManyElements`.
 #[inline]
 fn shape_num_elements(shape: &[u32]) -> Result<u64, TensoError> {
     let mut acc: u64 = 1;
@@ -373,8 +352,7 @@ fn shape_num_elements(shape: &[u32]) -> Result<u64, TensoError> {
     Ok(acc)
 }
 
-/// Single-pass XXH3-64 over `data`. Matches Python's
-/// `xxhash.xxh3_64_intdigest` byte-for-byte.
+/// Single-pass XXH3-64 over `data` (matches Python `xxhash.xxh3_64_intdigest`).
 #[cfg(feature = "integrity")]
 #[inline]
 fn integrity_hash(data: &[u8]) -> u64 {
@@ -465,8 +443,7 @@ impl Default for EncodeOpts {
     }
 }
 
-/// Pre-flight validation shared by `dense_required_size` and
-/// `encode_dense_into`. Returns the resolved (flags-irrelevant) layout numbers.
+/// Shared pre-flight layout for `dense_required_size` / `encode_dense_into`.
 struct DenseLayout {
     use_custom_align: bool,
     header_len: usize,
@@ -475,7 +452,7 @@ struct DenseLayout {
 
 fn dense_layout(spec: &ArraySpec, opts: &EncodeOpts) -> Result<DenseLayout, TensoError> {
     if !opts.alignment.is_power_of_two() {
-        // Alignment must be a power of two (mirrors the Python/Rust encoders).
+        // alignment must be a power of two
         return Err(TensoError::Malformed);
     }
     let ndim = spec.shape.len();
@@ -486,9 +463,7 @@ fn dense_layout(spec: &ArraySpec, opts: &EncodeOpts) -> Result<DenseLayout, Tens
     if num_elements > MAX_ELEMENTS {
         return Err(TensoError::TooManyElements);
     }
-    // Dense path only supports fixed-size dtypes; the variable-length /
-    // quantized dtypes have their own packet shapes and are not produced via
-    // ArraySpec dense encoding.
+    // Dense path is fixed-size dtypes only (variable/quant dtypes have their own packets).
     let item = spec
         .dtype
         .item_size()
@@ -497,7 +472,7 @@ fn dense_layout(spec: &ArraySpec, opts: &EncodeOpts) -> Result<DenseLayout, Tens
         .checked_mul(item)
         .ok_or(TensoError::TooManyElements)?;
     if spec.data.len() != expected {
-        // Caller's byte buffer must match shape*item_size exactly.
+        // buffer must be exactly shape*item_size
         return Err(TensoError::Malformed);
     }
 
@@ -523,9 +498,7 @@ pub fn dense_required_size(spec: &ArraySpec, opts: &EncodeOpts) -> Result<usize,
     let body_len = if opts.compress {
         #[cfg(feature = "compression")]
         {
-            // Upper bound for the LZ4 *frame* output. Mirror the Python/Rust
-            // sizing: block worst-case + fixed frame overhead + 4-byte per-block
-            // size prefix so tiny/incompressible inputs never overflow.
+            // LZ4 frame upper bound: block worst-case + frame overhead + per-block size prefix.
             let nbytes = spec.data.len();
             let block_worst = lz4_flex::block::get_maximum_output_size(nbytes);
             block_worst + 64 + (nbytes / 65536 + 1) * 4
@@ -552,8 +525,7 @@ pub fn encode_dense_into(
     let layout = dense_layout(spec, opts)?;
     let ndim = spec.shape.len();
 
-    // Resolve the (optionally compressed) body bytes up front so we know the
-    // exact total length.
+    // Resolve the (optionally compressed) body up front to know total length.
     #[cfg(feature = "compression")]
     let compressed: Option<Vec<u8>> = if opts.compress {
         Some(lz4_compress_frame(spec.data)?)
@@ -606,7 +578,7 @@ pub fn encode_dense_into(
         out[cursor] = opts.alignment.trailing_zeros() as u8;
         cursor += 1;
     }
-    // cursor == header_len here; zero the padding.
+    // cursor == header_len; zero the padding
     debug_assert_eq!(cursor, layout.header_len);
     let body_start = layout.header_len + layout.padding_len;
     for b in &mut out[layout.header_len..body_start] {
@@ -618,8 +590,7 @@ pub fn encode_dense_into(
     if opts.check_integrity {
         #[cfg(feature = "integrity")]
         {
-            // Integrity covers the (possibly compressed) body bytes exactly as
-            // they appear on the wire — matches root src/lib.rs / core.py.
+            // Integrity covers the on-wire body (compressed or raw); matches core.py.
             let hash = integrity_hash(body);
             let footer_start = body_start + body_len;
             out[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
@@ -640,14 +611,10 @@ pub fn encode_dense_into(
 /// Maximum bundle entries: the v4 header stores the count in `ndim` (one byte).
 pub const MAX_BUNDLE_ENTRIES: usize = 255;
 
-/// Compute the exact buffer size needed to encode `entries` as a bundle packet.
+/// Exact buffer size for a bundle packet.
 ///
-/// Layout (matches `decode()`'s bundle arm and the Python `dumps` bundle path):
-///   v4 header (flags = FLAG_BUNDLE, dtype = 0, ndim = entry count)
-///   then for each entry: klen:u32 LE | key utf8 | vlen:u32 LE | value packet
-///
-/// `entries` carry the already-encoded value packets as `&[u8]`. More than
-/// `MAX_BUNDLE_ENTRIES` entries is an error (the count must fit in one byte).
+/// Layout: v4 header (FLAG_BUNDLE, dtype 0, ndim = entry count), then per entry
+/// `klen:u32 LE | key utf8 | vlen:u32 LE | value packet`. >`MAX_BUNDLE_ENTRIES` errors.
 pub fn bundle_required_size(entries: &[(&str, &[u8])]) -> Result<usize, TensoError> {
     if entries.len() > MAX_BUNDLE_ENTRIES {
         return Err(TensoError::BadBundle);
@@ -665,10 +632,7 @@ pub fn bundle_required_size(entries: &[(&str, &[u8])]) -> Result<usize, TensoErr
     Ok(total)
 }
 
-/// Encode `entries` into `out` as a bundle packet, returning the byte count.
-///
-/// See [`bundle_required_size`] for the layout. More than
-/// `MAX_BUNDLE_ENTRIES` entries returns `Err(TensoError::BadBundle)`.
+/// Encode `entries` as a bundle packet into `out` (layout: [`bundle_required_size`]).
 pub fn encode_bundle_into(entries: &[(&str, &[u8])], out: &mut [u8]) -> Result<usize, TensoError> {
     let total = bundle_required_size(entries)?;
     if out.len() < total {
@@ -699,9 +663,7 @@ pub fn encode_bundle_into(entries: &[(&str, &[u8])], out: &mut [u8]) -> Result<u
 // Sparse encode API
 // =============================================================================
 
-/// Encode options for sparse component sub-packets: dense, no integrity, no
-/// compression, default 64-byte alignment. Mirrors the Python sparse path
-/// (`dumps(c, strict, False, False, alignment)` with `alignment == 64`).
+/// Sparse component opts: dense, no integrity/compression, 64-byte align (matches Python).
 #[inline]
 fn sparse_component_opts() -> EncodeOpts {
     EncodeOpts {
@@ -711,16 +673,10 @@ fn sparse_component_opts() -> EncodeOpts {
     }
 }
 
-/// Compute the exact buffer size needed to encode a sparse packet.
+/// Exact buffer size for a sparse packet.
 ///
-/// Layout (matches `decode()`'s sparse arm and the Python sparse path):
-///   v4 header (flags = sparse format flag, dtype = 0, ndim = shape.len())
-///   shape[ndim] (u32 LE each)
-///   then 3x: size:u32 LE | dense sub-packet
-///
-/// `components` are the three dense arrays (in order) and are each measured as
-/// dense packets with `EncodeOpts{check_integrity:false, compress:false,
-/// alignment:64}`. Exactly three components are required.
+/// Layout: v4 header (format flag, dtype 0, ndim = shape.len()), shape[ndim] (u32 LE),
+/// then 3x `size:u32 LE | dense sub-packet`. Exactly three components required.
 pub fn sparse_required_size(shape: &[u32], components: &[ArraySpec]) -> Result<usize, TensoError> {
     if components.len() != 3 {
         return Err(TensoError::Malformed);
@@ -734,7 +690,7 @@ pub fn sparse_required_size(shape: &[u32], components: &[ArraySpec]) -> Result<u
         .ok_or(TensoError::Malformed)?;
     for comp in components {
         let sub = dense_required_size(comp, &opts)?;
-        // size prefix (4) + sub-packet
+        // size prefix(4) + sub-packet
         total = total
             .checked_add(4)
             .and_then(|t| t.checked_add(sub))
@@ -743,11 +699,8 @@ pub fn sparse_required_size(shape: &[u32], components: &[ArraySpec]) -> Result<u
     Ok(total)
 }
 
-/// Encode a sparse packet into `out`, returning the byte count.
-///
-/// See [`sparse_required_size`] for the layout. The three `components` are
-/// encoded as dense sub-packets WITHOUT integrity or compression, at 64-byte
-/// alignment, exactly as the Python/decoder layout requires.
+/// Encode a sparse packet into `out` (layout: [`sparse_required_size`]).
+/// Components are dense sub-packets, no integrity/compression, 64-byte aligned.
 pub fn encode_sparse_into(
     format: SparseFormat,
     shape: &[u32],
@@ -792,17 +745,15 @@ pub fn encode_sparse_into(
 // Quantized encode API
 // =============================================================================
 
-/// A quantized tensor to encode. `scales`/`zero_points` are f32 values (one per
-/// tensor/channel/group); `data` is the already-packed body (4-bit dtypes pack
-/// two elements per byte). Mirrors `core.py::_serialize_quantized`.
+/// A quantized tensor to encode (mirrors `core.py::_serialize_quantized`).
+/// `data` is the already-packed body (4-bit dtypes pack 2 elements/byte).
 pub struct QuantSpec<'a> {
     pub dtype: Dtype,
     pub shape: &'a [u32],
     pub scheme: u8,
     pub axis: u8,
     pub group_size: u32,
-    /// Raw little-endian f32 bytes (one f32 per tensor/channel/group), exactly as
-    /// they appear on the wire (`numpy.float32 array.tobytes()`).
+    /// Raw LE f32 bytes, one per tensor/channel/group (on-wire `numpy.float32.tobytes()`).
     pub scales: &'a [u8],
     pub zero_points: &'a [u8],
     pub data: &'a [u8],
@@ -830,7 +781,7 @@ fn quant_layout(spec: &QuantSpec, opts: &EncodeOpts) -> Result<QuantLayout, Tens
     if ndim > MAX_NDIM {
         return Err(TensoError::TooManyDims);
     }
-    // scales/zero_points are raw f32 bytes: equal length, multiple of 4.
+    // scales/zero_points: raw f32 bytes, equal length, multiple of 4
     if spec.scales.len() != spec.zero_points.len() || !spec.scales.len().is_multiple_of(4) {
         return Err(TensoError::Malformed);
     }
@@ -870,8 +821,7 @@ pub fn quantized_required_size(spec: &QuantSpec, opts: &EncodeOpts) -> Result<us
     Ok(l.header_len + l.padding_len + l.body_len + footer_len)
 }
 
-/// Encode a quantized tensor into `out`, returning the number of bytes written.
-/// Byte-identical to `core.py::_serialize_quantized`.
+/// Encode a quantized tensor into `out` (byte-identical to `core.py::_serialize_quantized`).
 pub fn encode_quantized_into(
     spec: &QuantSpec,
     out: &mut [u8],
@@ -968,9 +918,8 @@ pub fn string_required_size(
     Ok(header_len + padding_len + body_len + footer_len)
 }
 
-/// Encode a StringTensor into `out`. `offsets` is `count + 1` u64 values starting
-/// at 0, monotonic non-decreasing, ending at `payload.len()`. Byte-identical to
-/// `ragged.py::StringTensor.dumps` (always 64-aligned, dtype = Str, ndim = 1).
+/// Encode a StringTensor into `out` (byte-identical to `ragged.py::StringTensor.dumps`;
+/// 64-aligned, dtype Str, ndim 1). `offsets` is `count+1` u64s from 0, monotonic, ending at `payload.len()`.
 pub fn encode_string_into(
     count: u32,
     offsets: &[u64],
@@ -1026,7 +975,7 @@ pub fn encode_string_into(
     if check_integrity {
         #[cfg(feature = "integrity")]
         {
-            // Integrity covers the body (offsets + payload), matching ragged.py.
+            // Integrity covers body (offsets + payload); matches ragged.py.
             let hash = integrity_hash(&out[body_start..body_start + body_len]);
             let footer_start = body_start + body_len;
             out[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
@@ -1109,21 +1058,13 @@ impl SparseFormat {
     }
 }
 
-/// Decode a Tenso packet into its structured form.
-///
-/// Body slices are zero-copy borrows from `bytes` except where decompression
-/// is required (compressed dense bodies cannot be returned through the
-/// borrowing `Decoded` shape, so they are rejected here — the FFI/device layer
-/// owns owned-buffer decode paths). Quantized scales/zero-points/packed and
-/// string/ragged offsets/payload are all borrowed in place.
+/// Decode a Tenso packet. Bodies are zero-copy borrows; compressed dense bodies
+/// can't be borrowed so are rejected here (use the owning FFI/device decode path).
 pub fn decode(bytes: &[u8]) -> Result<Decoded<'_>, TensoError> {
     decode_depth(bytes, 0)
 }
 
-/// Maximum bundle/sparse nesting depth `decode` will follow. A packet whose
-/// value sub-packets nest deeper than this is rejected with `Malformed` rather
-/// than risking unbounded recursion / stack overflow on untrusted input. This is
-/// an availability bound (a safe-Rust DoS guard), not a memory-safety fix.
+/// Max bundle/sparse nesting depth (DoS guard against stack overflow; deeper => `Malformed`).
 pub const MAX_DECODE_DEPTH: usize = 64;
 
 fn decode_depth(bytes: &[u8], depth: usize) -> Result<Decoded<'_>, TensoError> {
@@ -1199,10 +1140,8 @@ fn decode_depth(bytes: &[u8], depth: usize) -> Result<Decoded<'_>, TensoError> {
         return decode_string(bytes, &hdr);
     }
     if flags & FLAG_RAGGED != 0 {
-        // RaggedArray is serialized as a bundle in the Python impl, so a raw
-        // FLAG_RAGGED header is not normally produced; support a direct framing
-        // (shape + offsets + payload) symmetric with the String layout for
-        // completeness.
+        // Python serializes RaggedArray as a bundle; support the direct
+        // (shape+offsets+payload) framing here for completeness.
         return decode_ragged(bytes, &hdr);
     }
 
@@ -1247,9 +1186,8 @@ fn read_shape(bytes: &[u8], base: usize, ndim: usize) -> Result<Vec<u32>, TensoE
     Ok(shape)
 }
 
-/// Resolve the body alignment from flags + an optional custom-align exponent
-/// byte that follows the shape. Returns (alignment, header_len) where
-/// `header_len` includes the alignment byte if present.
+/// Resolve body alignment from flags + optional custom-align exponent byte after the shape.
+/// Returns (alignment, header_len), where header_len includes the align byte if present.
 fn resolve_alignment(
     bytes: &[u8],
     flags: u16,
@@ -1303,7 +1241,7 @@ fn decode_dense<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, TensoE
         .ok_or(TensoError::TooManyElements)?;
 
     let body_len = if flags & FLAG_COMPRESSION != 0 {
-        // Compressed body extends to the footer.
+        // compressed body runs to the footer
         let avail = bytes.len();
         if avail < body_start + footer_len {
             return Err(TensoError::TooShort);
@@ -1341,10 +1279,8 @@ fn decode_dense<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, TensoE
     }
 
     if flags & FLAG_COMPRESSION != 0 {
-        // A compressed dense body cannot be returned as a zero-copy borrow.
-        // The owning decode paths (FFI Mode B / device codec) handle
-        // decompression; the borrowing `decode` rejects it so callers don't
-        // mistake the compressed bytes for tensor data.
+        // Can't borrow a compressed body zero-copy; reject so callers don't
+        // mistake compressed bytes for tensor data (owning paths decompress).
         return Err(TensoError::Lz4(
             "compressed dense bodies require an owning decode path",
         ));
@@ -1358,16 +1294,11 @@ fn decode_dense<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, TensoE
     }))
 }
 
-/// Owning dense decode that also handles COMPRESSED bodies (decompresses them).
-///
-/// The borrowing [`decode`] rejects a compressed dense packet because it cannot
-/// hand back an owned decompressed buffer; this is its owning counterpart for
-/// binding / FFI callers. Returns `(dtype, shape, owned_body)`. Integrity (when
-/// present) is verified by the underlying parse before decompression.
+/// Owning dense decode (decompresses compressed bodies); the borrowing [`decode`] rejects those.
+/// Returns `(dtype, shape, owned_body)`; integrity is verified before decompression.
 #[cfg(feature = "compression")]
 pub fn decode_dense_to_owned(bytes: &[u8]) -> Result<(Dtype, Vec<u32>, Vec<u8>), TensoError> {
-    // Uncompressed dense reuses the borrowing decoder directly (which also runs
-    // the integrity check); a non-dense packet is an error here.
+    // Uncompressed dense reuses the borrowing decoder (also runs integrity); non-dense errors.
     match decode(bytes) {
         Ok(Decoded::Dense(v)) => return Ok((v.dtype, v.shape, v.body.to_vec())),
         Ok(_) => return Err(TensoError::Malformed),
@@ -1393,8 +1324,7 @@ pub fn decode_dense_to_owned(bytes: &[u8]) -> Result<(Dtype, Vec<u32>, Vec<u8>),
     if bytes.len() < body_start + footer_len {
         return Err(TensoError::TooShort);
     }
-    // Compressed body extends from body_start to the footer (it has no length
-    // prefix). Bounds were validated by the `decode` parse above.
+    // Compressed body: body_start to the footer (no length prefix; bounds checked above).
     let body = &bytes[body_start..bytes.len() - footer_len];
     let owned = lz4_decompress_frame(body)?;
     Ok((dtype, shape, owned))
@@ -1413,8 +1343,7 @@ fn decode_quantized<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, Te
         return Err(TensoError::TooManyElements);
     }
 
-    // Quant metadata: scheme(1) + axis(1) + group_size(4) + num_scales(4)
-    //                 + scales(num_scales*4) + zero_points(num_scales*4)
+    // meta: scheme(1) + axis(1) + group_size(4) + num_scales(4) + scales(n*4) + zero_points(n*4)
     let meta_start = shape_end;
     let mut cursor = meta_start;
     if bytes.len() < cursor + 10 {
@@ -1490,9 +1419,7 @@ fn decode_quantized<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, Te
         dtype,
         shape,
         scheme,
-        // axis is stored as a single unsigned byte on the wire (the Python
-        // serializer writes `axis & 0xFF` and reads it back unsigned), so
-        // surface it as an unsigned-extended i32 to match round-trip semantics.
+        // axis is a single unsigned wire byte (Python writes `axis & 0xFF`); zero-extend to i32.
         axis: axis_byte as i32,
         group_size,
         scales,
@@ -1523,14 +1450,8 @@ fn decode_ragged<'a>(bytes: &'a [u8], hdr: &Header) -> Result<Decoded<'a>, Tenso
 /// Decoded offset+payload: `(offsets-as-u32-shape, offsets_bytes, payload_bytes)`.
 type OffsetPayload<'a> = (Vec<u32>, &'a [u8], &'a [u8]);
 
-/// Shared decode for the String/Ragged offset+payload layout:
-///
-/// ```text
-/// header + shape[ndim] + (cust-align byte?) + padding
-///        + offsets((count+1) * u64) + payload + (8-byte integrity footer?)
-/// ```
-///
-/// `shape[0]` (== count) determines the offsets array length.
+/// Shared String/Ragged decode. Layout: header + shape[ndim] + (cust-align?) + padding
+/// + offsets((count+1)*u64) + payload + (integrity footer?). `shape[0]` == count.
 fn decode_offset_payload<'a>(
     bytes: &'a [u8],
     hdr: &Header,
@@ -1562,9 +1483,8 @@ fn decode_offset_payload<'a>(
     }
     let offsets = &bytes[body_start..offsets_end];
 
-    // Validate offsets: must start at 0 and be monotonic non-decreasing
-    // (mirrors the StringTensor.loads validation in ragged.py so untrusted
-    // input can't drive garbage slices). The last offset is the payload length.
+    // Offsets must start at 0 and be monotonic (mirrors ragged.py; guards untrusted input).
+    // Last offset is the payload length.
     let mut prev = 0u64;
     for i in 0..=count {
         let o = read_u64(bytes, body_start + i * 8)?;
@@ -1593,7 +1513,7 @@ fn decode_offset_payload<'a>(
                 return Err(TensoError::TooShort);
             }
             let expected = read_u64(bytes, payload_end)?;
-            // Integrity covers the body = offsets + payload (matches ragged.py).
+            // Integrity covers body = offsets + payload (matches ragged.py).
             if integrity_hash(&bytes[body_start..payload_end]) != expected {
                 return Err(TensoError::IntegrityMismatch);
             }
@@ -1612,15 +1532,13 @@ fn decode_offset_payload<'a>(
 // =============================================================================
 
 /// Encode an `IpcRef` into a fresh `IPC_REF_PACKET_LEN`-byte packet.
-///
-/// Layout: v4 header with `FLAG_GPU_IPC_REF`, reserved byte (offset 9) set to
-/// `IPC_REF_DISCRIMINATOR`, then the fixed 96-byte body:
-///   handle[64], byte_offset:u64 LE, nbytes:u64 LE, device_uuid[16]
+/// Layout: v4 header (FLAG_GPU_IPC_REF, offset-9 byte = IPC_REF_DISCRIMINATOR), then 96-byte
+/// body: handle[64], byte_offset:u64 LE, nbytes:u64 LE, device_uuid[16].
 pub fn write_ipc_ref(out: &mut [u8], ipc: &IpcRef) -> Result<usize, TensoError> {
     if out.len() < IPC_REF_PACKET_LEN {
         return Err(TensoError::BufferTooSmall);
     }
-    // ndim = 0 (no shape); flags = GPU_IPC_REF only (never INTEGRITY).
+    // ndim 0 (no shape); GPU_IPC_REF only, never INTEGRITY
     write_v4_header(out, FLAG_GPU_IPC_REF, 0, 0);
     out[9] = IPC_REF_DISCRIMINATOR;
 
@@ -1638,21 +1556,20 @@ pub fn write_ipc_ref(out: &mut [u8], ipc: &IpcRef) -> Result<usize, TensoError> 
     Ok(IPC_REF_PACKET_LEN)
 }
 
-/// Parse an IpcRef packet, validating the discriminator and rejecting any
-/// illegal flag combinations (e.g. INTEGRITY) or inline body.
+/// Parse an IpcRef packet; validate discriminator, reject illegal flags (INTEGRITY) / inline body.
 pub fn parse_ipc_ref(bytes: &[u8]) -> Result<IpcRef, TensoError> {
     let hdr = parse_header(bytes)?;
     if hdr.flags & FLAG_GPU_IPC_REF == 0 {
         return Err(TensoError::Malformed);
     }
-    // IpcRef packets must never carry an integrity footer or an inline body.
+    // IpcRef never carries an integrity footer or inline body
     if hdr.flags & FLAG_INTEGRITY != 0 {
         return Err(TensoError::Malformed);
     }
     if hdr.version != VERSION {
         return Err(TensoError::UnsupportedVersion(hdr.version));
     }
-    // Reserved byte (offset 9) is the discriminator; ndim must be 0.
+    // offset-9 byte is the discriminator; ndim must be 0
     if bytes.len() < HEADER_BASE_V4 || bytes[9] != IPC_REF_DISCRIMINATOR {
         return Err(TensoError::Malformed);
     }
@@ -1696,8 +1613,7 @@ pub enum TensoError {
     TooManyElements,
     IntegrityMismatch,
     BadBundle,
-    /// LZ4 (de)compression error; carries a static reason string so the enum
-    /// stays no_std-clonable without dragging in the lz4 error type.
+    /// LZ4 (de)compression error; static reason string keeps the enum no_std-clonable.
     Lz4(&'static str),
     /// Buffer supplied to an `*_into` function was too small.
     BufferTooSmall,
@@ -1970,8 +1886,7 @@ mod tests {
         let mut b_pkt = vec![0u8; b_sz];
         encode_dense_into(&b_spec, &mut b_pkt, &EncodeOpts::default()).unwrap();
 
-        // Assemble a bundle packet manually (encoder for bundles lives in the
-        // FFI/python layer; here we just exercise the decoder).
+        // Assemble a bundle packet manually to exercise the decoder.
         let mut pkt = vec![0u8; HEADER_BASE_V4];
         write_v4_header(&mut pkt, FLAG_BUNDLE, 0, 2);
         for (key, body) in [("a", &a_pkt), ("b", &b_pkt)] {
@@ -2107,9 +2022,8 @@ mod tests {
 
     #[test]
     fn decode_rejects_too_deeply_nested_bundle() {
-        // Innermost valid dense packet, then wrap it in 1-entry bundles deeper
-        // than MAX_DECODE_DEPTH. decode() must reject with Malformed rather than
-        // recursing until the stack overflows (untrusted-input DoS guard).
+        // Wrap a dense packet in 1-entry bundles past MAX_DECODE_DEPTH; decode() must
+        // reject with Malformed instead of overflowing the stack (DoS guard).
         let data = 1.0f32.to_le_bytes().to_vec();
         let shape = [1u32];
         let spec = ArraySpec {
@@ -2144,8 +2058,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized_element_count() {
-        // Dense f32, ndim=1, shape=[u32::MAX] -> element count far over
-        // MAX_ELEMENTS. decode() must reject it (no oversized allocation).
+        // Dense f32 shape=[u32::MAX] exceeds MAX_ELEMENTS; decode() must reject (no huge alloc).
         let mut pkt = vec![0u8; HEADER_BASE_V4 + 4];
         write_v4_header(&mut pkt, 0, Dtype::F32.code(), 1);
         pkt[HEADER_BASE_V4..HEADER_BASE_V4 + 4].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -2379,8 +2292,8 @@ mod tests {
         let zp: f32 = 1.0;
         let body: [u8; 4] = [10, 20, 30, 40];
 
+        // meta = scheme1 axis1 gs4 num4 + 1*4 scales + 1*4 zp = 18
         let header_len_base = HEADER_BASE_V4 + ndim * 4; // shape
-                                                         // meta: scheme1 axis1 gs4 num4 + 1*4 scales + 1*4 zp = 18
         let mut pkt = vec![0u8; header_len_base];
         write_v4_header(&mut pkt, FLAG_ALIGNED, DCODE_QINT8, ndim as u8);
         pkt[HEADER_BASE_V4..HEADER_BASE_V4 + 4].copy_from_slice(&shape[0].to_le_bytes());
@@ -2454,8 +2367,7 @@ mod tests {
             zero_points: &zps,
             data: &data,
         };
-        // check_integrity stays false so this runs under default features too
-        // (the integrity footer path requires the `integrity` feature).
+        // check_integrity false so this runs without the `integrity` feature
         let opts = EncodeOpts {
             check_integrity: false,
             compress: false,
@@ -2506,8 +2418,7 @@ mod tests {
 
     #[test]
     fn encode_string_roundtrip_and_matches_fixture() {
-        // Same strings as the string_mixed_utf8.tenso fixture (Python-produced):
-        // the Rust encoder must be byte-identical.
+        // Same strings as the string_mixed_utf8.tenso fixture; encoder must be byte-identical.
         let parts: [&[u8]; 4] = [b"hi", b"", b"world", "\u{00f1}".as_bytes()];
         let mut payload: Vec<u8> = Vec::new();
         let mut offsets: Vec<u64> = vec![0];
@@ -2534,12 +2445,8 @@ mod tests {
 }
 
 // =============================================================================
-// Conformance tests: read frozen .tenso fixtures and assert round-trip + that
-// the core encoder reproduces the dense fixtures byte-for-byte.
-//
-// Fixtures live at the workspace root (tests/fixtures). They are only present
-// in a full checkout, so each test that opens one skips gracefully if the file
-// is missing (e.g. a packaged crate build).
+// Conformance tests: frozen .tenso fixtures round-trip + byte-identical encode.
+// Fixtures (tests/fixtures, root) may be absent in a packaged build; tests skip if missing.
 // =============================================================================
 
 #[cfg(all(test, feature = "std"))]
@@ -2700,9 +2607,7 @@ mod conformance {
             eprintln!("skip: fixture missing");
             return;
         };
-        // bf16 [1.0, -1.5, 0.25, 3.75]; reproduce by reading the body bytes
-        // from the fixture itself (we don't depend on a bf16 crate) and
-        // round-tripping them through the encoder.
+        // Read the body bytes from the fixture (no bf16 crate dep) and round-trip through the encoder.
         let hdr = parse_header(&data).unwrap();
         assert_eq!(hdr.dtype_code, DCODE_BF16);
         // header(10)+shape(4)=14, pad to 64 -> body at 64, 4*2=8 bytes.
