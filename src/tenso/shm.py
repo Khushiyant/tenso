@@ -9,6 +9,7 @@ tensors between local processes.
 from typing import Any, Optional, Self, Union
 import numpy as np
 
+from .config import _HEADER_BASE_V4
 from .core import dumps, loads as core_loads
 
 try:
@@ -112,7 +113,10 @@ class TensoShm:
                     compress=compress,
                     alignment=alignment,
                 )
-            except (NotImplementedError, TypeError):
+            except (NotImplementedError, TypeError, AttributeError):
+                # AttributeError covers types the Rust path can't introspect
+                # (e.g. QuantizedTensor has no .dtype); the Python dumps()
+                # fallback below handles them correctly.
                 pass
 
         # Fallback: serialize to bytes then copy into SHM
@@ -160,7 +164,16 @@ class TensoShm:
         """
         estimated_size = cls._estimate_size(obj, check_integrity, alignment)
 
-        shm = cls(name, create=True, size=estimated_size)
+        try:
+            shm = cls(name, create=True, size=estimated_size)
+        except FileExistsError:
+            # A previous run may have leaked this segment (segments outlive the
+            # process unless explicitly unlinked). Reclaim the stale name.
+            stale = cls(name)
+            stale.close()
+            stale.unlink()
+            shm = cls(name, create=True, size=estimated_size)
+
         try:
             shm.put(obj, check_integrity=check_integrity, compress=compress, alignment=alignment)
             return shm
@@ -177,22 +190,22 @@ class TensoShm:
 
         if isinstance(obj, np.ndarray):
             ndim = obj.ndim
-            header_size = 8 + (ndim * 4) + (1 if alignment != 64 else 0)
+            header_size = _HEADER_BASE_V4 + (ndim * 4) + (1 if alignment != 64 else 0)
             return header_size + (alignment - 1) + obj.nbytes + footer_size + safety
 
         if isinstance(obj, dict):
-            total = 8  # bundle header
+            total = _HEADER_BASE_V4  # bundle header
             for key, value in obj.items():
                 key_bytes = key.encode('utf-8') if isinstance(key, str) else str(key).encode('utf-8')
                 total += 4 + len(key_bytes) + 4
                 total += TensoShm._estimate_size(value, check_integrity, alignment)
             return total + safety
 
-        if hasattr(obj, 'format') and hasattr(obj, 'data'):
+        if hasattr(obj, 'format') and hasattr(obj, 'data') and not isinstance(obj, np.ndarray):
             fmt = getattr(obj, 'format', '')
             shape = obj.shape
             ndim = len(shape)
-            total = 8 + (ndim * 4)  # main header
+            total = _HEADER_BASE_V4 + (ndim * 4)  # main header
             comps = []
             if fmt == 'coo':
                 comps = [obj.data, obj.row, obj.col]
@@ -200,8 +213,16 @@ class TensoShm:
                 comps = [obj.data, obj.indices, obj.indptr]
             for c in comps:
                 c = np.asarray(c)
-                h = 8 + (c.ndim * 4) + (1 if alignment != 64 else 0)
+                h = _HEADER_BASE_V4 + (c.ndim * 4) + (1 if alignment != 64 else 0)
                 total += 4 + h + (alignment - 1) + c.nbytes + footer_size
             return total + safety
 
-        raise TypeError(f"Unsupported type for SHM auto-sizing: {type(obj)}")
+        # General fallback (e.g. QuantizedTensor): serialize once to size it
+        # exactly. create_from is not a hot path, so the extra encode is fine.
+        try:
+            packet = bytes(dumps(obj, check_integrity=check_integrity, alignment=alignment))
+        except Exception as exc:
+            raise TypeError(
+                f"Unsupported type for SHM auto-sizing: {type(obj)}"
+            ) from exc
+        return len(packet) + safety

@@ -89,11 +89,13 @@ class TensoFastAPIClient:
         Any
             The deserialized response (np.ndarray, dict, or sparse matrix).
         """
-        packet = bytes(dumps(
+        # dumps() returns a memoryview; httpx's `content=` accepts any
+        # bytes-like object, so pass the view directly to avoid an extra copy.
+        packet = dumps(
             tensor,
             check_integrity=self._check_integrity,
             compress=compress,
-        ))
+        )
         client = self._get_sync_client()
         response = client.post(
             endpoint,
@@ -110,11 +112,13 @@ class TensoFastAPIClient:
         compress: bool = False,
     ) -> Any:
         """Async version of predict()."""
-        packet = bytes(dumps(
+        # dumps() returns a memoryview; httpx accepts bytes-like content
+        # directly, avoiding an extra copy on the request side.
+        packet = dumps(
             tensor,
             check_integrity=self._check_integrity,
             compress=compress,
-        ))
+        )
         client = self._get_async_client()
         response = await client.post(
             endpoint,
@@ -133,7 +137,9 @@ class TensoFastAPIClient:
         Send a tensor and stream the response, reassembling chunks
         into the final deserialized object.
         """
-        packet = bytes(dumps(tensor, check_integrity=self._check_integrity))
+        # dumps() returns a memoryview; httpx accepts it as request content
+        # without an extra copy.
+        packet = dumps(tensor, check_integrity=self._check_integrity)
         client = self._get_sync_client()
 
         chunks = []
@@ -144,6 +150,8 @@ class TensoFastAPIClient:
             for chunk in response.iter_bytes():
                 chunks.append(chunk)
 
+        # loads() needs a single contiguous buffer, so the streamed chunks must
+        # be concatenated here; this join is required, not an avoidable copy.
         return loads(b"".join(chunks))
 
     def close(self):

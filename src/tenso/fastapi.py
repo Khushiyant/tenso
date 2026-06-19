@@ -9,7 +9,7 @@ from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse
 import numpy as np
 from typing import Any
-from .core import iter_dumps, loads
+from .core import dumps, iter_dumps, loads
 
 
 class TensoResponse(StreamingResponse):
@@ -32,19 +32,28 @@ class TensoResponse(StreamingResponse):
 
     def __init__(
         self,
-        tensor: np.ndarray,
+        tensor: Any,
         filename: str = None,
         strict: bool = False,
         check_integrity: bool = False,
         **kwargs,
     ):
-        stream = iter_dumps(tensor, strict=strict, check_integrity=check_integrity)
+        if isinstance(tensor, np.ndarray):
+            # Zero-copy vectored streaming for dense arrays.
+            stream = iter_dumps(tensor, strict=strict, check_integrity=check_integrity)
+        else:
+            # Bundles (dict), sparse matrices and quantized tensors aren't
+            # supported by iter_dumps; serialize the whole packet via dumps().
+            packet = dumps(tensor, strict=strict, check_integrity=check_integrity)
+            stream = iter((bytes(packet),))
         super().__init__(stream, media_type="application/octet-stream", **kwargs)
         if not hasattr(self, "background"):
             self.background = kwargs.get("background")
-        self.headers["X-Tenso-Version"] = "2"
-        self.headers["X-Tenso-Shape"] = str(tensor.shape)
-        self.headers["X-Tenso-Dtype"] = str(tensor.dtype)
+        self.headers["X-Tenso-Version"] = "4"
+        if hasattr(tensor, "shape"):
+            self.headers["X-Tenso-Shape"] = str(tensor.shape)
+        if hasattr(tensor, "dtype"):
+            self.headers["X-Tenso-Dtype"] = str(tensor.dtype)
         if filename:
             self.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
 
@@ -74,6 +83,8 @@ async def get_tenso_data(request: Request) -> Any:
         )
     body = await request.body()
     try:
-        return loads(body)
+        # copy=True so handlers receive a writable array rather than a read-only
+        # view into the (immutable) request body.
+        return loads(body, copy=True)
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Invalid Tenso packet: {str(e)}")

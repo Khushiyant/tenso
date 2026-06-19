@@ -25,12 +25,17 @@ Usage::
     ray.get(process.remote(np.random.randn(1000, 1000)))
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
 from . import dumps, loads
 from .quantize import QuantizedTensor
+
+# Tracks the classes for which register() installed Tenso serializers, so
+# that unregister() can remove exactly those (including torch/jax) and
+# correctly revert to pickle.
+_registered_types: List[type] = []
 
 
 def _serialize_ndarray(arr: np.ndarray) -> bytes:
@@ -103,12 +108,24 @@ def register(
             "Install it with: pip install 'tenso[api]'"
         )
 
+    # Reset tracking so unregister() only ever reverts this call's serializers.
+    _registered_types.clear()
+
     # numpy arrays
     register_serializer(
         np.ndarray,
         serializer=_serialize_ndarray,
         deserializer=_deserialize_ndarray,
     )
+    _registered_types.append(np.ndarray)
+
+    # dict bundles
+    register_serializer(
+        dict,
+        serializer=_serialize_dict,
+        deserializer=_deserialize_dict,
+    )
+    _registered_types.append(dict)
 
     # QuantizedTensor
     register_serializer(
@@ -116,6 +133,7 @@ def register(
         serializer=_serialize_quantized,
         deserializer=_deserialize_quantized,
     )
+    _registered_types.append(QuantizedTensor)
 
     # PyTorch tensors
     if include_torch:
@@ -140,6 +158,7 @@ def register(
             serializer=_serialize_torch,
             deserializer=_deserialize_torch,
         )
+        _registered_types.append(torch.Tensor)
 
     # JAX arrays
     if include_jax:
@@ -165,20 +184,24 @@ def register(
             serializer=_serialize_jax,
             deserializer=_deserialize_jax,
         )
+        _registered_types.append(JaxArray)
 
 
 def unregister() -> None:
     """
     Remove Tenso serializers from Ray, reverting to default pickle behavior.
 
-    This deregisters all types that were registered by :func:`register`.
+    This deregisters exactly the types that were registered by the most recent
+    :func:`register` call (including dict bundles and any torch/jax types),
+    so that all of them revert to pickle.
     """
     try:
         from ray.util.serialization import deregister_serializer
     except ImportError:
         return
 
-    for cls in [np.ndarray, QuantizedTensor]:
+    while _registered_types:
+        cls = _registered_types.pop()
         try:
             deregister_serializer(cls)
         except Exception:

@@ -7,6 +7,11 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# Own workspace root: the repo root Cargo.toml is now a [workspace] that
+# `exclude`s `fuzz`. Without an empty [workspace] here, cargo-fuzz building from
+# the root errors "current package believes it's in a workspace when it's not".
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 

@@ -6,4 +6,4 @@ Report vulnerabilities privately via GitHub Security Advisories:
 
 Please do not file public issues for suspected security bugs.
 
-Supported releases: latest minor (0.21.x) and the previous one (0.20.x).
+Supported releases: latest minor (0.22.x) and the previous one (0.21.x).

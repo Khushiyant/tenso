@@ -1,435 +1,205 @@
+// This crate targets the PyO3 0.22 `gil-refs` API. Migrating to the `Bound`
+// API is tracked separately (it touches every binding); until then, silence
+// the deprecation warnings so `clippy -D warnings` stays meaningful for real
+// issues. `clippy::useless_conversion` is allowed for the same reason: it fires
+// on PyErr->PyErr conversions inside `#[pyfunction]` macro-generated code, which
+// we don't control until the Bound migration. The pure-Rust engine
+// (crates/tenso-core) is gil-refs-free and keeps the full strict lint set.
+#![allow(deprecated, clippy::useless_conversion)]
+
+//! Thin PyO3 binding over `tenso-core`.
+//!
+//! This crate owns ONLY the Python-facing concerns:
+//!   * numpy extraction (dtype/ptr/shape) and Python object construction,
+//!   * dispatch between dense / bundle / sparse on the Python side,
+//!   * true zero-copy `loads` via `numpy.frombuffer(offset=...)`,
+//!   * the POSIX shared-memory mutex helpers (`shm_mutex`).
+//!
+//! ALL wire-format codec is delegated to `tenso_core` (the authoritative
+//! engine). There is no duplicated header/dense/bundle/sparse logic here.
+
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
-use std::convert::TryInto;
-use xxhash_rust::xxh3::{xxh3_64, Xxh3};
-use rayon::prelude::*;
+use std::fs::File;
+use std::io::Write;
+use std::mem::ManuallyDrop;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
-use std::mem::ManuallyDrop;
-use std::io::{self, Write, Read};
-use std::fs::File;
-use lz4_flex::decompress as lz4_decompress;
-use lz4_flex::frame::{FrameEncoder, FrameDecoder};
 
-/// Compress `data` into an LZ4 *frame* (matching Python's `lz4.frame`).
-///
-/// The Tenso wire format mandates the LZ4 frame format (magic
-/// `04 22 4D 18`). An earlier version of this codepath used the raw
-/// LZ4 block format, which Python readers cannot decompress.
-fn lz4_compress_frame(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(data.len() / 2 + 32);
-    {
-        let mut encoder = FrameEncoder::new(&mut out);
-        encoder.write_all(data)?;
-        encoder.finish()?;
-    }
-    Ok(out)
-}
+use tenso_core::{
+    bundle_required_size, decode, dense_required_size, encode_bundle_into, encode_dense_into,
+    encode_sparse_into, parse_header, sparse_required_size, ArraySpec, Decoded, Dtype, EncodeOpts,
+    SparseFormat, TensoError, FLAG_ALIGNED, FLAG_INTEGRITY,
+};
 
 // -----------------------------------------------------------------------------
-// DType Definition
+// Error mapping + small extraction helpers
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DType {
-    Float32,
-    Int32,
-    Float64,
-    Int64,
-    Uint8,
-    Uint16,
-    Bool,
-    Float16,
-    // New types
-    Int8,
-    Int16,
-    Uint32,
-    Uint64,
-    Complex64,
-    Complex128,
-    BFloat16,
+/// Map a `tenso_core::TensoError` to a Python exception, matching the messages
+/// the previous in-crate codec raised where they were observable.
+fn map_err(e: TensoError) -> PyErr {
+    let msg = match e {
+        TensoError::TooShort => "Packet too short".to_string(),
+        TensoError::BadMagic => "Invalid tenso packet".to_string(),
+        TensoError::UnsupportedVersion(v) => format!("Unsupported protocol version: {}", v),
+        TensoError::BadDtype(c) => format!("Unsupported or unknown dtype code: {}", c),
+        TensoError::TooManyDims => "Packet exceeds maximum dimensions".to_string(),
+        TensoError::TooManyElements => "Packet exceeds maximum elements".to_string(),
+        TensoError::IntegrityMismatch => "Integrity check failed: XXH3 mismatch".to_string(),
+        TensoError::BadBundle => {
+            "Bundle has too many entries; the wire format encodes the entry count in a \
+             single byte, so at most 255 entries are supported"
+                .to_string()
+        }
+        TensoError::Lz4(reason) => reason.to_string(),
+        TensoError::BufferTooSmall => "Buffer too small".to_string(),
+        TensoError::Malformed => "Malformed tenso packet".to_string(),
+    };
+    pyo3::exceptions::PyValueError::new_err(msg)
 }
 
-impl DType {
-    fn from_code(code: u8) -> PyResult<Self> {
-        match code {
-            1 => Ok(DType::Float32),
-            2 => Ok(DType::Int32),
-            3 => Ok(DType::Float64),
-            4 => Ok(DType::Int64),
-            5 => Ok(DType::Uint8),
-            6 => Ok(DType::Uint16),
-            7 => Ok(DType::Bool),
-            8 => Ok(DType::Float16),
-            9 => Ok(DType::Int8),
-            10 => Ok(DType::Int16),
-            11 => Ok(DType::Uint32),
-            12 => Ok(DType::Uint64),
-            13 => Ok(DType::Complex64),
-            14 => Ok(DType::Complex128),
-            15 => Ok(DType::BFloat16),
-            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unsupported or unknown dtype code: {}",
-                code
-            ))),
+/// Resolve a numpy dtype `name` string to a `tenso_core::Dtype`.
+fn dtype_from_name(name: &str) -> PyResult<Dtype> {
+    let d = match name {
+        "float32" => Dtype::F32,
+        "int32" => Dtype::I32,
+        "float64" => Dtype::F64,
+        "int64" => Dtype::I64,
+        "uint8" => Dtype::U8,
+        "uint16" => Dtype::U16,
+        "bool" => Dtype::Bool,
+        "float16" => Dtype::F16,
+        "int8" => Dtype::I8,
+        "int16" => Dtype::I16,
+        "uint32" => Dtype::U32,
+        "uint64" => Dtype::U64,
+        "complex64" => Dtype::C64,
+        "complex128" => Dtype::C128,
+        "bfloat16" => Dtype::BF16,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unsupported dtype: {}",
+                name
+            )))
         }
+    };
+    Ok(d)
+}
+
+/// Extracted view of a numpy array: dtype + raw little-endian body bytes + shape
+/// as u32 dims. The returned `&[u8]` borrows the array's backing buffer for the
+/// lifetime of `array`; the caller must keep the GIL held while it is used.
+struct NumpyView<'a> {
+    dtype: Dtype,
+    data: &'a [u8],
+    shape: Vec<u32>,
+}
+
+fn extract_numpy<'a>(array: &'a PyAny) -> PyResult<NumpyView<'a>> {
+    let dtype_obj = array.getattr("dtype")?;
+    let name: String = dtype_obj.getattr("name")?.extract()?;
+    let dtype = dtype_from_name(&name)?;
+
+    // Reject non-C-contiguous arrays. We read `nbytes` raw bytes starting at
+    // `ctypes.data` assuming row-major order, which is WRONG for a strided /
+    // transposed / Fortran-order view: a forward-strided view yields the wrong
+    // bytes, and a reverse-strided view puts `ctypes.data` at the last element so
+    // `data_ptr + nbytes` overruns the parent buffer (an out-of-bounds read in the
+    // `from_raw_parts` below). The Python wrapper coerces with ascontiguousarray,
+    // but `dumps_rs` is an exported pyfunction, so enforce the invariant here too
+    // (mirrors the check in `dump_to_fd_rs`).
+    let c_contiguous: bool = array.getattr("flags")?.getattr("c_contiguous")?.extract()?;
+    if !c_contiguous {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Array must be C-contiguous",
+        ));
     }
 
-    fn code(&self) -> u8 {
-        match self {
-            DType::Float32 => 1,
-            DType::Int32 => 2,
-            DType::Float64 => 3,
-            DType::Int64 => 4,
-            DType::Uint8 => 5,
-            DType::Uint16 => 6,
-            DType::Bool => 7,
-            DType::Float16 => 8,
-            DType::Int8 => 9,
-            DType::Int16 => 10,
-            DType::Uint32 => 11,
-            DType::Uint64 => 12,
-            DType::Complex64 => 13,
-            DType::Complex128 => 14,
-            DType::BFloat16 => 15,
-        }
-    }
+    let nbytes: usize = array.getattr("nbytes")?.extract()?;
+    let data_ptr: usize = array.getattr("ctypes")?.getattr("data")?.extract()?;
+    let shape_usize: Vec<usize> = array.getattr("shape")?.extract()?;
+    let shape: Vec<u32> = shape_usize.iter().map(|&d| d as u32).collect();
 
-    fn item_size(&self) -> usize {
-        match self {
-            DType::Float32 => 4,
-            DType::Int32 => 4,
-            DType::Float64 => 8,
-            DType::Int64 => 8,
-            DType::Uint8 => 1,
-            DType::Uint16 => 2,
-            DType::Bool => 1,
-            DType::Float16 => 2,
-            DType::Int8 => 1,
-            DType::Int16 => 2,
-            DType::Uint32 => 4,
-            DType::Uint64 => 8,
-            DType::Complex64 => 8,
-            DType::Complex128 => 16,
-            DType::BFloat16 => 2,
-        }
-    }
+    // Safety: C-contiguity was verified above, so numpy guarantees `data_ptr`
+    // points to `nbytes` of contiguous little-endian array memory while the GIL
+    // is held and `array` is alive.
+    let data = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, nbytes) };
+    Ok(NumpyView { dtype, data, shape })
+}
 
-    fn name(&self) -> &'static str {
-        match self {
-            DType::Float32 => "float32",
-            DType::Int32 => "int32",
-            DType::Float64 => "float64",
-            DType::Int64 => "int64",
-            DType::Uint8 => "uint8",
-            DType::Uint16 => "uint16",
-            DType::Bool => "bool",
-            DType::Float16 => "float16",
-            DType::Int8 => "int8",
-            DType::Int16 => "int16",
-            DType::Uint32 => "uint32",
-            DType::Uint64 => "uint64",
-            DType::Complex64 => "complex64",
-            DType::Complex128 => "complex128",
-            DType::BFloat16 => "bfloat16",
-        }
+/// Build the `EncodeOpts` the core expects from the Python-facing flags.
+fn opts(check_integrity: bool, compress: bool, alignment: usize) -> EncodeOpts {
+    EncodeOpts {
+        check_integrity,
+        compress,
+        alignment,
     }
 }
 
 // -----------------------------------------------------------------------------
-// Helper Functions & Structs
+// Container helpers (bundle / sparse) — collect bytes, then delegate to core
 // -----------------------------------------------------------------------------
 
-fn compute_integrity_hash(data: &[u8]) -> u64 {
-    // Single-pass XXH3-64 over the whole body. Must match Python's
-    // `xxhash.xxh3_64_intdigest` byte-for-byte regardless of size — a
-    // previous version of this function switched to a parallel Merkle
-    // hash above 1 MiB, which silently broke cross-implementation
-    // integrity verification for any tensor larger than that.
-    xxh3_64(data)
-}
-
-struct WrapperWriter<W> {
-    inner: W,
-    hasher: Option<Xxh3>,
-    written: usize,
-}
-
-impl<W: Write> WrapperWriter<W> {
-    fn new(inner: W, track_hash: bool) -> Self {
-        Self {
-            inner,
-            hasher: if track_hash { Some(Xxh3::new()) } else { None },
-            written: 0,
-        }
-    }
-
-    fn finish(self) -> (W, Option<u64>, usize) {
-        let hash = self.hasher.map(|h| h.digest());
-        (self.inner, hash, self.written)
-    }
-}
-
-impl<W: Write> Write for WrapperWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(h) = &mut self.hasher {
-            h.update(buf);
-        }
-        let n = self.inner.write(buf)?;
-        self.written += n;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Protocol Version & Header Helpers
-// -----------------------------------------------------------------------------
-
-const CURRENT_VERSION: u8 = 4;
-const HEADER_BASE_V4: usize = 10; // magic(4) + ver(1) + flags_u16(2) + dtype(1) + ndim(1) + reserved(1)
-
-/// Write a v4 header into `target[0..10]`.
-fn write_v4_header(target: &mut [u8], flags: u16, dtype_code: u8, ndim: u8) {
-    target[0..4].copy_from_slice(b"TNSO");
-    target[4] = CURRENT_VERSION;
-    target[5..7].copy_from_slice(&flags.to_le_bytes());
-    target[7] = dtype_code;
-    target[8] = ndim;
-    target[9] = 0; // reserved
-}
-
-/// Parsed packet header (version-aware).
-#[derive(Debug, PartialEq)]
-struct ParsedHeader {
-    flags: u16,
-    dtype_code: u8,
-    ndim: usize,
-    base_size: usize, // 8 for v3, 10 for v4
-}
-
-#[derive(Debug, PartialEq)]
-enum HeaderError {
-    TooShort,
-    BadMagic,
-    TruncatedV4,
-    UnsupportedVersion(u8),
-}
-
-impl HeaderError {
-    fn message(&self) -> String {
-        match self {
-            HeaderError::TooShort => "Packet too short".to_string(),
-            HeaderError::BadMagic => "Invalid tenso packet".to_string(),
-            HeaderError::TruncatedV4 => "Packet too short for v4 header".to_string(),
-            HeaderError::UnsupportedVersion(v) => format!("Unsupported protocol version: {}", v),
-        }
-    }
-}
-
-/// Pure-Rust header parser, handling both v3 (1-byte flags) and v4 (2-byte flags).
-fn parse_packet_header_raw(bytes: &[u8]) -> Result<ParsedHeader, HeaderError> {
-    if bytes.len() < 8 {
-        return Err(HeaderError::TooShort);
-    }
-    if &bytes[0..4] != b"TNSO" {
-        return Err(HeaderError::BadMagic);
-    }
-    let ver = bytes[4];
-    match ver {
-        3 => Ok(ParsedHeader {
-            flags: bytes[5] as u16,
-            dtype_code: bytes[6],
-            ndim: bytes[7] as usize,
-            base_size: 8,
-        }),
-        4 => {
-            if bytes.len() < 10 {
-                return Err(HeaderError::TruncatedV4);
-            }
-            Ok(ParsedHeader {
-                flags: u16::from_le_bytes([bytes[5], bytes[6]]),
-                dtype_code: bytes[7],
-                ndim: bytes[8] as usize,
-                base_size: 10,
-            })
-        }
-        _ => Err(HeaderError::UnsupportedVersion(ver)),
-    }
-}
-
-fn parse_packet_header(bytes: &[u8]) -> PyResult<ParsedHeader> {
-    parse_packet_header_raw(bytes)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.message()))
-}
-
-// -----------------------------------------------------------------------------
-// Serialization Implementation (In-Memory)
-// -----------------------------------------------------------------------------
-
-// Helper to write a dense array into a mutable byte slice.
-// Returns the number of bytes written.
-fn write_dense_to_slice(
-    _py: Python,
-    array: &PyAny,
-    target: &mut [u8],
+/// Recursively serialize each dict value to a packet via `dumps_rs`, returning
+/// `(key_utf8, value_packet)` pairs whose bytes outlive the encode call.
+fn collect_bundle_entries(
+    py: Python,
+    dict: &PyDict,
     check_integrity: bool,
     compress: bool,
     alignment: usize,
-) -> PyResult<usize> {
-    if !alignment.is_power_of_two() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
+) -> PyResult<Vec<(String, Vec<u8>)>> {
+    if dict.len() > tenso_core::MAX_BUNDLE_ENTRIES {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Bundle has {} entries; the wire format encodes the entry count in a \
+             single byte, so at most 255 entries are supported",
+            dict.len()
+        )));
     }
-
-    let dtype = array.getattr("dtype")?;
-    let name: String = dtype.getattr("name")?.extract()?;
-    let dtype_enum = match name.as_str() {
-        "float32" => DType::Float32,
-        "int32" => DType::Int32,
-        "float64" => DType::Float64,
-        "int64" => DType::Int64,
-        "uint8" => DType::Uint8,
-        "uint16" => DType::Uint16,
-        "bool" => DType::Bool,
-        "float16" => DType::Float16,
-        "int8" => DType::Int8,
-        "int16" => DType::Int16,
-        "uint32" => DType::Uint32,
-        "uint64" => DType::Uint64,
-        "complex64" => DType::Complex64,
-        "complex128" => DType::Complex128,
-        "bfloat16" => DType::BFloat16,
-        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("Unsupported dtype: {}", name))),
-    };
-
-    // Generic way to get raw data pointer and size from any NumPy array
-    let nbytes: usize = array.getattr("nbytes")?.extract()?;
-    let data_ptr: usize = array.getattr("ctypes")?.getattr("data")?.extract()?;
-    let ndim: usize = array.getattr("ndim")?.extract()?;
-    let shape: Vec<usize> = array.getattr("shape")?.extract()?;
-
-    let u8_slice = unsafe {
-        std::slice::from_raw_parts(data_ptr as *const u8, nbytes)
-    };
-
-    let use_custom_align = alignment != 64;
-    let mut header_len = HEADER_BASE_V4 + (ndim * 4);
-    if use_custom_align {
-        header_len += 1;
+    let mut entries = Vec::with_capacity(dict.len());
+    for (key, value) in dict.iter() {
+        let key_str: String = key.extract()?;
+        let val_packet_obj = dumps_rs(py, value, check_integrity, compress, alignment)?;
+        let val_bytes = val_packet_obj.as_bytes().to_vec();
+        entries.push((key_str, val_bytes));
     }
-
-    let remainder = header_len % alignment;
-    let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
-
-    let uncompressed_len = u8_slice.len();
-
-    let (compressed_data, body_len, flags_compression) = if compress {
-         let data = lz4_compress_frame(u8_slice)
-             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("LZ4 frame encode failed: {}", e)))?;
-         let len = data.len();
-         (Some(data), len, 4u16)
-    } else {
-         (None, uncompressed_len, 0u16)
-    };
-
-    let footer_len = if check_integrity { 8 } else { 0 };
-    let total_len = header_len + padding_len + body_len + footer_len;
-
-    if target.len() < total_len {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!("Buffer too small: {} < {}", target.len(), total_len)));
-    }
-
-    // Write v4 Header
-    let mut flags: u16 = 0;
-    if use_custom_align { flags |= 128; } else { flags |= 1; }
-    if check_integrity { flags |= 2; }
-    flags |= flags_compression;
-    write_v4_header(target, flags, dtype_enum.code(), ndim as u8);
-
-    let mut cursor = HEADER_BASE_V4;
-    for &dim in &shape {
-        target[cursor..cursor + 4].copy_from_slice(&(dim as u32).to_le_bytes());
-        cursor += 4;
-    }
-
-    if use_custom_align {
-        target[cursor] = alignment.trailing_zeros() as u8;
-    }
-
-    let body_start = header_len + padding_len;
-    let target_body = &mut target[body_start..body_start + body_len];
-
-    if let Some(ref c_data) = compressed_data {
-        target_body.copy_from_slice(c_data);
-        if check_integrity {
-             let hash = compute_integrity_hash(c_data);
-             let footer_start = body_start + body_len;
-             target[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
-        }
-    } else {
-        const PARALLEL_THRESHOLD: usize = 1024 * 1024;
-        if body_len >= PARALLEL_THRESHOLD {
-            target_body.par_chunks_mut(128 * 1024)
-                .zip(u8_slice.par_chunks(128 * 1024))
-                .for_each(|(t, s)| t.copy_from_slice(s));
-        } else {
-            target_body.copy_from_slice(u8_slice);
-        }
-
-        if check_integrity {
-            let hash = compute_integrity_hash(u8_slice);
-            let footer_start = body_start + body_len;
-            target[footer_start..footer_start + 8].copy_from_slice(&hash.to_le_bytes());
-        }
-    }
-    
-    Ok(total_len)
+    Ok(entries)
 }
 
-// Helper to calculate dense size without writing
-fn calc_dense_size(_py: Python, array: &PyAny, check_integrity: bool, compress: bool, alignment: usize) -> PyResult<usize> {
-    let ndim: usize = array.getattr("ndim")?.extract()?;
-    let nbytes: usize = array.getattr("nbytes")?.extract()?;
-
-    let use_custom_align = alignment != 64;
-    let mut header_len = HEADER_BASE_V4 + (ndim * 4);
-    if use_custom_align { header_len += 1; }
-
-    let remainder = header_len % alignment;
-    let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
-
-    let body_len = if compress {
-        // LZ4 worst-case: input size + header overhead. lz4_flex block compression
-        // can expand by at most ~0.4%, plus a small fixed overhead.
-        let worst_case = lz4_flex::block::get_maximum_output_size(nbytes);
-        worst_case
-    } else {
-        nbytes
-    };
-
-    let footer_len = if check_integrity { 8 } else { 0 };
-    Ok(header_len + padding_len + body_len + footer_len)
+/// Resolve a sparse tensor's format flag + the three component arrays (made
+/// C-contiguous if needed) and their owned little-endian body bytes.
+struct SparseComponents {
+    format: SparseFormat,
+    shape: Vec<u32>,
+    // Each component: (dtype, owned body bytes, shape).
+    comps: Vec<(Dtype, Vec<u8>, Vec<u32>)>,
 }
 
-fn serialize_sparse<'py>(py: Python<'py>, tensor: &'py PyAny, format: &str, _check_integrity: bool, alignment: usize) -> PyResult<&'py PyBytes> {
-    let (flag_code, comps): (u16, Vec<&str>) = match format {
-        "coo" => (8, vec!["data", "row", "col"]),
-        "csr" => (32, vec!["data", "indices", "indptr"]),
-        "csc" => (64, vec!["data", "indices", "indptr"]),
-        _ => return Err(pyo3::exceptions::PyValueError::new_err("Unknown sparse format")),
+fn collect_sparse_components<'py>(
+    py: Python<'py>,
+    tensor: &'py PyAny,
+    format: &str,
+) -> PyResult<SparseComponents> {
+    let (sparse_format, names): (SparseFormat, [&str; 3]) = match format {
+        "coo" => (SparseFormat::Coo, ["data", "row", "col"]),
+        "csr" => (SparseFormat::Csr, ["data", "indices", "indptr"]),
+        "csc" => (SparseFormat::Csc, ["data", "indices", "indptr"]),
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Unknown sparse format",
+            ))
+        }
     };
 
-    let shape_tuple: Vec<u32> = tensor.getattr("shape")?.extract()?;
-    let ndim = shape_tuple.len();
+    let shape_usize: Vec<usize> = tensor.getattr("shape")?.extract()?;
+    let shape: Vec<u32> = shape_usize.iter().map(|&d| d as u32).collect();
 
-    let mut component_arrays = Vec::with_capacity(3);
-    for name in comps {
+    let mut comps = Vec::with_capacity(3);
+    for name in names {
         let arr = tensor.getattr(name)?;
         let contig = if arr.getattr("flags")?.getattr("c_contiguous")?.extract()? {
             arr
@@ -437,359 +207,100 @@ fn serialize_sparse<'py>(py: Python<'py>, tensor: &'py PyAny, format: &str, _che
             let numpy = py.import("numpy")?;
             numpy.call_method1("ascontiguousarray", (arr,))?
         };
-        component_arrays.push(contig);
+        let view = extract_numpy(contig)?;
+        comps.push((view.dtype, view.data.to_vec(), view.shape));
     }
 
-    let main_header_len = HEADER_BASE_V4 + (ndim * 4);
-    let mut total_len = main_header_len;
-    let mut comp_sizes = Vec::with_capacity(3);
-
-    for arr in &component_arrays {
-        let size = calc_dense_size(py, arr, false, false, alignment)?;
-        comp_sizes.push(size);
-        total_len += 4 + size;
-    }
-
-    PyBytes::new_with(py, total_len, |bytes: &mut [u8]| {
-        write_v4_header(bytes, flag_code, 0, ndim as u8);
-
-        let mut cursor = HEADER_BASE_V4;
-        for &dim in &shape_tuple {
-            bytes[cursor..cursor+4].copy_from_slice(&(dim).to_le_bytes());
-            cursor += 4;
-        }
-
-        for (i, arr) in component_arrays.iter().enumerate() {
-            let size = comp_sizes[i];
-            bytes[cursor..cursor+4].copy_from_slice(&(size as u32).to_le_bytes());
-            cursor += 4;
-            let sub_slice = &mut bytes[cursor..cursor+size];
-            write_dense_to_slice(py, arr, sub_slice, false, false, alignment)?;
-            cursor += size;
-        }
-        Ok(())
+    Ok(SparseComponents {
+        format: sparse_format,
+        shape,
+        comps,
     })
 }
 
-fn serialize_bundle<'py>(
+// -----------------------------------------------------------------------------
+// dumps_rs — numpy / dict / sparse -> packet bytes (PyBytes)
+// -----------------------------------------------------------------------------
+
+#[pyfunction]
+#[pyo3(signature = (array, check_integrity=false, compress=false, alignment=64))]
+fn dumps_rs<'py>(
     py: Python<'py>,
-    dict: &'py PyDict,
+    array: &'py PyAny,
     check_integrity: bool,
     compress: bool,
     alignment: usize,
 ) -> PyResult<&'py PyBytes> {
-    let mut total_len = HEADER_BASE_V4; // Header
-    let mut entries = Vec::with_capacity(dict.len());
-
-    for (key, value) in dict.iter() {
-        let key_str: String = key.extract()?;
-        let key_bytes = key_str.as_bytes();
-        let key_len = key_bytes.len();
-
-        // Recursively call dumps_rs to get the packet for the value
-        // We can call the pyfunction itself to handle all types
-        let val_packet_obj = dumps_rs(py, value, check_integrity, compress, alignment)?;
-        let val_packet = val_packet_obj.as_bytes();
-        let val_len = val_packet.len();
-
-        total_len += 4 + key_len + 4 + val_len;
-        entries.push((key_bytes.to_vec(), val_packet.to_vec()));
-    }
-
-    PyBytes::new_with(py, total_len, |bytes: &mut [u8]| {
-        write_v4_header(bytes, 16, 0, entries.len().min(255) as u8); // FLAG_BUNDLE = 16
-
-        let mut cursor = HEADER_BASE_V4;
-        for (key_bytes, val_bytes) in entries {
-            let k_len = key_bytes.len() as u32;
-            bytes[cursor..cursor + 4].copy_from_slice(&k_len.to_le_bytes());
-            cursor += 4;
-            bytes[cursor..cursor + key_bytes.len()].copy_from_slice(&key_bytes);
-            cursor += key_bytes.len();
-
-            let v_len = val_bytes.len() as u32;
-            bytes[cursor..cursor + 4].copy_from_slice(&v_len.to_le_bytes());
-            cursor += 4;
-            bytes[cursor..cursor + val_bytes.len()].copy_from_slice(&val_bytes);
-            cursor += val_bytes.len();
-        }
-        Ok(())
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (array, check_integrity=false, compress=false, alignment=64))]
-fn dumps_rs<'py>(py: Python<'py>, array: &'py PyAny, check_integrity: bool, compress: bool, alignment: usize) -> PyResult<&'py PyBytes> {
     if !alignment.is_power_of_two() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Alignment must be a power of two",
+        ));
     }
 
     // CHECK FOR BUNDLE
     if let Ok(dict) = array.downcast::<PyDict>() {
-        return serialize_bundle(py, dict, check_integrity, compress, alignment);
+        let entries = collect_bundle_entries(py, dict, check_integrity, compress, alignment)?;
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        let size = bundle_required_size(&refs).map_err(map_err)?;
+        return PyBytes::new_with(py, size, |out: &mut [u8]| {
+            encode_bundle_into(&refs, out).map_err(map_err)?;
+            Ok(())
+        });
     }
 
     // CHECK FOR SPARSE
     if let Ok(format_attr) = array.getattr("format") {
         if let Ok(format_str) = format_attr.extract::<String>() {
-             return serialize_sparse(py, array, &format_str, check_integrity, alignment);
+            let sc = collect_sparse_components(py, array, &format_str)?;
+            let specs: Vec<ArraySpec> = sc
+                .comps
+                .iter()
+                .map(|(dtype, data, shape)| ArraySpec {
+                    data: data.as_slice(),
+                    dtype: *dtype,
+                    shape: shape.as_slice(),
+                })
+                .collect();
+            let size = sparse_required_size(&sc.shape, &specs).map_err(map_err)?;
+            return PyBytes::new_with(py, size, |out: &mut [u8]| {
+                encode_sparse_into(sc.format, &sc.shape, &specs, out).map_err(map_err)?;
+                Ok(())
+            });
         }
     }
 
     // DENSE PATH
-    let size = calc_dense_size(py, array, check_integrity, compress, alignment)?;
-    
-    PyBytes::new_with(py, size, |bytes: &mut [u8]| {
-         write_dense_to_slice(py, array, bytes, check_integrity, compress, alignment)?;
-         Ok(())
-    })
+    let view = extract_numpy(array)?;
+    let spec = ArraySpec {
+        data: view.data,
+        dtype: view.dtype,
+        shape: &view.shape,
+    };
+    let o = opts(check_integrity, compress, alignment);
+    let size = dense_required_size(&spec, &o).map_err(map_err)?;
+
+    if compress {
+        // Compressed size is an upper bound; encode into scratch and copy out
+        // the exact bytes so the returned packet has no trailing slack (slack
+        // would push the integrity footer off the end on read).
+        let mut scratch = vec![0u8; size];
+        let actual = encode_dense_into(&spec, &mut scratch, &o).map_err(map_err)?;
+        Ok(PyBytes::new(py, &scratch[..actual]))
+    } else {
+        // Uncompressed: `size` is exact, fill the PyBytes in place (no copy).
+        PyBytes::new_with(py, size, |out: &mut [u8]| {
+            encode_dense_into(&spec, out, &o).map_err(map_err)?;
+            Ok(())
+        })
+    }
 }
-// DUMP TO FD Implementation (Optimized)
+
 // -----------------------------------------------------------------------------
-
-fn dump_to_fd_impl(
-    py: Python,
-    array: &PyAny,
-    fd: i32,
-    check_integrity: bool,
-    compress: bool,
-    alignment: usize,
-    dtype_enum: DType,
-) -> PyResult<usize> {
-    let is_contiguous: bool = array.getattr("flags")?.getattr("c_contiguous")?.extract()?;
-    if !is_contiguous {
-        return Err(pyo3::exceptions::PyValueError::new_err("Array must be C-Contiguous"));
-    }
-
-    let ndim: usize = array.getattr("ndim")?.extract()?;
-    let shape: Vec<usize> = array.getattr("shape")?.extract()?;
-    let total_bytes: usize = array.getattr("nbytes")?.extract()?;
-    let data_ptr: usize = array.getattr("ctypes")?.getattr("data")?.extract()?;
-
-    py.allow_threads(move || {
-        let u8_slice = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, total_bytes) };
-        #[cfg(unix)]
-        let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd)) };
-        #[cfg(windows)]
-        let mut file = unsafe {
-            // Convert C runtime fd to Windows HANDLE
-            extern "C" { fn _get_osfhandle(fd: i32) -> isize; }
-            let handle = _get_osfhandle(fd) as *mut std::ffi::c_void;
-            ManuallyDrop::new(File::from_raw_handle(handle))
-        };
-
-        let use_custom_align = alignment != 64;
-        let mut header_len = HEADER_BASE_V4 + (ndim * 4);
-        if use_custom_align { header_len += 1; }
-
-        let remainder = header_len % alignment;
-        let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
-
-        let mut flags: u16 = 0;
-        if use_custom_align { flags |= 128; } else { flags |= 1; }
-        if check_integrity { flags |= 2; }
-        if compress { flags |= 4; }
-
-        let mut header_buf = Vec::with_capacity(header_len + padding_len);
-        header_buf.extend_from_slice(b"TNSO");
-        header_buf.push(CURRENT_VERSION);
-        header_buf.extend_from_slice(&flags.to_le_bytes());
-        header_buf.push(dtype_enum.code());
-        header_buf.push(ndim as u8);
-        header_buf.push(0); // reserved
-        
-        for &dim in &shape {
-            header_buf.extend_from_slice(&(dim as u32).to_le_bytes());
-        }
-        
-        if use_custom_align {
-             header_buf.push(alignment.trailing_zeros() as u8);
-        }
-        
-        header_buf.resize(header_len + padding_len, 0);
-        file.write_all(&header_buf).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
-
-        let mut wrapper = WrapperWriter::new(&mut *file, check_integrity);
-        
-        if compress {
-            let mut encoder = FrameEncoder::new(&mut wrapper);
-            encoder.write_all(u8_slice).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
-            encoder.finish().map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
-        } else {
-            wrapper.write_all(u8_slice).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
-        }
-        
-        let (_, hash_opt, bytes_written) = wrapper.finish();
-
-        if let Some(hash) = hash_opt {
-             file.write_all(&hash.to_le_bytes()).map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
-        }
-        
-        let footer_len = if check_integrity { 8 } else { 0 };
-        Ok(header_len + padding_len + bytes_written + footer_len)
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (array, fd, check_integrity=false, compress=false, alignment=64))]
-fn dump_to_fd_rs<'py>(
-    py: Python<'py>,
-    array: &'py PyAny,
-    fd: i32,
-    check_integrity: bool,
-    compress: bool,
-    alignment: usize
-) -> PyResult<usize> {
-    if !alignment.is_power_of_two() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
-    }
-    
-    let dtype = array.getattr("dtype")?;
-    let name: String = dtype.getattr("name")?.extract()?;
-
-    let dtype_enum = match name.as_str() {
-        "float32" => DType::Float32,
-        "int32" => DType::Int32,
-        "float64" => DType::Float64,
-        "int64" => DType::Int64,
-        "uint8" => DType::Uint8,
-        "uint16" => DType::Uint16,
-        "bool" => DType::Bool,
-        "int8" => DType::Int8,
-        "int16" => DType::Int16,
-        "uint32" => DType::Uint32,
-        "uint64" => DType::Uint64,
-        "complex64" => DType::Complex64,
-        "complex128" => DType::Complex128,
-        "bfloat16" => DType::BFloat16,
-        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unsupported dtype: {}",
-            name
-        ))),
-    };
-
-    dump_to_fd_impl(py, array, fd, check_integrity, compress, alignment, dtype_enum)
-}
-
-// Write a sparse tensor into a pre-allocated buffer slice.
-fn write_sparse_to_slice(
-    py: Python,
-    tensor: &PyAny,
-    format: &str,
-    target: &mut [u8],
-    _check_integrity: bool,
-    alignment: usize,
-) -> PyResult<usize> {
-    let (flag_code, comps): (u16, Vec<&str>) = match format {
-        "coo" => (8, vec!["data", "row", "col"]),
-        "csr" => (32, vec!["data", "indices", "indptr"]),
-        "csc" => (64, vec!["data", "indices", "indptr"]),
-        _ => return Err(pyo3::exceptions::PyValueError::new_err("Unknown sparse format")),
-    };
-
-    let shape_tuple: Vec<u32> = tensor.getattr("shape")?.extract()?;
-    let ndim = shape_tuple.len();
-
-    let mut component_arrays = Vec::with_capacity(3);
-    for name in comps {
-        let arr = tensor.getattr(name)?;
-        let contig = if arr.getattr("flags")?.getattr("c_contiguous")?.extract()? {
-            arr
-        } else {
-            let numpy = py.import("numpy")?;
-            numpy.call_method1("ascontiguousarray", (arr,))?
-        };
-        component_arrays.push(contig);
-    }
-
-    let main_header_len = HEADER_BASE_V4 + (ndim * 4);
-    let mut total_len = main_header_len;
-    let mut comp_sizes = Vec::with_capacity(3);
-
-    for arr in &component_arrays {
-        let size = calc_dense_size(py, arr, false, false, alignment)?;
-        comp_sizes.push(size);
-        total_len += 4 + size;
-    }
-
-    if target.len() < total_len {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            format!("Buffer too small for sparse: {} < {}", target.len(), total_len)
-        ));
-    }
-
-    // Write v4 header
-    write_v4_header(target, flag_code, 0, ndim as u8);
-
-    let mut cursor = HEADER_BASE_V4;
-    for &dim in &shape_tuple {
-        target[cursor..cursor + 4].copy_from_slice(&dim.to_le_bytes());
-        cursor += 4;
-    }
-
-    // Write each component as: [4-byte size][dense packet]
-    for (i, arr) in component_arrays.iter().enumerate() {
-        let size = comp_sizes[i];
-        target[cursor..cursor + 4].copy_from_slice(&(size as u32).to_le_bytes());
-        cursor += 4;
-        let sub_slice = &mut target[cursor..cursor + size];
-        write_dense_to_slice(py, arr, sub_slice, false, false, alignment)?;
-        cursor += size;
-    }
-
-    Ok(total_len)
-}
-
-// Write a bundle (dict) into a pre-allocated buffer slice.
-fn write_bundle_to_slice(
-    py: Python,
-    dict: &PyDict,
-    target: &mut [u8],
-    check_integrity: bool,
-    compress: bool,
-    alignment: usize,
-) -> PyResult<usize> {
-    // First pass: serialize all entries to collect their bytes
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(dict.len());
-    let mut total_len = HEADER_BASE_V4; // header
-
-    for (key, value) in dict.iter() {
-        let key_str: String = key.extract()?;
-        let key_bytes = key_str.into_bytes();
-
-        let val_packet_obj = dumps_rs(py, value, check_integrity, compress, alignment)?;
-        let val_bytes = val_packet_obj.as_bytes().to_vec();
-
-        total_len += 4 + key_bytes.len() + 4 + val_bytes.len();
-        entries.push((key_bytes, val_bytes));
-    }
-
-    if target.len() < total_len {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            format!("Buffer too small for bundle: {} < {}", target.len(), total_len)
-        ));
-    }
-
-    // Write v4 header
-    write_v4_header(target, 16, 0, entries.len().min(255) as u8); // FLAG_BUNDLE = 16
-
-    let mut cursor = HEADER_BASE_V4;
-    for (key_bytes, val_bytes) in &entries {
-        let k_len = key_bytes.len() as u32;
-        target[cursor..cursor + 4].copy_from_slice(&k_len.to_le_bytes());
-        cursor += 4;
-        target[cursor..cursor + key_bytes.len()].copy_from_slice(key_bytes);
-        cursor += key_bytes.len();
-
-        let v_len = val_bytes.len() as u32;
-        target[cursor..cursor + 4].copy_from_slice(&v_len.to_le_bytes());
-        cursor += 4;
-        target[cursor..cursor + val_bytes.len()].copy_from_slice(val_bytes);
-        cursor += val_bytes.len();
-    }
-
-    Ok(total_len)
-}
+// dump_to_buffer_rs — same dispatch, encode into a caller-provided buffer
+// -----------------------------------------------------------------------------
 
 #[pyfunction]
 #[pyo3(signature = (array, buffer, check_integrity=false, compress=false, alignment=64))]
@@ -799,66 +310,243 @@ fn dump_to_buffer_rs<'py>(
     buffer: &'py PyAny,
     check_integrity: bool,
     compress: bool,
-    alignment: usize
+    alignment: usize,
 ) -> PyResult<usize> {
-    // get writable buffer
     let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
     if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Buffer is read-only",
+        ));
     }
-    
-    // Safety: we must ensure we don't violate aliasing rules if array and buffer overlap, 
-    // but for SHM use case they are distinct. PyBuffer ensures we have access.
-    // We treat the buffer as a raw mutable slice of u8.
+
     let buf_len = py_buf.len_bytes();
     let buf_ptr = py_buf.buf_ptr() as *mut u8;
-    let target_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) };
+    // Safety: PyBuffer guarantees `buf_ptr` is valid for `buf_len` writable
+    // bytes while the GIL is held; for the SHM use case `array` and `buffer`
+    // are distinct allocations.
+    let target = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) };
 
     if !alignment.is_power_of_two() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Alignment must be a power of two"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Alignment must be a power of two",
+        ));
     }
 
     // CHECK FOR BUNDLE
     if let Ok(dict) = array.downcast::<PyDict>() {
-        return write_bundle_to_slice(py, dict, target_slice, check_integrity, compress, alignment);
+        let entries = collect_bundle_entries(py, dict, check_integrity, compress, alignment)?;
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        return encode_bundle_into(&refs, target).map_err(map_err);
     }
 
     // CHECK FOR SPARSE
     if let Ok(format_attr) = array.getattr("format") {
         if let Ok(format_str) = format_attr.extract::<String>() {
-            return write_sparse_to_slice(py, array, &format_str, target_slice, check_integrity, alignment);
+            let sc = collect_sparse_components(py, array, &format_str)?;
+            let specs: Vec<ArraySpec> = sc
+                .comps
+                .iter()
+                .map(|(dtype, data, shape)| ArraySpec {
+                    data: data.as_slice(),
+                    dtype: *dtype,
+                    shape: shape.as_slice(),
+                })
+                .collect();
+            return encode_sparse_into(sc.format, &sc.shape, &specs, target).map_err(map_err);
         }
     }
 
     // DENSE PATH
-    write_dense_to_slice(py, array, target_slice, check_integrity, compress, alignment)
+    let view = extract_numpy(array)?;
+    let spec = ArraySpec {
+        data: view.data,
+        dtype: view.dtype,
+        shape: &view.shape,
+    };
+    let o = opts(check_integrity, compress, alignment);
+    encode_dense_into(&spec, target, &o).map_err(map_err)
 }
 
 // -----------------------------------------------------------------------------
-// Metadata Extraction Function
+// dump_to_fd_rs — dense only -> encode into a Vec -> write_all to the fd
+// -----------------------------------------------------------------------------
+
+#[pyfunction]
+#[pyo3(signature = (array, fd, check_integrity=false, compress=false, alignment=64))]
+fn dump_to_fd_rs<'py>(
+    py: Python<'py>,
+    array: &'py PyAny,
+    fd: i32,
+    check_integrity: bool,
+    compress: bool,
+    alignment: usize,
+) -> PyResult<usize> {
+    if !alignment.is_power_of_two() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Alignment must be a power of two",
+        ));
+    }
+
+    let is_contiguous: bool = array.getattr("flags")?.getattr("c_contiguous")?.extract()?;
+    if !is_contiguous {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Array must be C-Contiguous",
+        ));
+    }
+
+    let view = extract_numpy(array)?;
+    let spec = ArraySpec {
+        data: view.data,
+        dtype: view.dtype,
+        shape: &view.shape,
+    };
+    let o = opts(check_integrity, compress, alignment);
+
+    // Encode into an owned buffer (core handles header/padding/body/integrity),
+    // then stream it to the fd without the GIL held. Trim to the exact length
+    // because the compressed-size estimate is an upper bound.
+    let size = dense_required_size(&spec, &o).map_err(map_err)?;
+    let mut packet = vec![0u8; size];
+    let actual = encode_dense_into(&spec, &mut packet, &o).map_err(map_err)?;
+    packet.truncate(actual);
+
+    py.allow_threads(move || {
+        #[cfg(unix)]
+        let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd)) };
+        #[cfg(windows)]
+        let mut file = unsafe {
+            // Convert C runtime fd to Windows HANDLE.
+            extern "C" {
+                fn _get_osfhandle(fd: i32) -> isize;
+            }
+            let handle = _get_osfhandle(fd) as *mut std::ffi::c_void;
+            ManuallyDrop::new(File::from_raw_handle(handle))
+        };
+        file.write_all(&packet)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+        Ok(actual)
+    })
+}
+
+// -----------------------------------------------------------------------------
+// loads_rs — decode via tenso_core, zero-copy into the original Python buffer
+// -----------------------------------------------------------------------------
+
+/// Build a numpy array view over `view`, mapping its body back into `root_data`
+/// at the right absolute offset for true zero-copy. The body slice is always a
+/// borrow of `base` (the original packet buffer) since `decode` is zero-copy for
+/// dense bodies, so the offset is `body_ptr - base_ptr`.
+fn dense_to_numpy<'py>(
+    py: Python<'py>,
+    root_data: &'py PyAny,
+    base_ptr: usize,
+    dtype: Dtype,
+    shape: &[u32],
+    body: &[u8],
+) -> PyResult<PyObject> {
+    let numpy = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", dtype.name())?;
+
+    let num_elements: usize = shape.iter().map(|&d| d as usize).product();
+    kwargs.set_item("count", num_elements)?;
+
+    let offset = body.as_ptr() as usize - base_ptr;
+    kwargs.set_item("offset", offset)?;
+
+    let array = numpy.call_method("frombuffer", (root_data,), Some(kwargs))?;
+    let shape_usize: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    let reshaped = array.call_method1("reshape", (shape_usize,))?;
+    let flags_attr = reshaped.getattr("flags")?;
+    flags_attr.setattr("writeable", false)?;
+    Ok(reshaped.into())
+}
+
+/// Convert a `Decoded` into a Python object, recursing for bundles. Returns
+/// `Ok(None)` for any kind the Python layer's fallback owns (sparse, quantized,
+/// string, ragged, IpcRef) — preserving the previous supported-set semantics.
+fn decoded_to_py<'py>(
+    py: Python<'py>,
+    root_data: &'py PyAny,
+    base_ptr: usize,
+    decoded: Decoded,
+) -> PyResult<Option<PyObject>> {
+    match decoded {
+        Decoded::Dense(view) => Ok(Some(dense_to_numpy(
+            py,
+            root_data,
+            base_ptr,
+            view.dtype,
+            &view.shape,
+            view.body,
+        )?)),
+        Decoded::Bundle(entries) => {
+            let res = PyDict::new(py);
+            for (key, val) in entries {
+                match decoded_to_py(py, root_data, base_ptr, val)? {
+                    Some(obj) => res.set_item(key, obj)?,
+                    // A nested unsupported kind makes the whole packet a
+                    // Python-fallback case, matching the old behavior.
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(res.into()))
+        }
+        // Sparse / Quantized / String / Ragged / IpcRef are handled by the
+        // Python layer; signal fallback.
+        _ => Ok(None),
+    }
+}
+
+#[pyfunction]
+fn loads_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<Option<PyObject>> {
+    let buffer: PyBuffer<u8> = PyBuffer::get(data)?;
+    let base_ptr = buffer.buf_ptr() as usize;
+    // Safety: PyBuffer keeps `data` alive and the buffer readable for
+    // `len_bytes()` while the GIL is held.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes()) };
+
+    match decode(bytes) {
+        Ok(decoded) => decoded_to_py(py, data, base_ptr, decoded),
+        // Compressed-dense bodies (and any other kind core can't return as a
+        // borrow) fall back to the Python decoder — same observable result.
+        Err(TensoError::Lz4(_)) => Ok(None),
+        Err(e) => Err(map_err(e)),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// get_packet_info_rs — header + shape metadata dict
 // -----------------------------------------------------------------------------
 
 #[pyfunction]
 fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py PyDict> {
     let buffer: PyBuffer<u8> = PyBuffer::get(data)?;
-    let bytes = unsafe {
-        std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes()) };
 
-    let hdr = parse_packet_header(bytes)?;
+    let hdr = parse_header(bytes).map_err(map_err)?;
 
     let shape_end = hdr.base_size + (hdr.ndim * 4);
     if bytes.len() < shape_end {
-        return Err(pyo3::exceptions::PyValueError::new_err("Packet too short to contain shape"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Packet too short to contain shape",
+        ));
     }
 
     let mut shape = Vec::with_capacity(hdr.ndim);
     let mut cursor = hdr.base_size;
     for _ in 0..hdr.ndim {
-        let dim_bytes: [u8; 4] = bytes[cursor..cursor+4].try_into().map_err(|_| {
-             pyo3::exceptions::PyValueError::new_err("Failed to read shape")
-        })?;
-        let dim = u32::from_le_bytes(dim_bytes) as usize;
+        let dim = u32::from_le_bytes([
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ]) as usize;
         shape.push(dim);
         cursor += 4;
     }
@@ -869,225 +557,20 @@ fn get_packet_info_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<&'py P
     dict.set_item("dtype_code", hdr.dtype_code)?;
     dict.set_item("ndim", hdr.ndim)?;
 
-    let total_elements: usize = shape.iter().product();
+    // Saturating product: the dims are attacker-controlled u32s read off the
+    // packet, so the plain product can overflow usize and (in release builds)
+    // wrap to a small, misleading value. Saturate to usize::MAX instead so an
+    // oversized/malformed header surfaces as an obviously-huge count rather than a
+    // wrapped one. (decode() separately enforces MAX_NDIM / MAX_ELEMENTS.)
+    let total_elements: usize = shape.iter().fold(1usize, |acc, &d| acc.saturating_mul(d));
     dict.set_item("total_elements", total_elements)?;
     dict.set_item("shape", PyTuple::new(py, shape))?;
 
-    dict.set_item("aligned", (hdr.flags & 1) != 0)?;
-    dict.set_item("integrity_protected", (hdr.flags & 2) != 0)?;
+    dict.set_item("aligned", (hdr.flags & FLAG_ALIGNED) != 0)?;
+    dict.set_item("integrity_protected", (hdr.flags & FLAG_INTEGRITY) != 0)?;
 
     Ok(dict)
 }
-
-// -----------------------------------------------------------------------------
-// Loads Function
-// -----------------------------------------------------------------------------
-
-fn deserialize_impl<'py>(
-    py: Python<'py>,
-    root_data: &'py PyAny,
-    bytes: &[u8],
-    absolute_offset: usize
-) -> PyResult<Option<PyObject>> {
-    const MAX_NDIM: usize = 32;
-    const MAX_ELEMENTS: usize = 1_000_000_000;
-    const FLAG_BUNDLE: u16 = 16;
-
-    let hdr = parse_packet_header(bytes)?;
-    let ver = bytes[4];
-    let flags = hdr.flags;
-    let dtype_code = hdr.dtype_code;
-    let ndim = hdr.ndim;
-    let base_size = hdr.base_size;
-
-    let supported_mask: u16 = 1 | 2 | 4 | 16 | 128;
-    if (flags & !supported_mask) != 0 {
-        return Ok(None);
-    }
-
-    if (flags & FLAG_BUNDLE) != 0 {
-        let res = PyDict::new(py);
-        let count = ndim;
-        let mut cursor = base_size;
-
-        for _ in 0..count {
-            if cursor + 4 > bytes.len() {
-                return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (key len)"));
-            }
-            let k_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize;
-            cursor += 4;
-
-            if cursor + k_len > bytes.len() {
-                return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (key)"));
-            }
-            let key_str = std::str::from_utf8(&bytes[cursor..cursor+k_len])
-                .map_err(|_| pyo3::exceptions::PyValueError::new_err("Invalid UTF-8 key"))?;
-            cursor += k_len;
-
-            if cursor + 4 > bytes.len() {
-                return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (val len)"));
-            }
-            let v_len = u32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize;
-            cursor += 4;
-
-            if cursor + v_len > bytes.len() {
-                 return Err(pyo3::exceptions::PyValueError::new_err("Packet truncated (value body)"));
-            }
-
-            let val_bytes = &bytes[cursor..cursor+v_len];
-            let val_offset = absolute_offset + cursor;
-            
-            let val_obj = deserialize_impl(py, root_data, val_bytes, val_offset)?;
-            
-            match val_obj {
-                Some(obj) => res.set_item(key_str, obj)?,
-                None => return Ok(None), 
-            }
-
-            cursor += v_len;
-        }
-        return Ok(Some(res.into()));
-    }
-
-    if ndim > MAX_NDIM {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!("Packet exceeds maximum dimensions ({} > {})", ndim, MAX_NDIM)));
-    }
-
-    let mut header_len = base_size + (ndim * 4);
-    let mut alignment = 1;
-    let use_custom_align = (flags & 128) != 0;
-
-    if use_custom_align {
-        if bytes.len() < header_len + 1 {
-            return Err(pyo3::exceptions::PyValueError::new_err("Packet header incomplete (missing alignment byte)"));
-        }
-        let exponent = bytes[header_len];
-        alignment = 1 << exponent;
-        header_len += 1;
-    } else if (flags & 1) != 0 {
-        alignment = 64;
-    }
-
-    if bytes.len() < header_len {
-        return Err(pyo3::exceptions::PyValueError::new_err("Packet header incomplete"));
-    }
-
-    let mut shape = Vec::with_capacity(ndim);
-    let mut cursor = base_size;
-    for _ in 0..ndim {
-        let dim_bytes: [u8; 4] = bytes[cursor..cursor+4].try_into().map_err(|_| {
-             pyo3::exceptions::PyValueError::new_err("Failed to read shape")
-        })?;
-        let dim = u32::from_le_bytes(dim_bytes) as usize;
-        shape.push(dim);
-        cursor += 4;
-    }
-
-    let remainder = header_len % alignment;
-    let padding_len = if remainder == 0 { 0 } else { alignment - remainder };
-    
-    let body_start_rel = header_len + padding_len;
-
-    // Quantized types (codes 16-19) are handled by the Python layer
-    if dtype_code >= 16 && dtype_code <= 19 {
-        return Ok(None);
-    }
-
-    let dtype = DType::from_code(dtype_code)?;
-    let dtype_name = dtype.name();
-    let item_size = dtype.item_size();
-    
-    let num_elements: usize = shape.iter().product();
-
-    if num_elements > MAX_ELEMENTS {
-         return Err(pyo3::exceptions::PyValueError::new_err(format!("Packet exceeds maximum elements ({} > {})", num_elements, MAX_ELEMENTS)));
-    }
-
-    let uncompressed_len = num_elements * item_size;
-    let footer_len = if (flags & 2) != 0 { 8 } else { 0 };
-    
-    let available = bytes.len();
-    if available < body_start_rel {
-         return Err(pyo3::exceptions::PyValueError::new_err("Packet too short for header/padding"));
-    }
-    
-    let body_len = if (flags & 4) != 0 {
-        if available < body_start_rel + footer_len {
-             return Err(pyo3::exceptions::PyValueError::new_err("Packet too short for compressed body"));
-        }
-        available - body_start_rel - footer_len
-    } else {
-        uncompressed_len
-    };
-
-    if available < body_start_rel + body_len + footer_len {
-         return Err(pyo3::exceptions::PyValueError::new_err("Packet too short for body"));
-    }
-    
-    if (flags & 2) != 0 { 
-         let footer_start = body_start_rel + body_len;
-         let expected_hash_bytes: [u8; 8] = bytes[footer_start..footer_start+8].try_into().map_err(|_| {
-             pyo3::exceptions::PyValueError::new_err("Failed to read hash")
-         })?;
-         let expected_hash = u64::from_le_bytes(expected_hash_bytes);
-         
-         let body_slice = &bytes[body_start_rel..body_start_rel+body_len];
-         
-         let actual_hash = if ver >= 3 {
-             compute_integrity_hash(body_slice)
-         } else {
-             xxh3_64(body_slice)
-         };
-         
-         if actual_hash != expected_hash {
-              return Err(pyo3::exceptions::PyValueError::new_err("Integrity check failed: XXH3 mismatch"));
-         }
-    }
-
-    let numpy = py.import("numpy")?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("dtype", dtype_name)?;
-    
-    let array = if (flags & 4) != 0 {
-        let body_slice = &bytes[body_start_rel..body_start_rel+body_len];
-        let is_frame = body_slice.len() >= 4 && body_slice[0..4] == [0x04, 0x22, 0x4D, 0x18];
-
-        let decompressed = if is_frame {
-            let mut decoder = FrameDecoder::new(body_slice);
-            let mut out = Vec::with_capacity(uncompressed_len);
-            decoder.read_to_end(&mut out).map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("LZ4 Frame Decompression failed: {}", e)))?;
-            out
-        } else {
-             lz4_decompress(body_slice, uncompressed_len)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("LZ4 Block Decompression failed: {}", e)))?
-        };
-            
-        let py_bytes = PyBytes::new(py, &decompressed);
-        kwargs.set_item("count", num_elements)?;
-        numpy.call_method("frombuffer", (py_bytes,), Some(kwargs))?
-    } else {
-        kwargs.set_item("offset", absolute_offset + body_start_rel)?;
-        kwargs.set_item("count", num_elements)?;
-        numpy.call_method("frombuffer", (root_data,), Some(kwargs))?
-    };
-
-    let reshaped = array.call_method1("reshape", (shape,))?;
-    let flags_attr = reshaped.getattr("flags")?;
-    flags_attr.setattr("writeable", false)?;
-
-    Ok(Some(reshaped.into()))
-}
-
-#[pyfunction]
-fn loads_rs<'py>(py: Python<'py>, data: &'py PyAny) -> PyResult<Option<PyObject>> {
-    let buffer: PyBuffer<u8> = PyBuffer::get(data)?;
-    let bytes = unsafe {
-        std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, buffer.len_bytes())
-    };
-
-    deserialize_impl(py, data, bytes, 0)
-}
-
 
 // -----------------------------------------------------------------------------
 // Cross-Process Robust Mutex (POSIX pthread_mutex in shared memory)
@@ -1103,9 +586,16 @@ mod shm_mutex {
 
     extern "C" {
         fn pthread_mutexattr_init(attr: *mut libc::pthread_mutexattr_t) -> libc::c_int;
-        fn pthread_mutexattr_setpshared(attr: *mut libc::pthread_mutexattr_t, pshared: libc::c_int) -> libc::c_int;
+        fn pthread_mutexattr_setpshared(
+            attr: *mut libc::pthread_mutexattr_t,
+            pshared: libc::c_int,
+        ) -> libc::c_int;
         fn pthread_mutexattr_destroy(attr: *mut libc::pthread_mutexattr_t) -> libc::c_int;
-        fn pthread_mutex_init(mutex: *mut libc::pthread_mutex_t, attr: *const libc::pthread_mutexattr_t) -> libc::c_int;
+        fn pthread_mutex_init(
+            mutex: *mut libc::pthread_mutex_t,
+            attr: *const libc::pthread_mutexattr_t,
+        ) -> libc::c_int;
+        #[allow(dead_code)] // declared for API completeness; lock path uses trylock
         fn pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
         fn pthread_mutex_unlock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
         fn pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
@@ -1113,7 +603,10 @@ mod shm_mutex {
 
         // Robust mutex support (Linux)
         #[cfg(target_os = "linux")]
-        fn pthread_mutexattr_setrobust(attr: *mut libc::pthread_mutexattr_t, robust: libc::c_int) -> libc::c_int;
+        fn pthread_mutexattr_setrobust(
+            attr: *mut libc::pthread_mutexattr_t,
+            robust: libc::c_int,
+        ) -> libc::c_int;
         #[cfg(target_os = "linux")]
         fn pthread_mutex_consistent(mutex: *mut libc::pthread_mutex_t) -> libc::c_int;
     }
@@ -1209,21 +702,24 @@ mod shm_mutex {
 fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
     let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
     if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Buffer is read-only",
+        ));
     }
     let buf_len = py_buf.len_bytes();
     let ptr = py_buf.buf_ptr() as *mut u8;
 
     if offset + shm_mutex::MUTEX_SIZE > buf_len {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            format!("Insufficient space: need {} bytes at offset {}, buffer is {} bytes",
-                    shm_mutex::MUTEX_SIZE, offset, buf_len)
-        ));
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Insufficient space: need {} bytes at offset {}, buffer is {} bytes",
+            shm_mutex::MUTEX_SIZE,
+            offset,
+            buf_len
+        )));
     }
 
     unsafe {
-        shm_mutex::init_mutex(ptr.add(offset))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        shm_mutex::init_mutex(ptr.add(offset)).map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 }
 
@@ -1235,14 +731,16 @@ fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
 fn shm_mutex_lock(buffer: &PyAny, offset: usize, timeout_secs: f64) -> PyResult<bool> {
     let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
     if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Buffer is read-only",
+        ));
     }
     let ptr = py_buf.buf_ptr() as *mut u8;
     let timeout = std::time::Duration::from_secs_f64(timeout_secs);
 
     unsafe {
         shm_mutex::lock_mutex(ptr.add(offset), timeout)
-            .map_err(|e| pyo3::exceptions::PyTimeoutError::new_err(e))
+            .map_err(pyo3::exceptions::PyTimeoutError::new_err)
     }
 }
 
@@ -1252,13 +750,14 @@ fn shm_mutex_lock(buffer: &PyAny, offset: usize, timeout_secs: f64) -> PyResult<
 fn shm_mutex_unlock(buffer: &PyAny, offset: usize) -> PyResult<()> {
     let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
     if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Buffer is read-only",
+        ));
     }
     let ptr = py_buf.buf_ptr() as *mut u8;
 
     unsafe {
-        shm_mutex::unlock_mutex(ptr.add(offset))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        shm_mutex::unlock_mutex(ptr.add(offset)).map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 }
 
@@ -1268,13 +767,14 @@ fn shm_mutex_unlock(buffer: &PyAny, offset: usize) -> PyResult<()> {
 fn shm_mutex_destroy(buffer: &PyAny, offset: usize) -> PyResult<()> {
     let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
     if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err("Buffer is read-only"));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Buffer is read-only",
+        ));
     }
     let ptr = py_buf.buf_ptr() as *mut u8;
 
     unsafe {
-        shm_mutex::destroy_mutex(ptr.add(offset))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        shm_mutex::destroy_mutex(ptr.add(offset)).map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 }
 
@@ -1306,14 +806,14 @@ fn tenso_rs(_py: Python, m: &PyModule) -> PyResult<()> {
 // -----------------------------------------------------------------------------
 // Fuzzing shims (only compiled when `--cfg fuzzing` is set, e.g. by cargo-fuzz)
 //
-// These expose a minimal byte-in / Result-out API for the otherwise-private
-// header parser so that fuzz targets in `fuzz/` can drive it without pulling
-// in PyO3. They MUST NOT be used by production code or tests.
+// These expose a minimal byte-in / Result-out API over `tenso_core` so that
+// fuzz targets in `fuzz/` can drive the header + shape parse without pulling in
+// PyO3. They MUST NOT be used by production code or tests.
 // -----------------------------------------------------------------------------
 
 #[cfg(fuzzing)]
 pub mod fuzz_api {
-    use super::{parse_packet_header_raw, HeaderError, HEADER_BASE_V4};
+    use tenso_core::{parse_header, TensoError, HEADER_BASE_V4};
 
     /// Result of a successful header + shape parse.
     #[derive(Debug)]
@@ -1326,32 +826,34 @@ pub mod fuzz_api {
         pub shape: Vec<usize>,
     }
 
-    /// Pure-Rust wrapper around `parse_packet_header_raw` for fuzzing.
-    pub fn fuzz_parse_header(bytes: &[u8]) -> Result<(u16, u8, usize, usize), HeaderError> {
-        let h = parse_packet_header_raw(bytes)?;
+    /// Pure-Rust wrapper around `tenso_core::parse_header` for fuzzing.
+    pub fn fuzz_parse_header(bytes: &[u8]) -> Result<(u16, u8, usize, usize), TensoError> {
+        let h = parse_header(bytes)?;
         Ok((h.flags, h.dtype_code, h.ndim, h.base_size))
     }
 
     /// Parse header + per-dim shape entries (the dense pre-body decode that
-    /// `get_packet_info_rs` and `deserialize_impl` both share). Mirrors the
-    /// Python-free portion of the dense decode path.
+    /// `get_packet_info_rs` and `decode` both share). Mirrors the Python-free
+    /// portion of the dense decode path, delegating to `tenso_core`.
     ///
-    /// TODO(fuzz): the rest of `deserialize_impl` (LZ4 decode, integrity check,
-    /// numpy buffer hand-off) is locked behind PyO3 and cannot run without an
-    /// initialized Python interpreter. A future iteration could split the
-    /// pre-Python validation logic into a pure-Rust helper and fuzz that too.
-    pub fn fuzz_parse_header_and_shape(bytes: &[u8]) -> Result<ParsedShape, HeaderError> {
-        let h = parse_packet_header_raw(bytes)?;
-        let shape_end = h.base_size + (h.ndim * 4);
+    /// TODO(fuzz): the rest of the decode (LZ4, integrity, numpy hand-off) is
+    /// either inside `tenso_core::decode` (fuzzed separately as the engine
+    /// grows fuzz targets) or behind PyO3.
+    pub fn fuzz_parse_header_and_shape(bytes: &[u8]) -> Result<ParsedShape, TensoError> {
+        let h = parse_header(bytes)?;
+        let shape_end = h
+            .base_size
+            .checked_add(h.ndim.checked_mul(4).ok_or(TensoError::Malformed)?)
+            .ok_or(TensoError::Malformed)?;
         if bytes.len() < shape_end {
-            return Err(HeaderError::TooShort);
+            return Err(TensoError::TooShort);
         }
         let mut shape = Vec::with_capacity(h.ndim);
         let mut cursor = h.base_size;
         for _ in 0..h.ndim {
             let dim_bytes: [u8; 4] = bytes[cursor..cursor + 4]
                 .try_into()
-                .map_err(|_| HeaderError::TooShort)?;
+                .map_err(|_| TensoError::TooShort)?;
             shape.push(u32::from_le_bytes(dim_bytes) as usize);
             cursor += 4;
         }
@@ -1368,82 +870,3 @@ pub mod fuzz_api {
     /// Re-export the header base size so fuzz targets can sanity-check offsets.
     pub const HEADER_BASE_V4_PUB: usize = HEADER_BASE_V4;
 }
-
-#[cfg(test)]
-mod header_tests {
-    use super::*;
-
-    fn v3_header(flags: u8, dtype: u8, ndim: u8) -> [u8; 8] {
-        [b'T', b'N', b'S', b'O', 3, flags, dtype, ndim]
-    }
-
-    fn v4_header_bytes(flags: u16, dtype: u8, ndim: u8) -> [u8; 10] {
-        let mut buf = [0u8; 10];
-        write_v4_header(&mut buf, flags, dtype, ndim);
-        buf
-    }
-
-    #[test]
-    fn rejects_packet_too_short() {
-        assert_eq!(parse_packet_header_raw(&[b'T', b'N', b'S', b'O']), Err(HeaderError::TooShort));
-        assert_eq!(parse_packet_header_raw(&[]), Err(HeaderError::TooShort));
-    }
-
-    #[test]
-    fn rejects_bad_magic() {
-        let bytes = [b'X', b'X', b'X', b'X', 4, 0, 0, 0];
-        assert_eq!(parse_packet_header_raw(&bytes), Err(HeaderError::BadMagic));
-    }
-
-    #[test]
-    fn rejects_unsupported_versions() {
-        for ver in [0u8, 1, 2, 5, 99, 255] {
-            let bytes = [b'T', b'N', b'S', b'O', ver, 0, 0, 0];
-            assert_eq!(
-                parse_packet_header_raw(&bytes),
-                Err(HeaderError::UnsupportedVersion(ver)),
-                "version {} should be rejected",
-                ver,
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_v4_with_truncated_header() {
-        let bytes = [b'T', b'N', b'S', b'O', 4, 0, 0, 0];
-        assert_eq!(parse_packet_header_raw(&bytes), Err(HeaderError::TruncatedV4));
-    }
-
-    #[test]
-    fn parses_v3_round_trip() {
-        let bytes = v3_header(0b1010_0011, 7, 4);
-        let hdr = parse_packet_header_raw(&bytes).unwrap();
-        assert_eq!(hdr.flags, 0b1010_0011);
-        assert_eq!(hdr.dtype_code, 7);
-        assert_eq!(hdr.ndim, 4);
-        assert_eq!(hdr.base_size, 8);
-    }
-
-    #[test]
-    fn parses_v4_round_trip() {
-        let bytes = v4_header_bytes(0xBEEF, 9, 3);
-        let hdr = parse_packet_header_raw(&bytes).unwrap();
-        assert_eq!(hdr.flags, 0xBEEF);
-        assert_eq!(hdr.dtype_code, 9);
-        assert_eq!(hdr.ndim, 3);
-        assert_eq!(hdr.base_size, 10);
-    }
-
-    #[test]
-    fn write_v4_header_layout() {
-        let mut buf = [0xAAu8; 10];
-        write_v4_header(&mut buf, 0x1234, 5, 2);
-        assert_eq!(&buf[0..4], b"TNSO");
-        assert_eq!(buf[4], 4);
-        assert_eq!(u16::from_le_bytes([buf[5], buf[6]]), 0x1234);
-        assert_eq!(buf[7], 5);
-        assert_eq!(buf[8], 2);
-        assert_eq!(buf[9], 0);
-    }
-}
-

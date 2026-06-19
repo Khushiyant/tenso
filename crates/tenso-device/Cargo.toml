@@ -1,0 +1,15 @@
+[package]
+name = "tenso-device"
+version = "0.22.0"
+edition = "2021"
+description = "DeviceBackend trait + CpuBackend + MockBackend + GPU codec orchestration over tenso-core."
+license = "MIT"
+
+[lib]
+name = "tenso_device"
+
+[features]
+default = []
+
+[dependencies]
+tenso-core = { workspace = true }

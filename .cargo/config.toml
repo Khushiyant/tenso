@@ -1,2 +1,16 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Native CPU tuning is intentionally NOT enabled here.
+#
+# Setting `rustflags = ["-C", "target-cpu=native"]` under [build] poisons
+# distributed binary wheels (built in CI) with the build machine's ISA
+# (e.g. AVX-512), causing SIGILL on older user CPUs. Released wheels must
+# stay portable, so the default/release build uses no extra rustflags.
+#
+# For local development you can opt in to native CPU tuning per-build:
+#
+#     RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# Or uncomment the following to enable it for all local builds (do NOT
+# commit this enabled — it would break wheel portability):
+#
+# [build]
+# rustflags = ["-C", "target-cpu=native"]

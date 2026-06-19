@@ -2,10 +2,13 @@
 """Atheris fuzz target for ``tenso.loads``.
 
 Contract under test: ``tenso.loads(data)`` may raise ``ValueError``,
-``EOFError``, or ``TypeError`` on malformed input, but MUST NOT segfault,
-hang, or raise any other exception type. A surfaced ``MemoryError`` or
-``OverflowError`` is also a parser bug (the protocol caps ndim and
-total_elements precisely so we never end up there from untrusted input).
+``EOFError``, ``TypeError``, or ``ImportError`` on malformed input, but
+MUST NOT segfault, hang, or raise any other exception type. ``ImportError``
+is expected because the sparse deserialization path raises
+``ImportError("scipy is required...")`` when scipy is absent. A surfaced
+``MemoryError`` or ``OverflowError`` is also a parser bug (the protocol caps
+ndim and total_elements precisely so we never end up there from untrusted
+input).
 
 Run:
 
@@ -28,7 +31,7 @@ with atheris.instrument_imports():
 
 # Exceptions we consider "expected" for malformed input. Anything else
 # escaping ``tenso.loads`` is a bug worth a crash file.
-_EXPECTED = (ValueError, EOFError, TypeError)
+_EXPECTED = (ValueError, EOFError, TypeError, ImportError)
 
 
 def _one(data: bytes) -> None:

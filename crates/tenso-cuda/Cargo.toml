@@ -1,0 +1,21 @@
+[package]
+name = "tenso-cuda"
+version = "0.22.0"
+edition = "2021"
+description = "The only crate touching CUDA. Dlopen-based (libloading) DeviceBackend; aarch64-buildable without the CUDA toolkit."
+license = "MIT"
+
+[lib]
+name = "tenso_cuda"
+
+[features]
+# Off by default so the workspace builds anywhere (incl. aarch64 without CUDA).
+# The build agent gates real driver calls behind this; without it, constructing
+# a backend returns DevErr::IpcUnsupported / a "no driver" error at runtime.
+default = []
+cuda = ["dep:libloading"]
+
+[dependencies]
+tenso-core = { workspace = true }
+tenso-device = { workspace = true }
+libloading = { workspace = true, optional = true }

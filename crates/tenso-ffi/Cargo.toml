@@ -1,0 +1,19 @@
+[package]
+name = "tenso-ffi"
+version = "0.22.0"
+edition = "2021"
+description = "Stable C ABI for the Tenso core (cdylib + staticlib); cbindgen generates include/tenso.h."
+license = "MIT"
+
+[lib]
+name = "tenso_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+tenso-core = { workspace = true }
+
+[build-dependencies]
+cbindgen = { workspace = true }
