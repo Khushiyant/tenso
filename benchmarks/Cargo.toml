@@ -1,0 +1,33 @@
+# Standalone bench crate — its own workspace so arrow/cdr/etc. never touch the
+# main workspace's lockfile or build. Run from this directory.
+[package]
+name = "tenso-benchmarks"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+tenso = { path = "../crates/tenso", features = ["integrity", "compression"] }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"   # CBOR (TinyCBOR/QCBOR on MCUs)
+rmp-serde = "1"    # MessagePack
+postcard = { version = "1", features = ["alloc"] }  # embedded-Rust standard
+arrow = { version = "53", default-features = false, features = ["ipc"] }  # Apache Arrow
+cdr = "0.2"        # CDR — the ROS 2 / DDS wire serialization
+
+[[bin]]
+name = "serializers"
+path = "src/bin/serializers.rs"
+
+[[bin]]
+name = "arrow_bench"
+path = "src/bin/arrow_bench.rs"
+
+[[bin]]
+name = "cdr_bench"
+path = "src/bin/cdr_bench.rs"
+
+[profile.release]
+opt-level = 3
