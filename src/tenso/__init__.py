@@ -35,7 +35,7 @@ try:
 
     __version__ = _version("tenso")
 except Exception:
-    __version__ = "0.22.0"  # Fallback to pyproject.toml value
+    __version__ = "0.24.0"  # Fallback to pyproject.toml value
 
 __all__ = [
     "dumps",

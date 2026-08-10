@@ -14,9 +14,9 @@ resolver = "2"
 # Keeping version here makes a lockstep release a single edit (plus the matching
 # `version = ...` on the internal deps below).
 [workspace.package]
-version = "0.22.0"
+version = "0.24.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/Khushiyant/tenso"
 keywords = ["tensor", "serialization", "zero-copy", "ipc"]
 categories = ["encoding", "science", "data-structures"]
@@ -32,13 +32,13 @@ cbindgen = "0.27"
 # Internal path deps so crates reference each other by `{ workspace = true }`.
 # The `version` is REQUIRED for crates.io publishing (a path-only dep is rejected);
 # it must track the workspace.package version for a lockstep release.
-tenso = { path = "crates/tenso", version = "0.22.0" }
-tenso-device = { path = "crates/tenso-device", version = "0.22.0" }
-tenso-cuda = { path = "crates/tenso-cuda", version = "0.22.0" }
+tenso = { path = "crates/tenso", version = "0.24.0" }
+tenso-device = { path = "crates/tenso-device", version = "0.24.0" }
+tenso-cuda = { path = "crates/tenso-cuda", version = "0.24.0" }
 
 [package]
 name = "tenso-rs"
-version = "0.22.0"
+version = "0.24.0"
 edition = "2021"
 
 [lib]

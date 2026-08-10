@@ -3,12 +3,42 @@ name = "tenso"
 version = "0.24.0"
 description = "High-performance zero-copy tensor protocol"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Khushiyant", email = "khushiyant2002@gmail.com" }]
+keywords = ["tensor", "serialization", "zero-copy", "ipc", "simd", "numpy", "rust"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    # No "License ::" classifier: PEP 639 supersedes it with the SPDX
+    # `license` expression above, and PyPI rejects uploads carrying both.
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
 dependencies = [
     "lz4>=4.4.5",
     "numpy",
     "xxhash>=3.6.0",
 ]
 requires-python = ">=3.11"
+
+[project.urls]
+Homepage = "https://khushiyant.github.io/tenso/"
+Repository = "https://github.com/Khushiyant/tenso"
+Documentation = "https://khushiyant.github.io/tenso/"
+Changelog = "https://github.com/Khushiyant/tenso/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Khushiyant/tenso/issues"
 
 [project.optional-dependencies]
 api = [
@@ -58,7 +88,15 @@ module-name = "tenso.tenso_rs" # This compiles the rust binary as a submodule
 features = ["pyo3/extension-module"]
 
 [tool.semantic_release]
-version_toml = ["pyproject.toml:project.version"]
+# Cargo.toml is bumped here too, so a release tag carries a Cargo version that
+# matches the Python one. Previously only pyproject.toml was bumped and the
+# tagged tree kept a stale Cargo version, which the release workflow then had to
+# sed-rewrite at publish time.
+version_toml = [
+    "pyproject.toml:project.version",
+    "Cargo.toml:workspace.package.version",
+    "Cargo.toml:package.version",
+]
 branch = "main"
 upload_to_pypi = false
 upload_to_release = true
