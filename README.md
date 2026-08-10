@@ -7,7 +7,7 @@
 Zero-copy, SIMD-aligned tensor protocol for high-performance ML infrastructure.
 
 [![PyPI version](https://img.shields.io/pypi/v/tenso)](https://pypi.org/project/tenso/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 ---
@@ -45,56 +45,76 @@ binary footprint and verified embedded targets, see
 
 **System**: Python 3.12.9, NumPy 2.3.5, 12 CPU cores, M4 Pro
 
+**Reproduce**: `pip install -e ".[dev]" && maturin develop --release && python benchmark.py`.
+Timed sections take the fastest of 7 runs after 2 warmups; disk writes are fsynced and
+disk reads fault in every page, so every row in a table measures the same work.
+
 ### 1. In-Memory Serialization (LLM Layer - 64MB)
 
 | Format       | Size       | Serialize | Deserialize | Speedup (Deser) |
 |--------------|------------|-----------|-------------|-----------------|
-| **Tenso**    | 64.00 MB   | 3.51 ms   | **0.004 ms**| **1x**          |
-| Arrow        | 64.00 MB   | 7.06 ms   | 0.011 ms    | 2.8x slower     |
-| SafeTensors  | 64.00 MB   | 8.14 ms   | 2.39 ms     | 597x slower     |
-| Pickle       | 64.00 MB   | 2.93 ms   | 2.71 ms     | 677x slower     |
-| MsgPack      | 64.00 MB   | 10.44 ms  | 3.05 ms     | 763x slower     |
+| **Tenso**    | 64.00 MB   | 4.00 ms   | **0.004 ms**| **1x**          |
+| Arrow        | 64.00 MB   | 7.31 ms   | 0.008 ms    | 2x slower       |
+| SafeTensors  | 64.00 MB   | 8.88 ms   | 2.98 ms     | 745x slower     |
+| Pickle       | 64.00 MB   | 3.17 ms   | 3.00 ms     | 749x slower     |
+| MsgPack      | 64.00 MB   | 11.51 ms  | 2.98 ms     | 744x slower     |
 
-> **Note**: Tenso (Vect) variant is even faster with 0.000 ms deserialize time.
+> **Reading the table**: Tenso and Arrow return zero-copy *views*; SafeTensors, Pickle
+> and MsgPack *materialize* the array. The deserialize column therefore compares a view
+> against a full reconstruction — which is exactly the "serialize once, read many"
+> trade-off Tenso targets, not an identical-work decode. Against Arrow, which also
+> returns a view, the margin at this size is ~2x; see table 5 for how it scales.
 
 ### 2. Disk I/O (256 MB Matrix)
 
-| Format | Write | Read |
-|--------|-------|------|
-| **Tenso** | **29.41 ms** | **36.28 ms** |
-| NumPy .npy | 24.83 ms | 43.08 ms |
-| Pickle | 49.90 ms | 24.24 ms |
+| Format | Write (fsynced) | Read (all pages faulted) |
+|--------|-----------------|--------------------------|
+| **Tenso** | 47.05 ms | 31.21 ms |
+| NumPy .npy | 31.13 ms | 29.53 ms |
+| Pickle | 46.22 ms | 29.16 ms |
+
+Disk I/O is bound by the device, not the format: with writes fsynced and reads actually
+faulting in every page, all three land within noise of each other. Tenso's advantage is
+not on this axis — it is that the mapped bytes need no decode step before use.
 
 ### 3. Stream Reading (95 MB Packet)
 
 | Method | Time | Throughput | Speedup |
 |--------|------|------------|---------|
-| **Tenso read_stream** | **7.68 ms** | **12,417 MB/s** | **1x** |
-| Optimised Loop | 13.89 ms | 7,396 MB/s | 1.9x slower |
+| **Tenso read_stream** | **26.28 ms** | **3,628 MB/s** | **1x** |
+| Naive chunk-and-join loop | 32.79 ms | 2,909 MB/s | 1.2x slower |
+
+Framing dominates at this size, so the margin over a hand-rolled read loop is modest;
+the value is that `read_stream` hands off to the decoder without a second copy.
 
 ### 4. CPU Usage (Efficiency)
 
 | Format      | Serialize CPU% | Deserialize CPU% |
 |-------------|----------------|------------------|
-| **Tenso**   | 117.3%         | **0.8%**         |
-| Arrow       | 57.1%          | 1.0%             |
-| SafeTensors | 67.1%          | 37.1%            |
-| Pickle      | 44.0%          | 40.9%            |
+| **Tenso**   | 47.6%          | **0.2%**         |
+| Arrow       | 59.6%          | 1.8%             |
+| SafeTensors | 70.0%          | 41.7%            |
+| Pickle      | 47.3%          | 42.9%            |
 
 ### 5. Arrow vs Tenso (Comparison)
 
 | Size    | Tenso Ser | Arrow Ser | Tenso Des | Arrow Des | Speedup |
 |---------|-----------|-----------|-----------|-----------|---------|
-| Small   | 0.130ms   | 0.056ms   | 0.009ms   | 0.035ms   | 4.1x    |
-| Medium  | 0.972ms   | 0.912ms   | 0.020ms   | 0.040ms   | 2.0x    |
-| Large   | 3.166ms   | 3.655ms   | 0.019ms   | 0.222ms   | 11.8x   |
-| XLarge  | 19.086ms  | 28.726ms  | 0.023ms   | 0.733ms   | **32.0x** |
+| Small   | 0.067ms   | 0.055ms   | 0.003ms   | 0.035ms   | 13.7x   |
+| Medium  | 1.084ms   | 1.195ms   | 0.012ms   | 0.038ms   | 3.2x    |
+| Large   | 6.145ms   | 8.053ms   | 0.033ms   | 0.538ms   | 16.2x   |
+| XLarge  | 37.540ms  | 36.253ms  | 0.060ms   | 2.823ms   | **46.8x** |
+
+Both return views, so this measures how each library's decode path scales rather than
+memory bandwidth: Arrow's grows with size, Tenso's stays near-flat.
 
 ### 6. Network Performance
 
-- **Packet Throughput**: 89,183 packets/sec (over localhost TCP)
-- **Latency**: 11.2 µs/packet
-- **Async Write Throughput**: 88,397 MB/s (1.4M tensors/sec)
+- **Packet Throughput**: 104,982 packets/sec (over localhost TCP, 1 KB tensors)
+- **Latency**: 9.5 µs/packet (send-side cost; not a round trip)
+- **Async serialization ceiling**: 6,242 MB/s (99,871 tensors/sec at 64 KB each) —
+  encode plus framing into a null sink, with no socket or disk write. Real end-to-end
+  throughput is bounded by your transport, not by this number.
 
 ---
 
@@ -107,7 +127,7 @@ Tenso is built for one pattern: **serialize once, deserialize many times, over t
 - **You serve models over a network or RPC.** Inference nodes spend ~0.8% CPU decoding tensors instead of ~40%, leaving the cores for actual compute.
 - **You pass tensors between machines or processes** — gradients/activations in distributed training (native Ray integration), or zero-copy hand-offs via shared memory (`TensoShm`).
 - **Latency is critical** — real-time inference, robotics, sensor fusion (single-digit-µs reads).
-- **You stream many tensors** — high-throughput pipelines (1.4M tensors/sec), with `write_stream` sending straight from the array's own memory.
+- **You stream many tensors** — high-throughput pipelines, with `write_stream` sending straight from the array's own memory (no body copy).
 - **You feed GPUs** from the network or disk with minimal host involvement.
 - **You want integrity without overhead** — optional 64-bit XXH3 checksums.
 
@@ -254,7 +274,13 @@ async def get_tensor():
 
 ### Ray Integration (Distributed Computing)
 
-Replace pickle-based serialization in Ray with Tenso for **46x less CPU overhead** on tensor operations. Works transparently with `ray.put()`, `ray.get()`, remote functions, and actors.
+Replace pickle-based serialization in Ray with Tenso to cut encode cost on tensor
+operations. Works transparently with `ray.put()`, `ray.get()`, remote functions, and
+actors.
+
+> Note: this path deserializes with `copy=True`, because a view into Ray's object store
+> would not outlive the buffer Ray owns. So it avoids pickle's encode overhead but does
+> allocate on read — the zero-copy deserialize figures above do not apply here.
 
 ```python
 import ray
@@ -413,11 +439,13 @@ The padding ensures the body starts at a **64-byte boundary**, enabling AVX-512 
 
 ## Use Cases
 
-* **Model Serving APIs**: Up to 35x faster deserialization with 46x less CPU saves massive overhead on inference nodes.
+* **Model Serving APIs**: Up to 46x faster deserialization than Arrow, with far less CPU than SafeTensors, saves real overhead on inference nodes.
 * **Distributed Training**: Efficiently pass gradients or activations between nodes with native Ray integration.
 * **GPU-Direct Pipelines**: Stream data from network cards to GPU memory with minimal host intervention.
-* **Real-time Robotics**: 10.2 µs latency for high-frequency sensor fusion (LIDAR, Radar).
-* **High-Throughput Streaming**: 89K packets/sec network transmission for real-time data pipelines.
+* **Real-time Robotics**: single-digit-µs decode, and a `no_std` core that builds for
+  Cortex-M — see [`benchmarks/`](https://github.com/Khushiyant/tenso/tree/main/benchmarks)
+  for the ROS 2 / CDR comparison.
+* **High-Throughput Streaming**: ~105K packets/sec over localhost TCP for real-time data pipelines.
 
 ---
 
@@ -433,7 +461,7 @@ ships; we are currently looking for help with:
 
 ## License
 
-Apache License 2.0 - see [LICENSE](https://www.google.com/search?q=LICENSE) file.
+Apache License 2.0 - see [LICENSE](LICENSE) file.
 
 ## Citation
 

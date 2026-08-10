@@ -37,6 +37,25 @@ except ImportError:
 # Global state for integrity check
 USE_INTEGRITY = False
 
+
+def _best_of(fn, repeat: int = 7, warmup: int = 2) -> float:
+    """Milliseconds for the fastest of `repeat` runs, after `warmup` untimed runs.
+
+    A single cold call measures page faults, allocator growth and CPU frequency
+    ramp as much as it measures the code, which is why several tables here used to
+    swing by 3x between runs on the same machine. The minimum is the right summary
+    for "how fast can this go": noise only ever adds time.
+    """
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    return min(times) * 1000
+
+
 # --- HELPER: Resource Monitoring ---
 
 
@@ -251,8 +270,8 @@ def bench_tenso_vectored(data):
     """
     # This prepares the packet metadata but yields the original tensor.data memoryview
     enc = lambda x: list(tenso.iter_dumps(x, check_integrity=USE_INTEGRITY))  # noqa
-    # Deserialization from chunks happens at the I/O layer, so this is a placeholder
-    dec = lambda x: data  # noqa
+    # Reassemble the vectored chunks and decode (the real read-side cost).
+    dec = lambda chunks: tenso.loads(b"".join(bytes(c) for c in chunks))  # noqa
     return enc, dec
 
 
@@ -357,61 +376,54 @@ def run_io():
     size_mb = data.nbytes / (1024 * 1024)
     print(f"Dataset: {size_mb:.0f} MB Matrix {shape}")
 
+    # Writes are fsynced and reads touch every page, so all three rows measure the
+    # same work. Without fsync a "write" only reaches the page cache; without
+    # touching pages, the two mmap-based readers time an mmap() syscall while
+    # pickle actually moves 256 MB -- which made the read column meaningless.
     print(f"{'FORMAT':<15} | {'WRITE (ms)':<10} | {'READ (ms)':<10}")
     print("-" * 60)
 
-    # 1. Tenso
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        path = f.name
-    try:
-        t0 = time.perf_counter()
+    def _write_synced(path, writer):
         with open(path, "wb") as f:
-            tenso.dump(data, f, check_integrity=USE_INTEGRITY)
-        t_write = (time.perf_counter() - t0) * 1000
+            writer(f)
+            f.flush()
+            os.fsync(f.fileno())
 
-        t0 = time.perf_counter()
-        # load automatically detects integrity footer from header
+    def _bench_format(label, suffix, writer, reader):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            path = f.name
+        try:
+            t_write = _best_of(lambda: _write_synced(path, writer))
+            # Materialize on read: .sum() faults in every page for the mmap paths
+            # and is negligible next to the I/O it forces.
+            t_read = _best_of(lambda: float(np.asarray(reader(path)).sum()))
+            print(f"{label:<15} | {t_write:>10.2f} | {t_read:>10.2f}")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def _tenso_read(path):
         with open(path, "rb") as f:
-            tenso.load(f, mmap_mode=True)
-        t_read = (time.perf_counter() - t0) * 1000
-        print(f"{'Tenso':<15} | {t_write:>10.2f} | {t_read:>10.2f}")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+            # load auto-detects the integrity footer from the header
+            return tenso.load(f, mmap_mode=True)
 
-    # 2. Numpy
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f:
-        path = f.name
-    try:
-        t0 = time.perf_counter()
-        np.save(path, data)
-        t_write = (time.perf_counter() - t0) * 1000
-
-        t0 = time.perf_counter()
-        np.load(path, mmap_mode="r")
-        t_read = (time.perf_counter() - t0) * 1000
-        print(f"{'Numpy .npy':<15} | {t_write:>10.2f} | {t_read:>10.2f}")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
-
-    # 3. Pickle
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        path = f.name
-    try:
-        t0 = time.perf_counter()
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
-        t_write = (time.perf_counter() - t0) * 1000
-
+    def _pickle_read(path):
         with open(path, "rb") as f:
-            t0 = time.perf_counter()
-            pickle.load(f)
-            t_read = (time.perf_counter() - t0) * 1000
-        print(f"{'Pickle':<15} | {t_write:>10.2f} | {t_read:>10.2f}")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+            return pickle.load(f)
+
+    _bench_format(
+        "Tenso",
+        "",
+        lambda f: tenso.dump(data, f, check_integrity=USE_INTEGRITY),
+        _tenso_read,
+    )
+    _bench_format(
+        "Numpy .npy",
+        ".npy",
+        lambda f: np.save(f, data),
+        lambda path: np.load(path, mmap_mode="r"),
+    )
+    _bench_format("Pickle", "", lambda f: pickle.dump(data, f), _pickle_read)
 
 
 def run_stream_read():
@@ -431,27 +443,26 @@ def run_stream_read():
     print(f"{'METHOD':<20} | {'TIME (ms)':<10} | {'THROUGHPUT':<15}")
     print("-" * 60)
 
-    # Optimized
-    stream = FastStream(packet)
-    t0 = time.perf_counter()
-    tenso.read_stream(stream)
-    t_opt = (time.perf_counter() - t0) * 1000
+    def read_via_stream():
+        stream = FastStream(packet)
+        tenso.read_stream(stream)
+
+    def read_via_naive_loop():
+        stream = FastStream(packet)
+        chunks = []
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        tenso.loads(b"".join(chunks))  # Standard Python way
+
+    t_opt = _best_of(read_via_stream)
     print(
         f"{'Tenso read_stream':<20} | {t_opt:>7.2f} ms | {size_mb / (t_opt / 1000):>7.2f} MB/s"
     )
 
-    # Legacy Loop Simulation
-    stream.seek(0)
-    t0 = time.perf_counter()
-    chunks = []
-    while True:
-        chunk = stream.read(65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    full_data = b"".join(chunks)  # Standard Python way
-    tenso.loads(full_data)
-    t_old = (time.perf_counter() - t0) * 1000
+    t_old = _best_of(read_via_naive_loop)
     print(
         f"{'Naive Loop':<20} | {t_old:>7.2f} ms | {size_mb / (t_old / 1000):>7.2f} MB/s"
     )
@@ -682,7 +693,7 @@ def run_async_benchmark():
     mbps = total_mb / t_write
 
     print(
-        f"{'Async Write':<20} | {t_write:>8.4f}s | {fps:>10.0f} tensors/s | {mbps:>8.2f} MB/s"
+        f"{'Async Ser (null-sink)':<20} | {t_write:>8.4f}s | {fps:>10.0f} tensors/s | {mbps:>8.2f} MB/s"
     )
     print("-" * 80)
 
