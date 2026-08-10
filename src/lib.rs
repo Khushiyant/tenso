@@ -861,11 +861,16 @@ mod shm_mutex {
     }
 }
 
-/// Init a POSIX process-shared mutex at `offset` in a shm-backed buffer
-/// (needs >= 64 bytes there).
+/// Resolve `buffer[offset..offset + MUTEX_SIZE]` to a writable pointer, or fail.
+///
+/// Every `shm_mutex_*` entry point goes through here. These functions are
+/// reachable from pure Python with an arbitrary `offset`, and the pthread calls
+/// they feed WRITE through the pointer, so an unchecked `ptr.add(offset)` hands
+/// Python arbitrary out-of-bounds memory access. `offset` is a `usize` straight
+/// from the caller, hence `checked_add` rather than `+`: a near-`usize::MAX`
+/// offset would otherwise wrap past the comparison.
 #[cfg(unix)]
-#[pyfunction]
-fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
+fn shm_mutex_ptr(buffer: &PyAny, offset: usize) -> PyResult<*mut u8> {
     let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
     if py_buf.readonly() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -873,9 +878,10 @@ fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
         ));
     }
     let buf_len = py_buf.len_bytes();
-    let ptr = py_buf.buf_ptr() as *mut u8;
-
-    if offset + shm_mutex::MUTEX_SIZE > buf_len {
+    let end = offset
+        .checked_add(shm_mutex::MUTEX_SIZE)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Offset overflows usize"))?;
+    if end > buf_len {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "Insufficient space: need {} bytes at offset {}, buffer is {} bytes",
             shm_mutex::MUTEX_SIZE,
@@ -883,10 +889,16 @@ fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
             buf_len
         )));
     }
+    Ok(unsafe { (py_buf.buf_ptr() as *mut u8).add(offset) })
+}
 
-    unsafe {
-        shm_mutex::init_mutex(ptr.add(offset)).map_err(pyo3::exceptions::PyRuntimeError::new_err)
-    }
+/// Init a POSIX process-shared mutex at `offset` in a shm-backed buffer
+/// (needs >= 64 bytes there).
+#[cfg(unix)]
+#[pyfunction]
+fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
+    let ptr = shm_mutex_ptr(buffer, offset)?;
+    unsafe { shm_mutex::init_mutex(ptr).map_err(pyo3::exceptions::PyRuntimeError::new_err) }
 }
 
 /// Lock a POSIX process-shared mutex. True if recovered from a dead owner.
@@ -894,18 +906,10 @@ fn shm_mutex_init(buffer: &PyAny, offset: usize) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(signature = (buffer, offset, timeout_secs=5.0))]
 fn shm_mutex_lock(buffer: &PyAny, offset: usize, timeout_secs: f64) -> PyResult<bool> {
-    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
-    if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Buffer is read-only",
-        ));
-    }
-    let ptr = py_buf.buf_ptr() as *mut u8;
+    let ptr = shm_mutex_ptr(buffer, offset)?;
     let timeout = std::time::Duration::from_secs_f64(timeout_secs);
-
     unsafe {
-        shm_mutex::lock_mutex(ptr.add(offset), timeout)
-            .map_err(pyo3::exceptions::PyTimeoutError::new_err)
+        shm_mutex::lock_mutex(ptr, timeout).map_err(pyo3::exceptions::PyTimeoutError::new_err)
     }
 }
 
@@ -913,34 +917,16 @@ fn shm_mutex_lock(buffer: &PyAny, offset: usize, timeout_secs: f64) -> PyResult<
 #[cfg(unix)]
 #[pyfunction]
 fn shm_mutex_unlock(buffer: &PyAny, offset: usize) -> PyResult<()> {
-    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
-    if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Buffer is read-only",
-        ));
-    }
-    let ptr = py_buf.buf_ptr() as *mut u8;
-
-    unsafe {
-        shm_mutex::unlock_mutex(ptr.add(offset)).map_err(pyo3::exceptions::PyRuntimeError::new_err)
-    }
+    let ptr = shm_mutex_ptr(buffer, offset)?;
+    unsafe { shm_mutex::unlock_mutex(ptr).map_err(pyo3::exceptions::PyRuntimeError::new_err) }
 }
 
 /// Destroy a POSIX process-shared mutex.
 #[cfg(unix)]
 #[pyfunction]
 fn shm_mutex_destroy(buffer: &PyAny, offset: usize) -> PyResult<()> {
-    let py_buf: PyBuffer<u8> = PyBuffer::get(buffer)?;
-    if py_buf.readonly() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Buffer is read-only",
-        ));
-    }
-    let ptr = py_buf.buf_ptr() as *mut u8;
-
-    unsafe {
-        shm_mutex::destroy_mutex(ptr.add(offset)).map_err(pyo3::exceptions::PyRuntimeError::new_err)
-    }
+    let ptr = shm_mutex_ptr(buffer, offset)?;
+    unsafe { shm_mutex::destroy_mutex(ptr).map_err(pyo3::exceptions::PyRuntimeError::new_err) }
 }
 
 /// Return the size in bytes needed for one POSIX process-shared mutex.
