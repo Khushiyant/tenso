@@ -386,15 +386,27 @@ fn read_u64(bytes: &[u8], off: usize) -> Result<u64, TensoError> {
     Ok(u64::from_le_bytes(arr))
 }
 
-/// Decompress an LZ4 *frame* (matching Python's `lz4.frame`).
+/// Decompress an LZ4 *frame* (matching Python's `lz4.frame`), bounding the
+/// output to `max_out` bytes. `max_out` is the size the declared shape implies
+/// (`num_elements * item_size`); a frame that expands past it is a decompression
+/// bomb and is rejected before it can balloon memory.
 #[cfg(feature = "compression")]
-fn lz4_decompress_frame(body: &[u8]) -> Result<Vec<u8>, TensoError> {
+fn lz4_decompress_frame(body: &[u8], max_out: usize) -> Result<Vec<u8>, TensoError> {
     use std::io::Read;
     let mut decoder = lz4_flex::frame::FrameDecoder::new(body);
     let mut out = Vec::new();
+    // Read one byte past the cap so an over-long frame is detected rather than
+    // silently truncated; `Take` stops the decoder before it overruns memory.
+    let cap = (max_out as u64).saturating_add(1);
     decoder
+        .take(cap)
         .read_to_end(&mut out)
         .map_err(|_| TensoError::Lz4("LZ4 frame decompression failed"))?;
+    if out.len() > max_out {
+        return Err(TensoError::Lz4(
+            "LZ4 frame decompressed past the declared size",
+        ));
+    }
     Ok(out)
 }
 
@@ -1326,7 +1338,18 @@ pub fn decode_dense_to_owned(bytes: &[u8]) -> Result<(Dtype, Vec<u32>, Vec<u8>),
     }
     // Compressed body: body_start to the footer (no length prefix; bounds checked above).
     let body = &bytes[body_start..bytes.len() - footer_len];
-    let owned = lz4_decompress_frame(body)?;
+    // Bomb guard: cap decompression at the byte size the declared shape implies.
+    let item = dtype
+        .item_size()
+        .ok_or(TensoError::BadDtype(hdr.dtype_code))?;
+    let num_elements = shape_num_elements(&shape)?;
+    if num_elements > MAX_ELEMENTS {
+        return Err(TensoError::TooManyElements);
+    }
+    let max_out = (num_elements as usize)
+        .checked_mul(item)
+        .ok_or(TensoError::TooManyElements)?;
+    let owned = lz4_decompress_frame(body, max_out)?;
     Ok((dtype, shape, owned))
 }
 
@@ -1764,6 +1787,42 @@ mod tests {
         match decode(&out) {
             Err(TensoError::IntegrityMismatch) => {}
             other => panic!("expected IntegrityMismatch, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn compressed_decode_rejects_decompression_bomb() {
+        // 1024 f32 zeros (4096 B) compress to a tiny frame.
+        let data = vec![0u8; 1024 * 4];
+        let shape = [1024u32];
+        let spec = ArraySpec {
+            data: &data,
+            dtype: Dtype::F32,
+            shape: &shape,
+        };
+        let opts = EncodeOpts {
+            compress: true,
+            check_integrity: false,
+            ..Default::default()
+        };
+        let sz = dense_required_size(&spec, &opts).unwrap();
+        let mut out = vec![0u8; sz];
+        let written = encode_dense_into(&spec, &mut out, &opts).unwrap();
+        out.truncate(written);
+
+        // Honest packet round-trips to the full 4096-byte body.
+        let (_, shp, body) = decode_dense_to_owned(&out).unwrap();
+        assert_eq!(shp, vec![1024]);
+        assert_eq!(body.len(), 1024 * 4);
+
+        // Tamper the declared shape to [1] (max_out = 4 B) while the frame still
+        // decompresses to 4096 B. Without the cap a tiny packet balloons memory;
+        // with it, decode must reject.
+        out[10..14].copy_from_slice(&1u32.to_le_bytes());
+        match decode_dense_to_owned(&out) {
+            Err(TensoError::Lz4(_)) => {}
+            other => panic!("expected Lz4 bomb rejection, got ok={}", other.is_ok()),
         }
     }
 
