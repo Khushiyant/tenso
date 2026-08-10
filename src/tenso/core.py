@@ -6,6 +6,8 @@ Sparse matrices, and Dictionaries to the Tenso binary format. It supports
 zero-copy memory mapping, LZ4 compression, and XXH3 integrity verification.
 """
 
+import io
+import math
 import mmap
 import struct
 import sys
@@ -77,6 +79,28 @@ _4BIT_CODES = (QDTYPE_QINT4, QDTYPE_QUINT4)
 _MAX_DIM = 0xFFFFFFFF
 
 
+def _validate_byteorder(arr: np.ndarray) -> None:
+    """Reject arrays whose dtype is not in the wire format's byte order.
+
+    The format stores bodies little-endian, and the encoder copies raw bytes from
+    ``arr.ctypes.data`` without inspecting byte order. ``_DTYPE_MAP`` is keyed on
+    native dtype objects, so a byteswapped dtype like ``'>f4'`` never matched and
+    fell through unchecked -- the bytes were written big-endian and read back
+    little-endian, silently producing different numbers with no error raised.
+
+    Rejecting is deliberate: converting on the caller's behalf would hide an
+    allocation and a copy inside what is documented as a zero-copy write.
+    """
+    if arr.dtype.isnative:
+        return
+    raise ValueError(
+        f"Cannot serialize dtype {arr.dtype!r}: tenso writes the array's raw "
+        f"bytes, so the dtype must be in this platform's native byte order "
+        f"({sys.byteorder}-endian). Convert first with "
+        f"arr.astype(arr.dtype.newbyteorder('='))."
+    )
+
+
 def _validate_dims(shape) -> None:
     """Reject shapes whose dimensions overflow the wire format's u32 dim slots.
 
@@ -108,11 +132,11 @@ def _aligned_empty(shape, dtype, alignment: int) -> np.ndarray:
 def _ensure_aligned(obj, alignment: int, copy: bool):
     """Guarantee ``obj``'s arrays are ``alignment``-aligned in memory.
 
-    A zero-copy ``np.frombuffer`` view inherits the alignment of the caller's
-    transport buffer, which Tenso does not control, so the "aligned" promise did
-    not hold for the returned array (issue #5). Here we keep the zero-copy view
-    whenever it already happens to be aligned and only fall back to an aligned
-    copy otherwise. ``copy=True`` always yields a writeable aligned copy.
+    Only reached when the caller opts in (``loads(..., align=True)``) or asks for
+    a writeable copy, because guaranteeing an *absolute* address is not free: a
+    decoded view inherits the transport buffer's address, which Tenso does not
+    own, so the guarantee costs a full copy whenever that address does not
+    already line up. See :func:`loads` for why that is opt-in rather than default.
     """
     if isinstance(obj, dict):
         return {k: _ensure_aligned(v, alignment, copy) for k, v in obj.items()}
@@ -337,7 +361,10 @@ def _read_full_packet(source: Any) -> Optional[bytearray]:
     shape_b = _take(ndim * 4)
     buf += shape_b
     shape = struct.unpack(f"<{ndim}I", shape_b)
-    num_elements = int(np.prod(shape))
+    # math.prod, not np.prod: these dims come off an untrusted header, and np.prod
+    # multiplies in int64, which wraps silently and lets a hostile shape slip past
+    # the MAX_ELEMENTS guard below. Python ints have no such ceiling.
+    num_elements = math.prod(shape)
     if num_elements > MAX_ELEMENTS:
         raise ValueError(f"Packet exceeds maximum elements ({num_elements})")
 
@@ -400,7 +427,11 @@ def read_stream(source: Any) -> Optional[Any]:
     packet = _read_full_packet(source)
     if packet is None:
         return None
-    return loads(bytes(packet))
+    # toreadonly() rather than bytes(): both give loads() an immutable buffer, but
+    # bytes() copies the whole packet first, which on a 100 MB frame cost ~4 ms and
+    # defeated the point of a zero-copy read. The returned view keeps this
+    # bytearray alive, and an exported buffer blocks resizing it.
+    return loads(memoryview(packet).toreadonly())
 
 
 def iter_dumps(
@@ -479,6 +510,7 @@ def _bundle_make_contiguous(d: dict, strict: bool) -> dict:
     out = {}
     for k, v in d.items():
         if isinstance(v, np.ndarray):
+            _validate_byteorder(v)
             if not v.flags["C_CONTIGUOUS"]:
                 if strict:
                     raise ValueError("Tensor is not C-Contiguous")
@@ -522,13 +554,14 @@ def dumps(
 
     # Reject oversized dims up front: clean ValueError instead of u32 truncation (issue #4).
     if isinstance(tensor, np.ndarray):
+        _validate_byteorder(tensor)
         _validate_dims(tensor.shape)
         # Reject oversized element COUNT before contiguity coercion, else a huge
         # strided view forces a multi-GB ascontiguousarray just to be rejected (OOM).
-        if int(np.prod(tensor.shape, dtype=object)) > MAX_ELEMENTS:
+        num_elements = math.prod(tensor.shape)
+        if num_elements > MAX_ELEMENTS:
             raise ValueError(
-                f"Packet exceeds maximum elements ({int(np.prod(tensor.shape, dtype=object))} "
-                f"> {MAX_ELEMENTS})"
+                f"Packet exceeds maximum elements ({num_elements} > {MAX_ELEMENTS})"
             )
     elif hasattr(tensor, "shape") and not isinstance(tensor, dict):
         _validate_dims(tensor.shape)
@@ -582,34 +615,50 @@ def dumps(
 
 
 def loads(
-    data: Union[bytes, bytearray, memoryview, np.ndarray, mmap.mmap], copy: bool = False
+    data: Union[bytes, bytearray, memoryview, np.ndarray, mmap.mmap],
+    copy: bool = False,
+    align: bool = False,
 ) -> Any:
     """
     Deserialize a Tenso packet into its original Python object.
+
+    By default this is genuinely zero-copy: the returned array is a view onto
+    ``data``, so nothing is allocated and nothing is copied regardless of packet
+    size. The view keeps ``data`` alive, so it stays valid after you drop your own
+    reference.
 
     Parameters
     ----------
     data : Union[bytes, bytearray, memoryview, np.ndarray, mmap.mmap]
         The raw Tenso packet data.
     copy : bool, default False
-        If True, returns a writeable copy. Otherwise returns a read-only view.
+        If True, returns a writeable, alignment-guaranteed copy. Otherwise
+        returns a read-only view.
+    align : bool, default False
+        If True, guarantee the returned array's *base address* is a multiple of
+        the packet's declared alignment, copying if the transport buffer does not
+        already line up. Off by default; see Notes.
 
     Returns
     -------
     Any
         The reconstructed NumPy array, Dictionary, or Sparse Matrix.
+
+    Notes
+    -----
+    The wire format guarantees the body starts at a 64-byte *offset* from the
+    packet start, so an array is aligned in memory exactly when the buffer holding
+    the packet is. That holds for ``mmap`` (page-aligned), shared memory, and any
+    aligned allocator — but not for a plain ``bytes`` object, whose payload sits a
+    fixed 32 bytes past its allocation and is therefore never 64-byte aligned.
+
+    Guaranteeing an absolute address there costs a full copy of the body, which is
+    the one thing this format exists to avoid, and buys nothing for ordinary NumPy
+    work: NumPy issues unaligned SIMD loads and imposes no alignment requirement
+    beyond the element size. So the guarantee is opt-in via ``align=True``, for
+    callers who need it (explicit aligned AVX-512 load/store, DMA, pinned host
+    buffers for GPU transfer) rather than charged to everyone.
     """
-    mv = memoryview(data)
-
-    # Resolve the promised alignment so it can be enforced on returned arrays
-    # after decode (a zero-copy view only inherits the transport buffer's). Issue #5.
-    try:
-        _hdr = _parse_header(mv)
-        alignment = _target_alignment(mv, _hdr[1], _hdr[4], _hdr[3])
-    except Exception:
-        _hdr = None
-        alignment = _ALIGNMENT
-
     # All decoding goes through the Rust core; it raises ValueError on a
     # malformed/integrity-failed packet.
     res = loads_rs(data)
@@ -619,6 +668,19 @@ def loads(
             "Unsupported tenso packet (e.g. a GPU IPC reference, which is "
             "decoded on the device rather than via loads())"
         )
+
+    if not (align or copy):
+        # Hot path: hand back the core's view untouched. Note this also skips the
+        # Python-side header reparse below, which was pure overhead per call.
+        return res
+
+    # Resolve the alignment the packet declares, then enforce it (issue #5).
+    try:
+        mv = memoryview(data)
+        hdr = _parse_header(mv)
+        alignment = _target_alignment(mv, hdr[1], hdr[4], hdr[3])
+    except Exception:
+        alignment = _ALIGNMENT
     return _ensure_aligned(res, alignment, copy)
 
 
@@ -654,6 +716,11 @@ def dump(
     if HAS_RUST and hasattr(fp, "fileno"):
         try:
             fd = fp.fileno()
+            # The Rust writer goes straight to the fd, behind fp's buffer. Anything
+            # the caller wrote earlier may still be sitting in that buffer, and
+            # would be flushed *after* our packet -- reordering the file. Drain it
+            # first so the packet lands where the caller's file position says.
+            fp.flush()
             if not tensor.flags["C_CONTIGUOUS"]:
                 if strict:
                     raise ValueError("Tensor is not C-Contiguous")
@@ -661,8 +728,10 @@ def dump(
 
             dump_to_fd_rs(tensor, fd, check_integrity=check_integrity)
             return
-        except (ValueError, TypeError, AttributeError, OSError):
-            # fileno() unavailable/invalid (e.g. BytesIO) or Rust failed.
+        except (AttributeError, io.UnsupportedOperation):
+            # No usable fileno() (e.g. BytesIO); fall through to the buffered
+            # write. Deliberately narrow: a failure *after* dump_to_fd_rs has
+            # written must not fall through and append a second packet.
             pass
 
     # Single write of the complete packet (~6x faster than chunked for large arrays).
@@ -670,7 +739,21 @@ def dump(
     fp.write(packet)
 
 
-def load(fp: BinaryIO, mmap_mode: bool = False, copy: bool = False) -> Any:
+class _MmapArray(np.ndarray):
+    """A view that keeps its backing mmap alive (see ``load(mmap_mode=True)``).
+
+    A plain ndarray has no writable ``base``, so a zero-copy view returned from
+    ``loads(mm)`` would not keep ``mm`` referenced; once ``mm`` is collected the
+    mapping is unmapped and touching the view segfaults. Holding ``mm`` as an
+    attribute here ties the mapping's lifetime to the array's.
+    """
+
+    _tenso_mmap = None
+
+
+def load(
+    fp: BinaryIO, mmap_mode: bool = False, copy: bool = False, align: bool = False
+) -> Any:
     """
     Deserialize an object from an open binary file.
 
@@ -679,9 +762,12 @@ def load(fp: BinaryIO, mmap_mode: bool = False, copy: bool = False) -> Any:
     fp : BinaryIO
         Open binary file object.
     mmap_mode : bool, default False
-        Use memory mapping for large files.
+        Use memory mapping for large files. This is the fully zero-copy read path:
+        the mapping is page-aligned, so the array is 64-byte aligned for free.
     copy : bool, default False
         Return a writeable copy.
+    align : bool, default False
+        Guarantee the returned array's base address is aligned. See :func:`loads`.
 
     Returns
     -------
@@ -690,7 +776,16 @@ def load(fp: BinaryIO, mmap_mode: bool = False, copy: bool = False) -> Any:
     """
     if mmap_mode:
         mm = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
-        return loads(mm, copy=copy)
+        result = loads(mm, copy=copy, align=align)
+        if copy or not isinstance(result, np.ndarray):
+            # A copy owns its data; non-array results are materialized too, so
+            # the mapping can be released when this frame returns.
+            return result
+        # Zero-copy view into the mapping: anchor mm so it outlives the view
+        # (and any view derived from it via numpy's base chain).
+        view = result.view(_MmapArray)
+        view._tenso_mmap = mm
+        return view
     result = read_stream(fp)
     if result is None:
         raise EOFError("Empty file or stream")
