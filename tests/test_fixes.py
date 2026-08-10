@@ -5,6 +5,8 @@ Each test pins a specific bug that was fixed so it can't silently regress.
 """
 
 import asyncio
+import gc
+import io
 import struct
 
 import numpy as np
@@ -319,8 +321,13 @@ def test_max_u32_dim_boundary():
 
 
 # --------------------------------------------------------------------------
-# Issue #5: loads() must return arrays aligned to the packet's boundary,
-# regardless of the transport buffer's own alignment.
+# Issue #5: loads(align=True) must return arrays aligned to the packet's
+# boundary, regardless of the transport buffer's own alignment.
+#
+# These assert the OPT-IN guarantee. They must not be relaxed to the default
+# path: alignment on an arbitrary buffer costs a full copy of the body, so
+# charging it to every caller is the regression fixed in
+# test_loads_is_zero_copy_by_default below.
 # --------------------------------------------------------------------------
 
 def _misaligned_packet_bytes(packet) -> bytes:
@@ -337,7 +344,7 @@ def test_loads_returns_aligned_array(dtype):
     x = np.array([[1, 5], [9, 24]], dtype=dtype)
     for _ in range(64):
         packet = _misaligned_packet_bytes(tenso.dumps(x))
-        out = tenso.loads(packet)
+        out = tenso.loads(packet, align=True)
         assert out.ctypes.data % 64 == 0, (
             f"deserialized array not 64-byte aligned: {out.ctypes.data % 64}"
         )
@@ -356,7 +363,7 @@ def test_loads_aligned_with_copy():
 def test_loads_custom_alignment_honored():
     x = np.arange(50, dtype=np.float32)
     packet = _misaligned_packet_bytes(tenso.dumps(x, alignment=128))
-    out = tenso.loads(packet)
+    out = tenso.loads(packet, align=True)
     assert out.ctypes.data % 128 == 0
     assert np.array_equal(out, x)
 
@@ -367,7 +374,7 @@ def test_loads_bundle_arrays_aligned():
         "b": np.array([[1, 2], [3, 4]], dtype=np.uint64),
     }
     packet = _misaligned_packet_bytes(tenso.dumps(bundle))
-    out = tenso.loads(packet)
+    out = tenso.loads(packet, align=True)
     for k, v in out.items():
         assert v.ctypes.data % 64 == 0, f"bundle member {k} not aligned"
 
@@ -384,7 +391,209 @@ def test_loads_zero_copy_preserved_when_input_aligned():
     aligned[:] = np.frombuffer(src, dtype=np.uint8)
     assert aligned.ctypes.data % 64 == 0
 
-    out = tenso.loads(memoryview(aligned))
+    out = tenso.loads(memoryview(aligned), align=True)
     assert np.array_equal(out, x)
     # body lives at an aligned offset within an aligned buffer -> aliased view.
     assert np.shares_memory(out, aligned)
+
+
+# --------------------------------------------------------------------------
+# Zero-copy regression guard.
+#
+# 4b4dbb2 ("guarantee array alignment (#5)") made loads() copy the entire body
+# on every call. Its own message claimed "zero-copy preserved otherwise", but
+# the otherwise never happens: a CPython bytes payload sits exactly 32 bytes
+# past its allocation (refcount + type + size + hash) and allocators align to
+# 16, so a packet body is always 32 mod 64 and the alignment check can never
+# pass. That silently turned a ~0.003 ms 64 MB read into ~2.4 ms and invalidated
+# every published benchmark for two releases with no test failing.
+#
+# These assert the property directly rather than a proxy for it.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32, np.float64, np.int64])
+def test_loads_is_zero_copy_by_default(dtype):
+    x = np.arange(1024, dtype=dtype)
+    packet = bytes(tenso.dumps(x))
+    out = tenso.loads(packet)
+    assert np.shares_memory(out, np.frombuffer(packet, dtype=np.uint8)), (
+        "loads() allocated instead of returning a view onto the packet"
+    )
+    assert np.array_equal(out, x)
+    assert out.flags.writeable is False
+
+
+def test_loads_zero_copy_across_repeated_calls():
+    # One lucky address is not evidence. Every call must alias, on fresh packets
+    # at fresh addresses, or the guarantee is really a coin flip.
+    x = np.arange(97, dtype=np.float32)
+    for i in range(64):
+        packet = bytes(tenso.dumps(x))
+        assert np.shares_memory(
+            tenso.loads(packet), np.frombuffer(packet, dtype=np.uint8)
+        ), f"loads() copied on iteration {i}"
+
+
+def test_loads_bundle_is_zero_copy_by_default():
+    bundle = {"a": np.arange(64, dtype=np.float32), "b": np.arange(8, dtype=np.uint64)}
+    packet = bytes(tenso.dumps(bundle))
+    pv = np.frombuffer(packet, dtype=np.uint8)
+    out = tenso.loads(packet)
+    for k, v in out.items():
+        assert np.shares_memory(v, pv), f"bundle member {k} was copied"
+
+
+def test_zero_copy_view_outlives_the_packet_reference():
+    # The view aliases the packet, so it must keep the packet alive. If it did
+    # not, zero-copy-by-default would be a use-after-free rather than a speedup.
+    x = np.arange(4096, dtype=np.float64)
+    packet = bytes(tenso.dumps(x))
+    out = tenso.loads(packet)
+    del packet
+    gc.collect()
+    assert np.array_equal(out, x)
+
+
+def test_read_stream_does_not_copy_the_packet():
+    # read_stream used to hand loads() a bytes() of its framing buffer, copying the
+    # whole packet before decoding it. The result must alias the framing buffer.
+    x = np.arange(65536, dtype=np.float64)
+    out = tenso.read_stream(io.BytesIO(bytes(tenso.dumps(x))))
+    assert np.array_equal(out, x)
+    # A copy would own its data outright; a view is backed by the framing buffer.
+    assert out.base is not None, "read_stream materialized instead of viewing"
+    assert out.flags.writeable is False, "read_stream leaked a writable view"
+
+
+def test_align_true_still_returns_correct_data_and_is_read_only():
+    # The opt-in path allocates, so it must not accidentally hand back a
+    # writeable buffer (that is copy=True's contract, not align's).
+    x = np.arange(129, dtype=np.float32)
+    out = tenso.loads(bytes(tenso.dumps(x)), align=True)
+    assert out.ctypes.data % 64 == 0
+    assert out.flags.writeable is False
+    assert np.array_equal(out, x)
+
+
+def test_load_mmap_mode_is_zero_copy_and_aligned(tmp_path):
+    # mmap is the path where alignment is free: the mapping is page-aligned, so
+    # the body's 64-byte offset lands on a 64-byte address with no copy.
+    x = np.arange(8192, dtype=np.float32)
+    p = tmp_path / "t.tenso"
+    p.write_bytes(bytes(tenso.dumps(x)))
+    with open(p, "rb") as f:
+        out = tenso.load(f, mmap_mode=True)
+    assert out.ctypes.data % 64 == 0
+    assert np.array_equal(out, x)
+
+
+# --------------------------------------------------------------------------
+# Non-native byte order: dumps() wrote the raw bytes and loads() read them back
+# in the opposite order, silently returning different numbers. _DTYPE_MAP is
+# keyed on native dtype objects, so '>f4' never matched and fell through
+# unvalidated. Reject rather than convert: converting would hide an allocation
+# and a copy inside a documented zero-copy write.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dt", [">f4", ">f8", ">i4", ">u8", ">i2"])
+def test_dumps_rejects_non_native_byteorder(dt):
+    x = np.arange(4, dtype=np.dtype(dt))
+    with pytest.raises(ValueError, match="native byte order"):
+        tenso.dumps(x)
+
+
+def test_dumps_rejects_non_native_byteorder_in_bundle():
+    # The bundle path recurses separately, so it needs its own guard.
+    bundle = {"ok": np.arange(4, dtype="<f4"), "bad": np.arange(4, dtype=">f4")}
+    with pytest.raises(ValueError, match="native byte order"):
+        tenso.dumps(bundle)
+
+
+def test_dumps_accepts_explicit_native_byteorder():
+    # '<f4' on a little-endian host is native; only a genuine mismatch is an error.
+    native = "<f4" if np.little_endian else ">f4"
+    x = np.arange(4, dtype=np.dtype(native))
+    assert np.array_equal(tenso.loads(tenso.dumps(x)), x)
+
+
+def test_dumps_accepts_single_byte_dtypes():
+    # uint8/int8 have byteorder '|' (not applicable) and must never be rejected.
+    for dt in (np.uint8, np.int8, np.bool_):
+        x = np.arange(4).astype(dt)
+        assert np.array_equal(tenso.loads(tenso.dumps(x)), x)
+
+
+# --------------------------------------------------------------------------
+# dump() took an fd fast path via fileno() and wrote behind the file object's
+# buffer, so anything the caller had already written was flushed AFTER the
+# packet -- reordering the file with no error. The broad
+# `except (ValueError, TypeError, AttributeError, OSError)` then appended a
+# second packet to the already-corrupt file.
+# --------------------------------------------------------------------------
+
+def test_dump_preserves_prior_buffered_writes(tmp_path):
+    x = np.arange(4, dtype=np.float32)
+    p = tmp_path / "out.bin"
+    with open(p, "wb") as f:
+        f.write(b"HEADER")
+        tenso.dump(x, f)
+    raw = p.read_bytes()
+    assert raw[:6] == b"HEADER", (
+        f"prior write was reordered; HEADER landed at offset {raw.find(b'HEADER')}"
+    )
+    assert np.array_equal(tenso.loads(raw[6:]), x)
+
+
+def test_dump_writes_exactly_one_packet(tmp_path):
+    # Guards the fall-through: a failure after the fd write must not silently
+    # append a second copy of the packet.
+    x = np.arange(64, dtype=np.float64)
+    p = tmp_path / "one.bin"
+    with open(p, "wb") as f:
+        tenso.dump(x, f)
+    expected = len(bytes(tenso.dumps(x)))
+    assert p.stat().st_size == expected, "dump() wrote more than one packet"
+
+
+def test_dump_still_works_without_a_fileno():
+    # BytesIO has no usable fileno(); the buffered fallback must still fire.
+    buf = io.BytesIO()
+    x = np.arange(10, dtype=np.int32)
+    buf.write(b"PRE")
+    tenso.dump(x, buf)
+    raw = buf.getvalue()
+    assert raw[:3] == b"PRE"
+    assert np.array_equal(tenso.loads(raw[3:]), x)
+
+
+# --------------------------------------------------------------------------
+# Untrusted shape dims were multiplied with np.prod (int64), which wraps
+# silently and could carry a hostile element count past the MAX_ELEMENTS guard.
+# --------------------------------------------------------------------------
+
+def _forge_v4_header(ndim: int, dims: list[int], dtype_code: int = 1) -> bytes:
+    """A v4 header plus shape block: magic(4) ver(1) flags(2) dtype(1) ndim(1) rsvd(1)."""
+    from tenso.config import _MAGIC, FLAG_ALIGNED
+
+    hdr = _MAGIC + bytes([4]) + struct.pack("<H", FLAG_ALIGNED) + bytes(
+        [dtype_code, ndim, 0]
+    )
+    assert len(hdr) == _HEADER_BASE_V4
+    return hdr + struct.pack(f"<{len(dims)}I", *dims)
+
+
+def test_stream_framing_rejects_int64_overflowing_shape():
+    # Eight dims of u32::MAX. The true element count is ~2**256; np.prod computes
+    # it in int64, which wraps to a small number and slips past MAX_ELEMENTS.
+    ndim = 8
+    forged = _forge_v4_header(ndim, [0xFFFFFFFF] * ndim)
+    with pytest.raises(ValueError, match="maximum elements"):
+        tenso.read_stream(io.BytesIO(forged))
+
+
+def test_stream_framing_still_accepts_an_honest_shape():
+    # The overflow guard must not reject legitimate multi-dimensional packets.
+    x = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    assert np.array_equal(
+        tenso.read_stream(io.BytesIO(bytes(tenso.dumps(x)))), x
+    )

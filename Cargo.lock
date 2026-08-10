@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "tenso"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "lz4_flex",
  "xxhash-rust",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "tenso-bus"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "libc",
  "tenso",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "tenso-cuda"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "libloading",
  "tenso",
@@ -548,14 +548,14 @@ dependencies = [
 
 [[package]]
 name = "tenso-device"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "tenso",
 ]
 
 [[package]]
 name = "tenso-ffi"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "cbindgen",
  "tenso",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "tenso-rs"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "libc",
  "pyo3",
