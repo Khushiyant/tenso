@@ -687,6 +687,20 @@ impl RingBus {
         Self::header_bytes() + capacity * Self::slot_bytes(slot_stride)
     }
 
+    /// `segment_size` with overflow reported instead of wrapped.
+    ///
+    /// Used on the attach path, where capacity and stride come off a header a
+    /// peer process wrote: a wrapped product would compute a *small* required
+    /// size, pass the bounds check below, and then be indexed with the large
+    /// values.
+    fn checked_segment_size(capacity: usize, slot_stride: usize) -> Option<usize> {
+        let per_slot = aligned_hdr(core::mem::size_of::<SlotMeta>())
+            .checked_add(align_up(slot_stride, ALIGNMENT))?;
+        capacity
+            .checked_mul(per_slot)?
+            .checked_add(Self::header_bytes())
+    }
+
     /// Default per-slot payload stride when attaching needs a fallback.
     const DEFAULT_SLOT_STRIDE: usize = 1 << 20; // 1 MiB
 
@@ -729,6 +743,22 @@ impl RingBus {
 
         let resolved_cap = hdr.capacity.load(Ordering::Acquire) as usize;
         let resolved_stride = hdr.slot_stride.load(Ordering::Acquire) as usize;
+
+        // The mapping was sized from OUR capacity/stride, but every subsequent
+        // access indexes with the resolved values from the shared header. If a
+        // peer created the ring with a larger geometry, slot_base() and
+        // buffer_ptr() would compute addresses past the end of this mapping --
+        // silently reading, and writing, out of bounds. Attaching with the wrong
+        // geometry is a configuration error, so refuse rather than truncate.
+        let required = Self::checked_segment_size(resolved_cap, resolved_stride)
+            .ok_or(BusError::Shm("ring geometry overflows address space"))?;
+        if resolved_cap == 0 || required > seg.len() {
+            return Err(BusError::Shm(
+                "ring header declares a geometry larger than the mapped segment; \
+                 attach with the same capacity and slot_stride the creator used",
+            ));
+        }
+
         // Attaching consumers start at the current head: only frames published after joining (telemetry).
         let start = hdr.write_index.load(Ordering::Acquire);
 
@@ -1201,6 +1231,57 @@ mod tests {
     }
 
     // ----- RingBus -----
+
+    /// Attaching with a smaller stride than the creator used must be refused.
+    ///
+    /// Before the geometry check, `open_with` sized the mapping from the
+    /// attacher's stride but then adopted the creator's larger stride from the
+    /// shared header, so `slot_base()`/`buffer_ptr()` computed addresses past the
+    /// end of the mapping: out-of-bounds reads that returned `Ok` with wrong
+    /// data, and out-of-bounds writes on the push path. `RingBus::open` hardcodes
+    /// a 1 MiB default stride, so this needed no attacker -- only a consumer that
+    /// did not know the creator's stride.
+    #[test]
+    fn ring_attach_rejects_geometry_larger_than_mapping() {
+        let name = unique_name("ring_geom");
+        let prod = RingBus::open_with(
+            &BusConfig::new(&name, 8, true),
+            4 << 20,
+            OverflowPolicy::Error,
+        )
+        .unwrap();
+
+        // Same capacity, much smaller stride: the mapping is far too small for
+        // the 4 MiB slots the header declares.
+        let attached = RingBus::open_with(
+            &BusConfig::new(&name, 8, false),
+            4096,
+            OverflowPolicy::Error,
+        );
+        match attached {
+            Err(BusError::Shm(msg)) => assert!(
+                msg.contains("larger than the mapped segment"),
+                "unexpected error: {msg}"
+            ),
+            Err(e) => panic!("expected a geometry rejection, got {e:?}"),
+            Ok(_) => panic!("attached with a geometry larger than the mapping"),
+        }
+
+        // A matching stride still attaches and round-trips.
+        let cons = RingBus::open_with(
+            &BusConfig::new(&name, 8, false),
+            4 << 20,
+            OverflowPolicy::Error,
+        )
+        .unwrap();
+        let p = make_packet(7, 8);
+        prod.push(&p).unwrap();
+        let mut out = vec![0u8; 4096];
+        let n = cons.pop(&mut out).unwrap();
+        assert_eq!(&out[..n], &p[..]);
+
+        prod.unlink();
+    }
 
     #[test]
     fn ring_push_pop_fifo() {
